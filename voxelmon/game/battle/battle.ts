@@ -117,7 +117,8 @@ export interface MsgShown {
 export type BattlePhase = "messages" | "menu" | "moveSelect" | "party" | "item";
 
 export class WildBattle implements EffectBattle {
-  readonly kind = "wild";
+  readonly kind: "wild" | "trainer";
+  readonly opponentName?: string;
   readonly data: VoxelmonData;
   /** The battle rng stream. Tests may swap it after construction (the
    * harness.lua injection style — rng.ts). */
@@ -206,11 +207,20 @@ export class WildBattle implements EffectBattle {
    * BattleState.newWild (:576-594). The enemy mon's DVs consume the battle
    * rng stream; the overworld streams are untouched.
    */
-  constructor(data: VoxelmonData, save: BattleSave, rng: Rng, species: string, level: number) {
+  constructor(
+    data: VoxelmonData,
+    save: BattleSave,
+    rng: Rng,
+    species: string,
+    level: number,
+    trainer?: { name: string },
+  ) {
     this.data = data;
     this.save = save;
     this.rng = rng;
     this.chart = createTypeChart(data.type_chart);
+    this.kind = trainer ? "trainer" : "wild";
+    this.opponentName = trainer?.name;
     const playerMon = firstHealthy(save.party);
     if (!playerMon) {
       // :580-583 — flagged dead; enter() takes the blackout path (#425)
@@ -577,7 +587,9 @@ export class WildBattle implements EffectBattle {
     // with the text — after the silhouettes have slid in, not on the frame
     // the battle was pushed.
     this.act(() => this.audioCues.push(`cry:${this.enemy.mon.species}`));
-    this.say(`Wild ${this.enemy.name}\nappeared!`);
+    this.say(this.kind === "trainer"
+      ? `${this.opponentName} sent\nout ${this.enemy.name}!`
+      : `Wild ${this.enemy.name}\nappeared!`);
     // _InitBattleCommon clears the intro chrome the instant the intro text
     // is dismissed (:1534-1539, #317)
     this.act(() => {
@@ -1251,6 +1263,10 @@ export class WildBattle implements EffectBattle {
   tryRun(): void {
     this.phase = "messages";
     this.afterQueue = "menu";
+    if (this.kind === "trainer") {
+      this.say("No! There's no\nrunning from a\ntrainer battle!");
+      return;
+    }
     const escaped = this.runRoll(effectiveSpeed(this.player), effectiveSpeed(this.enemy));
     if (escaped) {
       this.say("Got away safely!");
@@ -1273,6 +1289,12 @@ export class WildBattle implements EffectBattle {
 
   /** :4315-4321 openItems, narrowed to balls (v1: the bag is ball-only). */
   openItems(): void {
+    if (this.kind === "trainer") {
+      this.say("The trainer blocked\nthe BALL!");
+      this.phase = "messages";
+      this.afterQueue = "menu";
+      return;
+    }
     this.itemList = Object.keys(this.save.inventory).filter((id) => {
       if ((this.save.inventory[id] ?? 0) <= 0) return false;
       const def = this.data.items?.[id];
@@ -1332,11 +1354,15 @@ export class WildBattle implements EffectBattle {
 
   /** :4484-4575 throwBall, wild branch (trainer block-ball is out). */
   throwBall(ball: string): void {
-    const itemName = this.data.items?.[ball]?.name ?? ball;
+    const itemDef = this.data.items?.[ball];
+    const itemName = itemDef?.name ?? ball;
+    // Data-defined balls (mods and fixtures) name the stock capture profile
+    // they inherit. Standard Gen I item ids already equal their profile.
+    const ballKind = itemDef?.ball ?? ball;
     this.sayAuto(`${this.save.player.name} used\n${itemName}!`);
     this.act(() => {
       this.lastBall = ball;
-      const [caught, shakes] = catchAttempt(ball, this.enemy.mon, this.enemy.def, this.rng);
+      const [caught, shakes] = catchAttempt(ballKind, this.enemy.mon, this.enemy.def, this.rng);
       // ItemUseBall's 20-frame beat before the toss chain (:4551-4553)
       this.insertNext({ wait: 20 });
       this.ballChain(caught, shakes, ball);

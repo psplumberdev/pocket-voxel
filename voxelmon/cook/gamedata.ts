@@ -9,6 +9,7 @@
 // minted LIGATURE_BASE point; the UI page lays glyphs at their GB codes, so
 // tile id == code.
 
+import type { EncounterDef } from "../game/data.ts";
 import { LIGATURE_BASE } from "../game/ui/tiles.ts";
 import { tileShapesFor } from "./classify.ts";
 import { GameMap, type GenData, type MapDef, type Profile, type TilesetDef } from "./data.ts";
@@ -190,6 +191,13 @@ export function buildGamedata(
     tilesets[id] = tilesetSubset(ts, supports.get(id));
   }
 
+  // Red does not normally place Onix in Mt. Moon. This campaign addition
+  // makes it a rare (5%) B2F encounter at level 10, in line with the floor's
+  // native level 9-12 population and without inflating the encounter rate.
+  const encounters = structuredClone(gen.encounters) as Record<string, EncounterDef>;
+  const moon = encounters.MT_MOON_B2F?.grass?.slots;
+  if (moon?.[6]) moon[6] = { species: "ONIX", level: 10 };
+
   const game = {
     constants: gen.constants,
     // The maps whose geometry this pak actually carries. gamedata keeps
@@ -199,7 +207,7 @@ export function buildGamedata(
     cookedMaps,
     maps: gen.maps,
     tilesets,
-    encounters: gen.encounters,
+    encounters,
     moves: gen.moves,
     pokemon,
     items: gen.items,

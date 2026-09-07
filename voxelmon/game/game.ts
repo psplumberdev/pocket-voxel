@@ -13,13 +13,21 @@
 import { fromSection, type AudioBanks } from "./audio/banks.ts";
 import { AudioDirector } from "./audio/music.ts";
 import { WildBattle } from "./battle/battle.ts";
-import { healMon, newMon, type PartyMon } from "./battle/mon.ts";
+import { healMon, newMon, partyAdd, type PartyMon } from "./battle/mon.ts";
 import { computeStaging, type BattleStaging } from "./battle/staging.ts";
 import { BattleUi } from "./battle/ui.ts";
 import type { VoxelmonData } from "./data.ts";
 import type { VoxelHost } from "./host.ts";
 import { Input } from "./input.ts";
 import { seededRng, type Rng } from "./rng.ts";
+import * as Bag from "./rules/bag.ts";
+import {
+  MAX_MONEY,
+  STARTING_MONEY,
+  moneyAfterBlackout,
+  sellPrice,
+  trainerPayout,
+} from "./rules/economy.ts";
 import { apply as applyEvolution, checkParty } from "./rules/evolution.ts";
 import { movesLearnedAt } from "./rules/experience.ts";
 import { MAP_ENTRY_AFTER_BATTLE, POST_BATTLE_RETURN, YES_NO_ANSWER } from "./rules/timing.ts";
@@ -38,6 +46,7 @@ import {
   type ChoiceSource,
   type Prof,
   type SceneView,
+  type SystemOverlaySource,
   type UiBoxSource,
 } from "./scene.ts";
 import { Overworld, type OverworldShell, type SaveSlice } from "./world/overworld.ts";
@@ -46,6 +55,14 @@ import { Textbox } from "./world/textbox.ts";
 /** The full save: the overworld slice plus the party the battle port added. */
 export interface GameSave extends SaveSlice {
   party: PartyMon[];
+  /** Runtime performance option: false keeps the PSP audio path idle. */
+  musicEnabled?: boolean;
+}
+
+interface SaveFileV1 {
+  version: 1;
+  save: GameSave;
+  location: { map: string; x: number; y: number; facing: "up" | "down" | "left" | "right" };
 }
 
 export interface GameState {
@@ -58,6 +75,115 @@ class OverworldState implements GameState {
   constructor(private ow: Overworld) {}
   update(): void {
     this.ow.update();
+  }
+}
+
+class TitleState implements GameState, SystemOverlaySource {
+  readonly kind = "title";
+  revision = 0;
+  private menu = false;
+  private selected = 0;
+  private readonly hasContinue: boolean;
+
+  constructor(private game: VoxelmonGame) {
+    this.hasContinue = game.hasSave();
+  }
+
+  update(): void {
+    const input = this.game.input;
+    if (!this.menu) {
+      if (input.wasPressed("a") || input.wasPressed("start")) {
+        this.menu = true;
+        this.revision += 1;
+      }
+      return;
+    }
+    const rows = this.hasContinue ? 2 : 1;
+    if (input.wasPressed("up")) {
+      this.selected = (this.selected + rows - 1) % rows;
+      this.revision += 1;
+    } else if (input.wasPressed("down")) {
+      this.selected = (this.selected + 1) % rows;
+      this.revision += 1;
+    } else if (input.wasPressed("a") || input.wasPressed("start")) {
+      if (this.hasContinue && this.selected === 0 && this.game.loadGame()) return;
+      this.game.startNewGameIntro();
+    }
+  }
+
+  emit(host: VoxelHost): void {
+    host.uiRect(0, 0, 480, 272, 0xff000000);
+    host.uiLabel(78, 40, 4, 0xffffffff, "POKEMON");
+    host.uiLabel(164, 94, 2, 0xff6060ff, "RED VERSION");
+    host.uiLabel(128, 228, 1, 0xffffffff, "1995 GAME FREAK INC.");
+    if (!this.menu) {
+      host.uiLabel(164, 178, 1, 0xffffffff, "PRESS START");
+      return;
+    }
+    const labels = this.hasContinue ? ["CONTINUE", "NEW GAME"] : ["NEW GAME"];
+    for (let i = 0; i < labels.length; i++) {
+      host.uiLabel(170, 158 + i * 20, 1, 0xffffffff, `${i === this.selected ? ">" : " "} ${labels[i]}`);
+    }
+  }
+}
+
+class IntroState implements GameState {
+  readonly kind = "intro";
+  constructor(private game: VoxelmonGame) {}
+  update(): void {}
+  begin(): void {
+    this.game.showText("Hello there!\nWelcome to the world\nof POKéMON!", () => {
+      this.game.showText("My name is OAK!\nPeople call me the\nPOKéMON PROF!", () => {
+        this.game.showMenuChoice("First, what is\nyour name?", ["RED", "ASH", "JACK"], (i) => {
+          this.game.save.player.name = ["RED", "ASH", "JACK"][i] ?? "RED";
+          this.game.showMenuChoice("What is your\nrival's name?", ["BLUE", "GARY", "JOHN"], (j) => {
+            this.game.save.player.rival = ["BLUE", "GARY", "JOHN"][j] ?? "BLUE";
+            this.game.showText(
+              `${this.game.save.player.name}! Your very own\nPOKéMON legend is\nabout to unfold!`,
+              () => this.game.pop(),
+            );
+          });
+        });
+      });
+    });
+  }
+}
+
+class StartMenuState implements GameState, SystemOverlaySource {
+  readonly kind = "start-menu";
+  revision = 0;
+  private selected = 0;
+  private status = "";
+  private get labels(): readonly string[] {
+    return ["POKEMON", "ITEM", `MUSIC ${this.game.musicEnabled ? "ON" : "OFF"}`, "SAVE", "EXIT"];
+  }
+  constructor(private game: VoxelmonGame) {}
+  update(): void {
+    const input = this.game.input;
+    if (input.wasPressed("b") || input.wasPressed("start")) {
+      this.game.pop();
+      return;
+    }
+    if (input.wasPressed("up")) this.selected = (this.selected + this.labels.length - 1) % this.labels.length;
+    else if (input.wasPressed("down")) this.selected = (this.selected + 1) % this.labels.length;
+    else if (input.wasPressed("a")) {
+      if (this.selected === 0) { this.game.pop(); this.game.openParty(); return; }
+      if (this.selected === 1) { this.game.pop(); this.game.openBag(); return; }
+      if (this.selected === 2) {
+        this.game.setMusicEnabled(!this.game.musicEnabled);
+        this.status = this.game.musicEnabled ? "SLOW WALK" : "NORMAL WALK";
+      } else if (this.selected === 3) {
+        this.status = this.game.saveGame() ? "GAME SAVED." : "SAVE FAILED!";
+      } else if (this.selected === 4) { this.game.pop(); return; }
+    } else return;
+    this.revision += 1;
+  }
+  emit(host: VoxelHost): void {
+    host.uiRect(286, 18, 176, 204, 0xff000000);
+    for (let i = 0; i < this.labels.length; i++) {
+      host.uiLabel(322, 38 + i * 28, 1, 0xffffffff, `${i === this.selected ? ">" : " "} ${this.labels[i]}`);
+    }
+    if (this.status) host.uiLabel(304, 188, 1, 0xffffffff, this.status);
   }
 }
 
@@ -116,27 +242,36 @@ class TextBoxState implements GameState, UiBoxSource {
 
 class ChoiceState implements GameState, ChoiceSource {
   readonly kind = "choice";
-  selected: number;
+  private cursor: number;
+  /** Four-row viewport consumed by Scene's fixed-size choice window. */
+  get labels(): readonly string[] {
+    const start = Math.max(0, Math.min(this.cursor - 3, this.allLabels.length - 4));
+    return this.allLabels.slice(start, start + 4);
+  }
+  get selected(): number {
+    const start = Math.max(0, Math.min(this.cursor - 3, this.allLabels.length - 4));
+    return this.cursor - start;
+  }
   /** The answer given, held on screen before it is handed back. */
   private pending: number | null = null;
   private holdFrames = 0;
   constructor(
     private game: VoxelmonGame,
-    readonly labels: readonly string[],
+    private readonly allLabels: readonly string[],
     private cb: (index: number) => void,
     opts?: { defaultNo?: boolean; noSound?: boolean },
   ) {
-    if (labels.length < 2 || labels.length > 4) {
-      throw new Error("a choice needs two to four labels");
+    if (allLabels.length < 2) {
+      throw new Error("a choice needs at least two labels");
     }
     // ChoiceBox.lua:16 — some of the original's prompts open on NO
-    this.selected = opts?.defaultNo ? labels.length - 1 : 0;
+    this.cursor = opts?.defaultNo ? allLabels.length - 1 : 0;
     this.noSound = opts?.noSound === true;
   }
   private readonly noSound: boolean;
   /** Compatibility name for the original YES/NO call sites. */
   get yes(): boolean {
-    return this.selected === 0;
+    return this.cursor === 0;
   }
   update(): void {
     const input = this.game.input;
@@ -155,20 +290,20 @@ class ChoiceState implements GameState, ChoiceSource {
       return;
     }
     if (input.wasPressed("up")) {
-      this.selected = (this.selected + this.labels.length - 1) % this.labels.length;
+      this.cursor = (this.cursor + this.allLabels.length - 1) % this.allLabels.length;
     } else if (input.wasPressed("down")) {
-      this.selected = (this.selected + 1) % this.labels.length;
+      this.cursor = (this.cursor + 1) % this.allLabels.length;
     } else if (input.wasPressed("a")) {
       // HandleMenuInput_ (home/window.asm): SFX_PRESS_AB on A and B alike
       if (!this.noSound) this.game.audio.playSfx("Press_AB"); // ChoiceBox.lua:53
-      this.pending = this.selected;
+      this.pending = this.cursor;
       this.holdFrames = YES_NO_ANSWER;
     } else if (input.wasPressed("b")) {
       if (!this.noSound) this.game.audio.playSfx("Press_AB"); // ChoiceBox.lua:59
       // .choseSecondMenuItem writes wCurrentMenuItem = 1 BEFORE the hold, so
       // the cursor visibly snaps to NO for those 15 frames
-      this.selected = this.labels.length - 1;
-      this.pending = this.selected;
+      this.cursor = this.allLabels.length - 1;
+      this.pending = this.cursor;
       this.holdFrames = YES_NO_ANSWER;
     }
   }
@@ -387,16 +522,30 @@ class WarpFadeState implements GameState {
 // scene reads it through SceneView.battleView().
 class BattleGameState implements GameState, BattleSceneView {
   readonly kind = "battle";
-  readonly battle: WildBattle;
+  battle: WildBattle;
   readonly staging: BattleStaging | null;
   readonly ui = new BattleUi();
+  private trainerIndex = 0;
 
   constructor(
     private game: VoxelmonGame,
     species: string,
     level: number,
+    private trainer?: {
+      name: string;
+      trainerClass: string;
+      party: readonly { species: string; level: number }[];
+      onWin: () => void;
+    },
   ) {
-    this.battle = new WildBattle(game.data, game.save, game.battleRng, species, level);
+    this.battle = new WildBattle(
+      game.data,
+      game.save,
+      game.battleRng,
+      species,
+      level,
+      trainer ? { name: trainer.name } : undefined,
+    );
     // stage where the player stands; nothing moves the player — the camera
     // goes to the arena (docs/VOXEL.md §4)
     const ow = game.overworld;
@@ -407,6 +556,20 @@ class BattleGameState implements GameState, BattleSceneView {
   update(): void {
     const b = this.battle;
     if (b.finished) {
+      const next = this.trainer?.party[this.trainerIndex + 1];
+      if (b.finished === "win" && next) {
+        this.trainerIndex += 1;
+        this.battle = new WildBattle(
+          this.game.data,
+          this.game.save,
+          this.game.battleRng,
+          next.species,
+          next.level,
+          { name: this.trainer!.name },
+        );
+        this.battle.enter();
+        return;
+      }
       // BattleState.lua:4647-4653 — teardown pops the battle screen FIRST,
       // and it is the map that holds: POST_BATTLE_RETURN before EnterMap
       // (home/overworld.asm:351-352) and then MapEntryAfterBattle's
@@ -420,7 +583,17 @@ class BattleGameState implements GameState, BattleSceneView {
       this.game.pushWarpFade(
         POST_BATTLE_RETURN + MAP_ENTRY_AFTER_BATTLE,
         () => {},
-        () => this.game.runEvolutions(b.leveledUp),
+        () => {
+          this.game.runEvolutions(b.leveledUp);
+          if (b.finished === "win" && this.trainer) {
+            this.game.awardTrainerMoney(
+              this.trainer.name,
+              this.trainer.trainerClass,
+              this.trainer.party,
+              this.trainer.onWin,
+            );
+          }
+        },
       );
       return;
     }
@@ -445,6 +618,9 @@ export class VoxelmonGame implements OverworldShell, SceneView {
    *  caller hands it the manifest — setAudio(banks) on the Bun transport,
    *  setAudioFromPak() on device. A director with no manifest emits nothing. */
   audio = new AudioDirector(null);
+  /** OFF is the PSP-friendly default; ON trades walking speed for music. */
+  musicEnabled = false;
+  private deviceAudioReady = false;
   private stack: GameState[] = [];
   private scene: Scene;
   tickIndex = 0;
@@ -494,6 +670,37 @@ export class VoxelmonGame implements OverworldShell, SceneView {
    */
   setAudioFromPak(): void {
     this.audio = new AudioDirector(fromSection(this.host.audiodata()), this.host);
+  }
+
+  /** Called after the PSP has mounted the resident AUDIO section. */
+  enableDeviceAudio(): void {
+    this.deviceAudioReady = true;
+    if (this.musicEnabled) this.startEnabledAudio();
+  }
+
+  /** Start-menu performance switch: silent/normal or music/slower walking. */
+  setMusicEnabled(enabled: boolean): void {
+    if (this.musicEnabled === enabled) return;
+    this.musicEnabled = enabled;
+    this.save.musicEnabled = enabled;
+    this.applyMovementSpeed();
+    if (enabled) this.startEnabledAudio();
+    else {
+      this.audio.stop();
+      this.audio = new AudioDirector(null);
+    }
+  }
+
+  private startEnabledAudio(): void {
+    if (!this.deviceAudioReady) return;
+    this.setAudioFromPak();
+    this.audioMap = this.overworld.map.id;
+    this.audio.startMap(this.audioMap);
+  }
+
+  private applyMovementSpeed(): void {
+    if (!this.overworld?.player) return;
+    this.overworld.player.stepFrames = this.musicEnabled ? 24 : 16;
   }
 
   /**
@@ -558,49 +765,134 @@ export class VoxelmonGame implements OverworldShell, SceneView {
   /**
    * Boot straight into the overworld, skipping title/intro like the
    * reference driver's U.newGame: SaveData.lua:1345 pins the spawn at
-   * REDS_HOUSE_2F (3,6) facing down, and :1303-1305 defaultHeal resolves
-   * the vanilla bedroom spawn to PALLET_TOWN (5,6) for lastHeal AND
-   * lastOutdoor (wLastMap is zero-filled and PALLET_TOWN is map 0), which
-   * is what makes the 1F exit mat's LAST_MAP warp work before the player
-   * has ever been outdoors.
+   * REDS_HOUSE_2F (3,6) facing down. `lastOutdoor` remains Pallet so the 1F
+   * exit mat works before the player has ever been outdoors; the gameplay
+   * checkpoint is Mom's house until a Pokémon Center nurse replaces it.
    */
   newGame(): void {
     this.save = {
-      // The starter is already in the party below, so the world must read
-      // as it does AFTER Oak's lab: every hand-ported script branches on
-      // this flag (data/scripts/reds_house.lua, pallet_town.lua), and with
-      // it clear Mom would offer the wake-up line to a trainer who already
-      // has a mon and Oak would still be barring the grass.
-      flags: { EVENT_GOT_STARTER: true },
+      // Oak's Pallet grass event is live; the party stays empty until the
+      // player confirms one of the three balls in Oak's lab.
+      flags: {},
       inventory: {},
+      money: STARTING_MONEY,
+      musicEnabled: false,
       player: { name: "RED", rival: "BLUE" },
-      lastHeal: { map: "PALLET_TOWN", x: 5, y: 6 },
+      lastHeal: { map: "REDS_HOUSE_1F", x: 4, y: 6 },
       lastOutdoor: { id: "PALLET_TOWN", x: 5, y: 6 },
-      // DEVIATION (battle slice): the reference new-game party is EMPTY
-      // until Oak's lab hands out a starter (SaveData.lua newGame); the
-      // slice has no lab script yet, so newGame grants SQUIRTLE L5 with
-      // fixed zero DVs (deterministic — no rng draw at boot) so wild
-      // encounters are playable end to end.
-      party: [newMon(this.data, "SQUIRTLE", 5)],
+      party: [],
     };
     this.overworld = new Overworld(this);
     this.stack = [new OverworldState(this.overworld)];
     this.overworld.enter("REDS_HOUSE_2F", 3, 6, "down");
+    this.musicEnabled = false;
+    this.applyMovementSpeed();
+  }
+
+  boot(): void {
+    this.newGame();
+    this.push(new TitleState(this));
+  }
+
+  startNewGameIntro(): void {
+    this.newGame();
+    const intro = new IntroState(this);
+    this.push(intro);
+    intro.begin();
+  }
+
+  hasSave(): boolean {
+    const raw = this.host.saveLoad?.();
+    if (!raw) return false;
+    try { return (JSON.parse(raw) as { version?: unknown }).version === 1; }
+    catch { return false; }
+  }
+
+  chooseStarter(species: "BULBASAUR" | "CHARMANDER" | "SQUIRTLE"): void {
+    if (this.save.flags.EVENT_GOT_STARTER) return;
+    this.save.party.push(
+      newMon(this.data, species, 5, undefined, {
+        hp: 0,
+        attack: 0,
+        defense: 0,
+        speed: 0,
+        special: 0,
+      }),
+    );
+    this.save.flags.EVENT_GOT_STARTER = true;
+    this.save.flags[`EVENT_CHOSE_${species}`] = true;
+    const rival = species === "BULBASAUR" ? "CHARMANDER" : species === "CHARMANDER" ? "SQUIRTLE" : "BULBASAUR";
+    this.save.flags[`EVENT_RIVAL_CHOSE_${rival}`] = true;
+  }
+
+  buyMagikarp(): "bought" | "money" | "party-full" | "already-bought" {
+    if (this.save.flags.EVENT_BOUGHT_MAGIKARP) return "already-bought";
+    const money = this.save.money ?? 0;
+    if (money < 500) return "money";
+    const mon = newMon(this.data, "MAGIKARP", 5);
+    if (!partyAdd(this.save.party, mon)) return "party-full";
+    this.save.money = money - 500;
+    this.save.flags.EVENT_BOUGHT_MAGIKARP = true;
+    return "bought";
+  }
+
+  saveGame(): boolean {
+    const p = this.overworld.player;
+    const file: SaveFileV1 = {
+      version: 1,
+      save: this.save,
+      location: { map: this.overworld.map.id, x: p.cellX, y: p.cellY, facing: p.facing },
+    };
+    return this.host.saveWrite?.(JSON.stringify(file)) ?? false;
+  }
+
+  loadGame(): boolean {
+    const raw = this.host.saveLoad?.();
+    if (!raw) return false;
+    try {
+      const file = JSON.parse(raw) as Partial<SaveFileV1>;
+      const loc = file.location;
+      const save = file.save;
+      if (
+        file.version !== 1 || !save || !loc ||
+        !this.data.maps?.[loc.map] || !Number.isInteger(loc.x) || !Number.isInteger(loc.y) ||
+        !["up", "down", "left", "right"].includes(loc.facing) ||
+        !Array.isArray(save.party) || typeof save.flags !== "object" ||
+        typeof save.inventory !== "object" || typeof save.player?.name !== "string"
+      ) return false;
+      this.save = save;
+      this.save.money = Math.max(0, Math.min(MAX_MONEY, Math.floor(this.save.money ?? STARTING_MONEY)));
+      this.musicEnabled = this.save.musicEnabled === true;
+      this.overworld = new Overworld(this);
+      this.stack = [new OverworldState(this.overworld)];
+      this.overworld.enter(loc.map, loc.x, loc.y, loc.facing);
+      this.applyMovementSpeed();
+      if (this.musicEnabled) this.startEnabledAudio();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
    * The blackout path a lost battle takes (pokered HandleBlackOut,
    * engine/battle/core.asm:1157+: heal the party, special-warp to the last
-   * Pokémon center). v1: full heal + the warp fade to save.lastHeal; the
-   * money halving (ResetStatusAndHalveMoneyOnBlackout) has no money field
-   * to act on in this slice.
+   * Pokémon center), including ResetStatusAndHalveMoneyOnBlackout.
    */
   blackout(): void {
+    this.save.money = moneyAfterBlackout(this.save.money ?? 0);
     for (const mon of this.save.party) healMon(this.data, mon);
-    const heal = this.save.lastHeal;
-    if (heal) {
-      this.overworld.startWarpTo(heal.map, heal.x, heal.y, "down");
-    }
+    const saved = this.save.lastHeal;
+    // Old saves used PALLET_TOWN as the zero-checkpoint. Treat that legacy
+    // outdoor value (and a missing/corrupt value) as Mom's house. A nurse
+    // records a concrete *_POKECENTER map and always wins thereafter.
+    const heal = saved?.map.endsWith("POKECENTER")
+      ? saved
+      : { map: "REDS_HOUSE_1F", x: 4, y: 6 };
+    this.save.lastHeal = heal;
+    // A blackout is a special relocation, not travel from the defeated map.
+    // Preserve lastOutdoor so the Center door still exits to its real town.
+    this.overworld.startWarpTo(heal.map, heal.x, heal.y, "down", undefined, false);
   }
 
   /** One guest turn per host tick — exactly once. */
@@ -703,6 +995,10 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     });
   }
 
+  openStartMenu(): void {
+    this.push(new StartMenuState(this));
+  }
+
   pushWarpFade(frames: number, midpoint: () => void, onDone?: () => void): void {
     this.push(new WarpFadeState(this, frames, midpoint, onDone));
   }
@@ -776,6 +1072,196 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     this.push(new BattleGameState(this, species, level));
   }
 
+  pushTrainerBattle(
+    name: string,
+    trainerClass: string,
+    party: readonly { species: string; level: number }[],
+    onWin: () => void,
+  ): void {
+    const first = party[0];
+    if (!first) { onWin(); return; }
+    this.push(new BattleGameState(this, first.species, first.level, { name, trainerClass, party, onWin }));
+  }
+
+  /** BeatTrainer payout: final enemy level × the ROM trainer-class rate. */
+  awardTrainerMoney(
+    name: string,
+    trainerClass: string,
+    party: readonly { level: number }[],
+    onDone?: () => void,
+  ): number {
+    const prize = trainerPayout(this.data.trainers?.[trainerClass], party);
+    this.save.money = Math.min(MAX_MONEY, (this.save.money ?? 0) + prize);
+    if (prize > 0) {
+      this.showText(`${this.save.player.name} got ¥${prize}\nfor winning!`, onDone);
+    } else {
+      onDone?.();
+    }
+    return prize;
+  }
+
+  openMart(stock: readonly { item: string; price: number }[]): void {
+    this.showMenuChoice(`Welcome! You have\n¥${this.save.money ?? 0}.`, ["BUY", "SELL", "QUIT"], (mode) => {
+      if (mode === 0) this.openMartBuy(stock);
+      else if (mode === 1) this.openMartSell();
+    });
+  }
+
+  private openMartBuy(stock: readonly { item: string; price: number }[]): void {
+    const labels = stock.map((row) => {
+      const name = this.data.items?.[row.item]?.name ?? row.item.replaceAll("_", " ");
+      return `${name} ¥${row.price}`;
+    });
+    this.showMenuChoice(`You have ¥${this.save.money ?? 0}.\nWhat would you like?`, [...labels, "CANCEL"], (index) => {
+      const row = stock[index];
+      if (!row) return;
+      if ((this.save.money ?? 0) < row.price) {
+        this.showText("You don't have\nenough money.");
+        return;
+      }
+      if (!Bag.add(this.save, row.item, 1, this.data)) {
+        this.showText("You can't carry\nany more items!");
+        return;
+      }
+      this.save.money = (this.save.money ?? 0) - row.price;
+      const name = this.data.items?.[row.item]?.name ?? row.item.replaceAll("_", " ");
+      this.showText(`Here you are!\nYou bought ${name}!`);
+    });
+  }
+
+  private openMartSell(): void {
+    const ids = Bag.order(this.save).filter((id) => {
+      const def = this.data.items?.[id];
+      return (this.save.inventory[id] ?? 0) > 0 && !!def && !def.keyItem && sellPrice(def) > 0;
+    });
+    if (ids.length === 0) {
+      this.showText("You have nothing\nI can buy.");
+      return;
+    }
+    const labels = ids.map((id) => {
+      const def = this.data.items![id]!;
+      return `${def.name} x${this.save.inventory[id]} ¥${sellPrice(def)}`;
+    });
+    this.showMenuChoice("What would you\nlike to sell?", [...labels, "CANCEL"], (index) => {
+      const id = ids[index];
+      if (!id) return;
+      const def = this.data.items![id]!;
+      const value = sellPrice(def);
+      Bag.remove(this.save, id, 1);
+      this.save.money = Math.min(MAX_MONEY, (this.save.money ?? 0) + value);
+      this.showText(`${def.name} sold\nfor ¥${value}.`);
+    });
+  }
+
+  /** Start-menu POKEMON: choose a party member, then its destination slot. */
+  openParty(): void {
+    if (this.save.party.length === 0) {
+      this.showText("You have no POKéMON!");
+      return;
+    }
+    const labels = () => this.save.party.map((mon, i) => {
+      const name = mon.nickname ?? this.data.pokemon[mon.species]?.name ?? mon.species;
+      return `${i + 1} ${name} L${mon.level}`;
+    });
+    this.showMenuChoice("Choose a POKéMON.", [...labels(), "CANCEL"], (from) => {
+      if (!this.save.party[from]) return;
+      this.showMenuChoice("Move it to which\nposition?", [...labels(), "CANCEL"], (to) => {
+        if (!this.save.party[to]) return;
+        if (from !== to) {
+          const mon = this.save.party[from];
+          this.save.party[from] = this.save.party[to];
+          this.save.party[to] = mon;
+        }
+        const lead = this.save.party[0];
+        const name = lead.nickname ?? this.data.pokemon[lead.species]?.name ?? lead.species;
+        this.showText(`${name} is now\nfirst in the lineup.`);
+      });
+    });
+  }
+
+  private teachMachine(id: string, partyIndex: number): void {
+    const item = this.data.items?.[id];
+    const machine = item?.machine;
+    const mon = this.save.party[partyIndex];
+    if (!machine || !mon) return;
+    const species = this.data.pokemon[mon.species];
+    const monName = mon.nickname ?? species?.name ?? mon.species;
+    const moveName = this.data.moves[machine.move]?.name ?? machine.move.replaceAll("_", " ");
+    if (!species?.tmhm.includes(machine.move)) {
+      this.showText(`${monName} is not\ncompatible with ${item.name}.`);
+      return;
+    }
+    if (mon.moves.some((move) => move.id === machine.move)) {
+      this.showText(`${monName} already\nknows ${moveName}.`);
+      return;
+    }
+    const finish = () => {
+      mon.moves.push({ id: machine.move, pp: this.data.moves[machine.move]?.pp ?? 0 });
+      if (machine.kind === "TM") Bag.remove(this.save, id, 1);
+      this.showText(`${monName} learned\n${moveName}!`);
+    };
+    if (mon.moves.length < 4) {
+      finish();
+      return;
+    }
+    const moveLabels = mon.moves.map((move) => this.data.moves[move.id]?.name ?? move.id.replaceAll("_", " "));
+    this.showMenuChoice(`Forget which move\nfor ${moveName}?`, [...moveLabels, "CANCEL"], (moveIndex) => {
+      const old = mon.moves[moveIndex];
+      if (!old) return;
+      const oldMachine = Object.values(this.data.items ?? {}).find((def) =>
+        def.machine?.kind === "HM" && def.machine.move === old.id
+      );
+      if (oldMachine) {
+        this.showText("HM moves can't be\nforgotten!");
+        return;
+      }
+      mon.moves.splice(moveIndex, 1);
+      finish();
+    });
+  }
+
+  openBag(): void {
+    const ids = Bag.order(this.save).filter((id) =>
+      (this.save.inventory[id] ?? 0) > 0 && !id.includes("BADGE"),
+    );
+    if (ids.length === 0) { this.showText("The BAG is empty."); return; }
+    this.showMenuChoice("Which item?", [...ids.map((id) => {
+      const def = this.data.items?.[id];
+      const name = def?.name ?? id.replaceAll("_", " ");
+      const move = def?.machine && (this.data.moves[def.machine.move]?.name ?? def.machine.move.replaceAll("_", " "));
+      return `${name}${move ? ` ${move}` : ""} x${this.save.inventory[id]}`;
+    }), "CANCEL"], (itemIndex) => {
+      const id = ids[itemIndex];
+      if (!id) return;
+      const targets = this.save.party.map((mon) => mon.nickname ?? this.data.pokemon[mon.species]?.name ?? mon.species);
+      this.showMenuChoice("Use on which\nPOKéMON?", [...targets, "CANCEL"], (partyIndex) => {
+        const mon = this.save.party[partyIndex];
+        if (!mon) return;
+        if (this.data.items?.[id]?.machine) {
+          this.teachMachine(id, partyIndex);
+          return;
+        }
+        let used = false;
+        if (id === "POTION" && mon.hp > 0 && mon.hp < mon.stats.hp) {
+          mon.hp = Math.min(mon.stats.hp, mon.hp + 20);
+          used = true;
+        } else if (id === "ANTIDOTE" && mon.status === "PSN") {
+          mon.status = null; used = true;
+        } else if (id === "PARLYZ_HEAL" && mon.status === "PAR") {
+          mon.status = null; used = true;
+        } else if (id === "BURN_HEAL" && mon.status === "BRN") {
+          mon.status = null; used = true;
+        } else if (id === "AWAKENING" && mon.status === "SLP") {
+          mon.status = null; used = true;
+        }
+        if (!used) { this.showText("It won't have any\neffect."); return; }
+        this.save.inventory[id] -= 1;
+        if (this.save.inventory[id] <= 0) delete this.save.inventory[id];
+        this.showText(`${targets[partyIndex]} recovered!`);
+      });
+    });
+  }
+
   // SceneView -----------------------------------------------------------
 
   uiBox(): UiBoxSource | null {
@@ -799,6 +1285,13 @@ export class VoxelmonGame implements OverworldShell, SceneView {
   remotePc(): RemotePcSource | null {
     const top = this.stack[this.stack.length - 1];
     return top?.kind === "pc-remote" ? (top as RemotePcState) : null;
+  }
+
+  systemOverlay(): SystemOverlaySource | null {
+    const top = this.stack[this.stack.length - 1];
+    return top?.kind === "title" || top?.kind === "start-menu"
+      ? (top as TitleState | StartMenuState)
+      : null;
   }
 
   battleView(): BattleSceneView | null {

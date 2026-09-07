@@ -47,6 +47,7 @@ export interface SaveSlice {
   flags: Record<string, boolean>;
   inventory: Record<string, number>;
   bagOrder?: string[];
+  money?: number;
   player: { name: string; rival: string };
   lastOutdoor?: LastOutdoor;
   lastHeal?: { map: string; x: number; y: number };
@@ -77,8 +78,18 @@ export interface OverworldShell {
   showChoice(text: string, choice: (yes: boolean) => void): void;
   /** Bedroom OpenRedsPC hidden event, owned by the game-state stack. */
   openBedroomComputer(): void;
+  openStartMenu(): void;
+  chooseStarter(species: "BULBASAUR" | "CHARMANDER" | "SQUIRTLE"): void;
+  buyMagikarp(): "bought" | "money" | "party-full" | "already-bought";
   pushWarpFade(frames: number, midpoint: () => void, onDone?: () => void): void;
   pushStubBattle(species: string, level: number): void;
+  pushTrainerBattle(
+    name: string,
+    trainerClass: string,
+    party: readonly { species: string; level: number }[],
+    onWin: () => void,
+  ): void;
+  openMart(stock: readonly { item: string; price: number }[]): void;
 }
 
 interface ScriptMove {
@@ -140,6 +151,7 @@ export function computeNeighbors(
   return out;
 }
 
+/** PSP-1000 memory boundary: these two outdoor maps must never coexist. */
 export class Overworld implements ScriptWorld {
   /** The content-boundary test: a map outside the pak's cooked set exists
    * as DATA (warp targets, connection math) but must never be entered —
@@ -168,6 +180,7 @@ export class Overworld implements ScriptWorld {
   private bumpCooldown = 0;
   /** A play_once jingle is in flight (Music.lua:389 pendingRestore). */
   private oneShotPending = false;
+  private oakEventRunning = false;
   /** OverworldController.lua:1455 — the map whose theme the seam step owes. */
   pendingSeamMusic: string | null = null;
   private joyLatch?: { a?: boolean };
@@ -260,6 +273,12 @@ export class Overworld implements ScriptWorld {
   // carries only the `hidden` gate (toggles/items-taken/defeated need save
   // machinery outside this slice).
   private objectVisible(obj: MapObject): boolean {
+    const chosen = this.shell.save.flags;
+    if (obj.name === "OAKSLAB_BULBASAUR_POKE_BALL" && (chosen.EVENT_CHOSE_BULBASAUR || chosen.EVENT_RIVAL_CHOSE_BULBASAUR)) return false;
+    if (obj.name === "OAKSLAB_CHARMANDER_POKE_BALL" && (chosen.EVENT_CHOSE_CHARMANDER || chosen.EVENT_RIVAL_CHOSE_CHARMANDER)) return false;
+    if (obj.name === "OAKSLAB_SQUIRTLE_POKE_BALL" && (chosen.EVENT_CHOSE_SQUIRTLE || chosen.EVENT_RIVAL_CHOSE_SQUIRTLE)) return false;
+    if (chosen[`EVENT_TAKEN_${obj.name}`] || chosen[`EVENT_BEAT_${obj.name}`]) return false;
+    if (obj.name === "SSANNE2F_RIVAL") return !chosen.EVENT_BEAT_SS_ANNE_RIVAL;
     return !(obj as MapObject & { hidden?: boolean }).hidden;
   }
 
@@ -373,6 +392,7 @@ export class Overworld implements ScriptWorld {
     // START menu: outside the slice (the early return still skips the
     // turn re-arm below, like the original's jump to .displayDialogue)
     if (input.wasPressed("start")) {
+      this.shell.openStartMenu();
       return;
     }
     for (const dir of ["up", "down", "left", "right"] as Dir[]) {
@@ -538,12 +558,50 @@ export class Overworld implements ScriptWorld {
   // so stepping onto a solid tile of the connected map bumps like a wall.
   crossConnection(dir: Dir, _conn: { map: string; offset: number }): boolean {
     if (!this.isCooked(_conn.map)) return false; // content boundary: a wall
+    // PewterCityScript: the east road does not open until Brock is beaten.
+    // The original youngster escorts Red back to the Gym; at the hard-load
+    // seam we keep the same progression invariant without staging him across
+    // a map boundary.
+    if (
+      this.map.id === "PEWTER_CITY" &&
+      dir === "right" &&
+      _conn.map === "ROUTE_3" &&
+      !this.shell.save.flags.EVENT_BEAT_BROCK
+    ) {
+      this.shell.showText("You have to beat\nBROCK before going\non to ROUTE 3!");
+      return true;
+    }
     const landing = this.connectionLanding(dir);
     if (!landing) return false;
     const { dest, ts, x, y } = landing;
     const p = this.player;
     if (!defPassable(dest, ts, x, y, p.surfing)) {
       return false;
+    }
+    // Every connection is a hard PSP-1000 scene boundary. Hold the old scene
+    // through the standard load fade, replace it at the midpoint, and enter
+    // directly on the validated destination cell. No neighbour geometry or
+    // atlas pages remain resident while the destination streams.
+    if (dest.id !== this.map.id) {
+      this.transitioning = true;
+      this.shell.pushWarpFade(
+        WARP_FADE_OUT,
+        () => {
+          this.setMap(dest.id, x, y, dir);
+          // The boundary traversal is still one logical walking cell even
+          // though no interpolated seam step survives the load screen.
+          this.player.landedCount += 1;
+          this.refreshStandingOnWarp();
+          this.shell.startMapMusic(dest.id);
+          // Preserve the seamless path's landing semantics (including its
+          // encounter RNG draw) after the destination has been installed.
+          this.onStepComplete();
+        },
+        () => {
+          this.transitioning = false;
+        },
+      );
+      return true;
     }
     this.setMap(dest.id, x, y, p.facing, { seamless: true });
     // place the player one cell before the seam and start the step into the
@@ -625,11 +683,217 @@ export class Overworld implements ScriptWorld {
   // TEXT_* constant. Item balls, static encounters, trainer engagement and
   // TX_SCRIPT marts/nurses are the battle/menu ports' seams.
   talkTo(npc: NPC): void {
+    if (this.tryChooseStarter(npc)) return;
+    if (this.tryChapterInteraction(npc)) return;
     npc.frozen = true;
     const unfreeze = () => {
       npc.frozen = false;
     };
     this.showMapText(npc.def.text, npc, unfreeze);
+  }
+
+  /** Pallet-to-Brock chapter interactions whose original pointers are
+   * TX_SCRIPT rather than plain text: centers, marts, item balls and the
+   * first trainer roster. */
+  private tryChapterInteraction(npc: NPC): boolean {
+    const name = npc.def.name ?? "";
+    if (name === "MTMOONPOKECENTER_MAGIKARP_SALESMAN") {
+      this.shell.showChoice("A MAGIKARP for just\n¥500! Want it?", (yes) => {
+        if (!yes) {
+          this.shell.showText("No? Only ¥500...", () => { npc.frozen = false; });
+          return;
+        }
+        const result = this.shell.buyMagikarp();
+        const text = result === "bought"
+          ? "You bought MAGIKARP!"
+          : result === "money"
+            ? "You don't have\nenough money."
+            : result === "party-full"
+              ? "Your party is full."
+              : "I already sold you\nthat MAGIKARP.";
+        this.shell.showText(text, () => { npc.frozen = false; });
+      });
+      return true;
+    }
+    if (name === "BILLSHOUSE_BILL_POKEMON") {
+      this.shell.save.flags.EVENT_MET_BILL = true;
+      this.shell.save.inventory.SS_TICKET = 1;
+      this.shell.showText("BILL is back to normal!\fBILL gave you the\nS.S.TICKET!");
+      return true;
+    }
+    if (name === "SSANNECAPTAINSROOM_CAPTAIN") {
+      if (!this.shell.save.flags.EVENT_GOT_HM01) {
+        this.shell.save.flags.EVENT_GOT_HM01 = true;
+        this.shell.save.inventory.HM_CUT = 1;
+        this.shell.showText("The CAPTAIN feels\nmuch better!\fYou received HM01\n- CUT!");
+      } else {
+        this.shell.showText("CAPTAIN: CUT can\nchop down small trees.");
+      }
+      return true;
+    }
+    if (name === "SSANNE2F_RIVAL") {
+      const starter = this.rivalStarter();
+      const index = starter === "SQUIRTLE" ? 1 : starter === "BULBASAUR" ? 2 : 3;
+      const party = this.shell.data.trainers?.OPP_RIVAL2?.parties[index - 1];
+      if (!party) return false;
+      this.shell.showText(`${this.shell.save.player.rival}: Bonjour!\nImagine seeing you here!`, () => {
+        this.shell.pushTrainerBattle(`RIVAL ${this.shell.save.player.rival}`, "OPP_RIVAL2", party, () => {
+          this.shell.save.flags.EVENT_BEAT_SS_ANNE_RIVAL = true;
+          this.npcs = this.npcs.filter((candidate) => candidate !== npc);
+          this.entities = [this.player, ...this.npcs];
+          this.shell.showText(`${this.shell.save.player.rival}: Smell ya!`);
+        });
+      });
+      return true;
+    }
+    if (name.endsWith("POKECENTER_NURSE")) {
+      npc.frozen = true;
+      npc.facePlayer(this.player);
+      this.shell.showChoice("Welcome to our\nPOKéMON CENTER!\nHeal your POKéMON?", (yes) => {
+        if (yes) {
+          this.shell.healParty();
+          this.shell.save.lastHeal = { map: this.map.id, x: 3, y: 6 };
+          this.shell.showText("Your POKéMON are\nfighting fit!", () => { npc.frozen = false; });
+        } else {
+          npc.frozen = false;
+        }
+      });
+      return true;
+    }
+    if (name.endsWith("MART_CLERK")) {
+      const pointers = this.shell.data.text_pointers as
+        | Record<string, Record<string, { mart?: string[] }>>
+        | undefined;
+      const ids = pointers?.[this.map.def.label]?.[npc.def.text]?.mart ?? [];
+      const stock = ids.flatMap((item) => {
+        const def = this.shell.data.items?.[item];
+        return def ? [{ item, price: def.price }] : [];
+      });
+      this.shell.openMart(stock);
+      return true;
+    }
+    const itemBalls: Record<string, string> = {
+      VIRIDIANFOREST_ANTIDOTE: "ANTIDOTE",
+      VIRIDIANFOREST_POTION: "POTION",
+      VIRIDIANFOREST_POKE_BALL: "POKE_BALL",
+      ROUTE2_MOON_STONE: "MOON_STONE",
+      ROUTE2_HP_UP: "HP_UP",
+      MTMOON1F_POTION1: "POTION",
+      MTMOON1F_MOON_STONE: "MOON_STONE",
+      MTMOON1F_RARE_CANDY: "RARE_CANDY",
+      MTMOON1F_ESCAPE_ROPE: "ESCAPE_ROPE",
+      MTMOON1F_POTION2: "POTION",
+      MTMOON1F_TM_WATER_GUN: "TM_WATER_GUN",
+      MTMOONB2F_HP_UP: "HP_UP",
+      MTMOONB2F_TM_MEGA_PUNCH: "TM_MEGA_PUNCH",
+      ROUTE4_TM_WHIRLWIND: "TM_WHIRLWIND",
+    };
+    const item = itemBalls[name] ?? npc.def.item;
+    if (item) {
+      this.shell.save.inventory[item] = (this.shell.save.inventory[item] ?? 0) + 1;
+      this.shell.save.flags[`EVENT_TAKEN_${name}`] = true;
+      this.npcs = this.npcs.filter((candidate) => candidate !== npc);
+      this.entities = [this.player, ...this.npcs];
+      this.shell.showText(`${this.shell.save.player.name} found\n${item.replaceAll("_", " ")}!`);
+      return true;
+    }
+    const trainers: Record<string, { label?: string; trainerClass: string; party?: { species: string; level: number }[]; partyIndex?: number; range?: number; event?: string }> = {
+      VIRIDIANFOREST_YOUNGSTER2: { label: "BUG CATCHER RICK", trainerClass: "OPP_BUG_CATCHER", party: [{ species: "WEEDLE", level: 6 }, { species: "CATERPIE", level: 6 }] },
+      VIRIDIANFOREST_YOUNGSTER3: { label: "BUG CATCHER DOUG", trainerClass: "OPP_BUG_CATCHER", party: [{ species: "WEEDLE", level: 7 }, { species: "KAKUNA", level: 7 }, { species: "WEEDLE", level: 7 }] },
+      VIRIDIANFOREST_YOUNGSTER4: { label: "BUG CATCHER SAMMY", trainerClass: "OPP_BUG_CATCHER", party: [{ species: "WEEDLE", level: 9 }] },
+      PEWTERGYM_COOLTRAINER_M: { label: "JR.TRAINER♂ LIAM", trainerClass: "OPP_JR_TRAINER_M", party: [{ species: "DIGLETT", level: 11 }, { species: "SANDSHREW", level: 11 }] },
+      PEWTERGYM_BROCK: { label: "BROCK", trainerClass: "OPP_BROCK", party: [{ species: "GEODUDE", level: 12 }, { species: "ONIX", level: 14 }] },
+      ROUTE3_YOUNGSTER1: { trainerClass: "OPP_BUG_CATCHER", partyIndex: 4, range: 2, event: "EVENT_BEAT_ROUTE_3_TRAINER_0" },
+      ROUTE3_YOUNGSTER2: { trainerClass: "OPP_YOUNGSTER", partyIndex: 1, range: 3, event: "EVENT_BEAT_ROUTE_3_TRAINER_1" },
+      ROUTE3_COOLTRAINER_F1: { trainerClass: "OPP_LASS", partyIndex: 1, range: 2, event: "EVENT_BEAT_ROUTE_3_TRAINER_2" },
+      ROUTE3_YOUNGSTER3: { trainerClass: "OPP_BUG_CATCHER", partyIndex: 5, range: 1, event: "EVENT_BEAT_ROUTE_3_TRAINER_3" },
+      ROUTE3_COOLTRAINER_F2: { trainerClass: "OPP_LASS", partyIndex: 2, range: 4, event: "EVENT_BEAT_ROUTE_3_TRAINER_4" },
+      ROUTE3_YOUNGSTER4: { trainerClass: "OPP_YOUNGSTER", partyIndex: 2, range: 3, event: "EVENT_BEAT_ROUTE_3_TRAINER_5" },
+      ROUTE3_YOUNGSTER5: { trainerClass: "OPP_BUG_CATCHER", partyIndex: 6, range: 3, event: "EVENT_BEAT_ROUTE_3_TRAINER_6" },
+      ROUTE3_COOLTRAINER_F3: { trainerClass: "OPP_LASS", partyIndex: 3, range: 2, event: "EVENT_BEAT_ROUTE_3_TRAINER_7" },
+      MTMOON1F_HIKER: { trainerClass: "OPP_HIKER", partyIndex: 1, range: 2, event: "EVENT_BEAT_MT_MOON_1_TRAINER_0" },
+      MTMOON1F_YOUNGSTER1: { trainerClass: "OPP_YOUNGSTER", partyIndex: 3, range: 3, event: "EVENT_BEAT_MT_MOON_1_TRAINER_1" },
+      MTMOON1F_COOLTRAINER_F1: { trainerClass: "OPP_LASS", partyIndex: 5, range: 3, event: "EVENT_BEAT_MT_MOON_1_TRAINER_2" },
+      MTMOON1F_SUPER_NERD: { trainerClass: "OPP_SUPER_NERD", partyIndex: 1, range: 3, event: "EVENT_BEAT_MT_MOON_1_TRAINER_3" },
+      MTMOON1F_COOLTRAINER_F2: { trainerClass: "OPP_LASS", partyIndex: 6, range: 3, event: "EVENT_BEAT_MT_MOON_1_TRAINER_4" },
+      MTMOON1F_YOUNGSTER2: { trainerClass: "OPP_BUG_CATCHER", partyIndex: 7, range: 3, event: "EVENT_BEAT_MT_MOON_1_TRAINER_5" },
+      MTMOON1F_YOUNGSTER3: { trainerClass: "OPP_BUG_CATCHER", partyIndex: 8, range: 3, event: "EVENT_BEAT_MT_MOON_1_TRAINER_6" },
+      MTMOONB2F_SUPER_NERD: { trainerClass: "OPP_SUPER_NERD", partyIndex: 2, event: "EVENT_BEAT_MT_MOON_3_SUPER_NERD" },
+      MTMOONB2F_ROCKET1: { trainerClass: "OPP_ROCKET", partyIndex: 1, range: 4, event: "EVENT_BEAT_MT_MOON_3_TRAINER_0" },
+      MTMOONB2F_ROCKET2: { trainerClass: "OPP_ROCKET", partyIndex: 2, range: 4, event: "EVENT_BEAT_MT_MOON_3_TRAINER_1" },
+      MTMOONB2F_ROCKET3: { trainerClass: "OPP_ROCKET", partyIndex: 3, range: 4, event: "EVENT_BEAT_MT_MOON_3_TRAINER_2" },
+      MTMOONB2F_ROCKET4: { trainerClass: "OPP_ROCKET", partyIndex: 4, range: 4, event: "EVENT_BEAT_MT_MOON_3_TRAINER_3" },
+      ROUTE4_COOLTRAINER_F2: { trainerClass: "OPP_LASS", partyIndex: 4, range: 3, event: "EVENT_BEAT_ROUTE_4_TRAINER_0" },
+      CERULEANGYM_COOLTRAINER_F: { trainerClass: "OPP_JR_TRAINER_F", partyIndex: 1, range: 3, event: "EVENT_BEAT_CERULEAN_GYM_TRAINER_0" },
+      CERULEANGYM_SWIMMER: { trainerClass: "OPP_SWIMMER", partyIndex: 1, range: 3, event: "EVENT_BEAT_CERULEAN_GYM_TRAINER_1" },
+      CERULEANGYM_MISTY: { label: "MISTY", trainerClass: "OPP_MISTY", partyIndex: 1, event: "EVENT_BEAT_MISTY" },
+    };
+    const trainer = trainers[name] ?? (npc.def.trainerClass && npc.def.trainerParty
+      ? {
+          trainerClass: npc.def.trainerClass,
+          partyIndex: npc.def.trainerParty,
+          event: `EVENT_BEAT_${name}`,
+        }
+      : undefined);
+    if (!trainer) return false;
+    const trainerDef = this.shell.data.trainers?.[trainer.trainerClass];
+    const party = trainer.party ?? trainerDef?.parties[(trainer.partyIndex ?? 1) - 1];
+    if (!party?.length) return false;
+    const label = trainer.label ?? trainerDef?.name ?? "TRAINER";
+    const forestFlag: Record<string, string> = {
+      VIRIDIANFOREST_YOUNGSTER2: "EVENT_BEAT_VIRIDIAN_FOREST_TRAINER_0",
+      VIRIDIANFOREST_YOUNGSTER3: "EVENT_BEAT_VIRIDIAN_FOREST_TRAINER_1",
+      VIRIDIANFOREST_YOUNGSTER4: "EVENT_BEAT_VIRIDIAN_FOREST_TRAINER_2",
+      PEWTERGYM_COOLTRAINER_M: "EVENT_BEAT_PEWTER_GYM_TRAINER_0",
+    };
+    const beatFlag = trainer.event ?? (name === "PEWTERGYM_BROCK" ? "EVENT_BEAT_BROCK" : (forestFlag[name] ?? `EVENT_BEAT_${name}`));
+    if (this.shell.save.flags[beatFlag]) {
+      if (name === "PEWTERGYM_BROCK") {
+        this.shell.showText("Go to the GYM in\nCERULEAN and test\nyour abilities!");
+        return true;
+      }
+      return false;
+    }
+    npc.frozen = true;
+    npc.facePlayer(this.player);
+    const pre = this.resolveText(npc.def.text) ?? `${label} wants\nto battle!`;
+    this.shell.showText(pre, () => this.shell.pushTrainerBattle(label, trainer.trainerClass, party, () => {
+      this.shell.save.flags[beatFlag] = true;
+      npc.frozen = false;
+      if (name === "PEWTERGYM_BROCK") {
+        this.shell.save.inventory.BOULDERBADGE = 1;
+        this.shell.save.inventory.TM_BIDE = (this.shell.save.inventory.TM_BIDE ?? 0) + 1;
+        this.shell.save.flags.EVENT_GOT_TM34 = true;
+        this.shell.showText("You received the\nBOULDERBADGE!\fBROCK gave you\nTM34 - BIDE!");
+      } else if (name === "CERULEANGYM_MISTY") {
+        this.shell.save.inventory.CASCADEBADGE = 1;
+        this.shell.save.inventory.TM_BUBBLEBEAM = (this.shell.save.inventory.TM_BUBBLEBEAM ?? 0) + 1;
+        this.shell.save.flags.EVENT_GOT_TM11 = true;
+        this.shell.showText("You received the\nCASCADEBADGE!\fMISTY gave you\nTM11 - BUBBLEBEAM!");
+      } else {
+        this.shell.showText(`${label} was\ndefeated!`);
+      }
+    }));
+    return true;
+  }
+
+  private tryChooseStarter(npc: NPC): boolean {
+    if (this.map.id !== "OAKS_LAB" || this.shell.save.flags.EVENT_GOT_STARTER) return false;
+    const species = npc.def.name?.match(/^OAKSLAB_(BULBASAUR|CHARMANDER|SQUIRTLE)_POKE_BALL$/)?.[1] as
+      | "BULBASAUR"
+      | "CHARMANDER"
+      | "SQUIRTLE"
+      | undefined;
+    if (!species) return false;
+    const kind = species === "BULBASAUR" ? "plant" : species === "CHARMANDER" ? "fire" : "water";
+    this.shell.showChoice(`So! You want the\n${kind} POKéMON,\n${species}?`, (yes) => {
+      if (!yes) return;
+      this.shell.chooseStarter(species);
+      this.shell.showText(`${this.shell.save.player.name} received\na ${species}!`);
+      this.npcs = this.npcs.filter((candidate) => this.objectVisible(candidate.def));
+      this.entities = [this.player, ...this.npcs];
+    });
+    return true;
   }
 
   // OverworldController.lua:3241 showMapText — a TEXT_* constant goes to the
@@ -730,6 +994,12 @@ export class Overworld implements ScriptWorld {
   // day-care, poison and repel are outside the slice.)
   onStepComplete(): void {
     const p = this.player;
+    if (this.tryLabExitGate()) return;
+    if (this.tryLabRivalEvent()) return;
+    if (this.tryPalletOakEvent()) return;
+    if (this.tryRoute22RivalEvent()) return;
+    if (this.tryCeruleanRivalEvent()) return;
+    if (this.tryTrainerSight()) return;
     // The arrival disable is POSITIONAL (issue #265): the cell we warped in
     // on is inert until we step off it; pokered has no one-shot counter —
     // every completed step runs CheckWarpsNoCollision.
@@ -781,6 +1051,239 @@ export class Overworld implements ScriptWorld {
     }
   }
 
+  /** CheckTrainerBattle: only the first-chapter trainer headers are active
+   * in this build. A clear straight sight line freezes input, walks the
+   * trainer to the adjacent cell, then dispatches the same talk handler as A. */
+  private tryTrainerSight(): boolean {
+    const ranges: Record<string, number> = {
+      VIRIDIANFOREST_YOUNGSTER2: 4,
+      VIRIDIANFOREST_YOUNGSTER3: 4,
+      VIRIDIANFOREST_YOUNGSTER4: 1,
+      PEWTERGYM_COOLTRAINER_M: 5,
+      ROUTE3_YOUNGSTER1: 2, ROUTE3_YOUNGSTER2: 3, ROUTE3_COOLTRAINER_F1: 2,
+      ROUTE3_YOUNGSTER3: 1, ROUTE3_COOLTRAINER_F2: 4, ROUTE3_YOUNGSTER4: 3,
+      ROUTE3_YOUNGSTER5: 3, ROUTE3_COOLTRAINER_F3: 2,
+      MTMOON1F_HIKER: 2, MTMOON1F_YOUNGSTER1: 3, MTMOON1F_COOLTRAINER_F1: 3,
+      MTMOON1F_SUPER_NERD: 3, MTMOON1F_COOLTRAINER_F2: 3,
+      MTMOON1F_YOUNGSTER2: 3, MTMOON1F_YOUNGSTER3: 3,
+      MTMOONB2F_ROCKET1: 4, MTMOONB2F_ROCKET2: 4,
+      MTMOONB2F_ROCKET3: 4, MTMOONB2F_ROCKET4: 4,
+      ROUTE4_COOLTRAINER_F2: 3,
+      CERULEANGYM_COOLTRAINER_F: 3, CERULEANGYM_SWIMMER: 3,
+    };
+    const events: Record<string, string> = {
+      ROUTE3_YOUNGSTER1: "EVENT_BEAT_ROUTE_3_TRAINER_0", ROUTE3_YOUNGSTER2: "EVENT_BEAT_ROUTE_3_TRAINER_1",
+      ROUTE3_COOLTRAINER_F1: "EVENT_BEAT_ROUTE_3_TRAINER_2", ROUTE3_YOUNGSTER3: "EVENT_BEAT_ROUTE_3_TRAINER_3",
+      ROUTE3_COOLTRAINER_F2: "EVENT_BEAT_ROUTE_3_TRAINER_4", ROUTE3_YOUNGSTER4: "EVENT_BEAT_ROUTE_3_TRAINER_5",
+      ROUTE3_YOUNGSTER5: "EVENT_BEAT_ROUTE_3_TRAINER_6", ROUTE3_COOLTRAINER_F3: "EVENT_BEAT_ROUTE_3_TRAINER_7",
+      MTMOON1F_HIKER: "EVENT_BEAT_MT_MOON_1_TRAINER_0", MTMOON1F_YOUNGSTER1: "EVENT_BEAT_MT_MOON_1_TRAINER_1",
+      MTMOON1F_COOLTRAINER_F1: "EVENT_BEAT_MT_MOON_1_TRAINER_2", MTMOON1F_SUPER_NERD: "EVENT_BEAT_MT_MOON_1_TRAINER_3",
+      MTMOON1F_COOLTRAINER_F2: "EVENT_BEAT_MT_MOON_1_TRAINER_4", MTMOON1F_YOUNGSTER2: "EVENT_BEAT_MT_MOON_1_TRAINER_5",
+      MTMOON1F_YOUNGSTER3: "EVENT_BEAT_MT_MOON_1_TRAINER_6", MTMOONB2F_ROCKET1: "EVENT_BEAT_MT_MOON_3_TRAINER_0",
+      MTMOONB2F_ROCKET2: "EVENT_BEAT_MT_MOON_3_TRAINER_1", MTMOONB2F_ROCKET3: "EVENT_BEAT_MT_MOON_3_TRAINER_2",
+      MTMOONB2F_ROCKET4: "EVENT_BEAT_MT_MOON_3_TRAINER_3", ROUTE4_COOLTRAINER_F2: "EVENT_BEAT_ROUTE_4_TRAINER_0",
+      CERULEANGYM_COOLTRAINER_F: "EVENT_BEAT_CERULEAN_GYM_TRAINER_0", CERULEANGYM_SWIMMER: "EVENT_BEAT_CERULEAN_GYM_TRAINER_1",
+    };
+    const dirs: Record<string, Dir> = {
+      LEFT: "left", RIGHT: "right", UP: "up", DOWN: "down",
+    };
+    for (const npc of this.npcs) {
+      const range = ranges[npc.def.name ?? ""];
+      const dir = dirs[npc.def.range ?? ""];
+      if (!range || !dir || this.shell.save.flags[events[npc.def.name ?? ""] ?? (
+        npc.def.name === "PEWTERGYM_COOLTRAINER_M"
+          ? "EVENT_BEAT_PEWTER_GYM_TRAINER_0"
+          : `EVENT_BEAT_VIRIDIAN_FOREST_TRAINER_${npc.def.index - 2}`
+      )]) continue;
+      const dx = this.player.cellX - npc.cellX;
+      const dy = this.player.cellY - npc.cellY;
+      const distance = Math.abs(dx) + Math.abs(dy);
+      const aligned =
+        (dir === "left" && dy === 0 && dx < 0) ||
+        (dir === "right" && dy === 0 && dx > 0) ||
+        (dir === "up" && dx === 0 && dy < 0) ||
+        (dir === "down" && dx === 0 && dy > 0);
+      if (!aligned || distance > range) continue;
+      let clear = true;
+      for (let step = 1; step < distance; step++) {
+        const x = npc.cellX + (dx === 0 ? 0 : Math.sign(dx) * step);
+        const y = npc.cellY + (dy === 0 ? 0 : Math.sign(dy) * step);
+        if (!this.map.isWalkableCell(x, y) || this.npcAtCell(x, y)) { clear = false; break; }
+      }
+      if (!clear) continue;
+      npc.frozen = true;
+      npc.facing = dir;
+      this.shell.showText("!", () => {
+        this.scriptMove(npc, dir, Math.max(0, distance - 1), () => this.talkTo(npc));
+      });
+      return true;
+    }
+    return false;
+  }
+
+  private tryLabExitGate(): boolean {
+    const flags = this.shell.save.flags;
+    if (
+      this.map.id !== "OAKS_LAB" || this.player.cellY < 6 ||
+      !flags.EVENT_FOLLOWED_OAK_INTO_LAB || flags.EVENT_GOT_STARTER
+    ) return false;
+    const text = this.shell.data.text as Record<string, string> | undefined;
+    this.shell.showText(text?._OaksLabOakDontGoAwayYetText ?? "OAK: Wait!\nDon't go away yet!", () => {
+      this.scriptMove(this.player, "up", 1);
+    });
+    return true;
+  }
+
+  private tryLabRivalEvent(): boolean {
+    const flags = this.shell.save.flags;
+    if (
+      this.map.id !== "OAKS_LAB" || this.player.cellY < 6 ||
+      !flags.EVENT_GOT_STARTER || flags.EVENT_BATTLED_RIVAL_IN_OAKS_LAB
+    ) return false;
+    const rivalSpecies = flags.EVENT_CHOSE_BULBASAUR
+      ? "CHARMANDER"
+      : flags.EVENT_CHOSE_CHARMANDER
+        ? "SQUIRTLE"
+        : "BULBASAUR";
+    const text = this.shell.data.text as Record<string, string> | undefined;
+    this.shell.showText(
+      text?._OaksLabRivalIllTakeYouOnText ?? "BLUE: Wait!\nLet's check out our\nPOKéMON!",
+      () => {
+        flags.EVENT_BATTLED_RIVAL_IN_OAKS_LAB = true;
+        this.shell.pushTrainerBattle("RIVAL BLUE", "OPP_RIVAL1", [{ species: rivalSpecies, level: 5 }], () => {});
+      },
+    );
+    return true;
+  }
+
+  private rivalStarter(): "BULBASAUR" | "CHARMANDER" | "SQUIRTLE" {
+    const flags = this.shell.save.flags;
+    return flags.EVENT_CHOSE_BULBASAUR ? "CHARMANDER"
+      : flags.EVENT_CHOSE_CHARMANDER ? "SQUIRTLE" : "BULBASAUR";
+  }
+
+  /** Route22.asm first rival encounter at (29,4)/(29,5), parties 4..6. */
+  private tryRoute22RivalEvent(): boolean {
+    const flags = this.shell.save.flags;
+    const p = this.player;
+    if (this.map.id !== "ROUTE_22" || !flags.EVENT_GOT_STARTER ||
+        flags.EVENT_BEAT_ROUTE22_RIVAL_1ST_BATTLE ||
+        !((p.cellX === 29 && p.cellY === 4) || (p.cellX === 29 && p.cellY === 5))) return false;
+    const starter = this.rivalStarter();
+    const index = starter === "SQUIRTLE" ? 4 : starter === "BULBASAUR" ? 5 : 6;
+    const party = this.shell.data.trainers?.OPP_RIVAL1?.parties[index - 1];
+    if (!party) return false;
+    this.shell.showText(`${this.shell.save.player.rival}: Hey!\nYou're going to the\nPOKéMON LEAGUE?`, () => {
+      this.shell.pushTrainerBattle(`RIVAL ${this.shell.save.player.rival}`, "OPP_RIVAL1", party, () => {
+        flags.EVENT_BEAT_ROUTE22_RIVAL_1ST_BATTLE = true;
+        this.shell.showText(`${this.shell.save.player.rival}: Smell you later!`);
+      });
+    });
+    return true;
+  }
+
+  /** CeruleanCity.asm bridge approach at (20,6)/(21,6), parties 7..9. */
+  private tryCeruleanRivalEvent(): boolean {
+    const flags = this.shell.save.flags;
+    const p = this.player;
+    if (this.map.id !== "CERULEAN_CITY" || flags.EVENT_BEAT_CERULEAN_RIVAL ||
+        !((p.cellX === 20 || p.cellX === 21) && p.cellY === 6)) return false;
+    const starter = this.rivalStarter();
+    const index = starter === "SQUIRTLE" ? 7 : starter === "BULBASAUR" ? 8 : 9;
+    const party = this.shell.data.trainers?.OPP_RIVAL1?.parties[index - 1];
+    if (!party) return false;
+    this.shell.showText(`${this.shell.save.player.rival}: Yo!\nYou're still struggling\nalong back here?`, () => {
+      this.shell.pushTrainerBattle(`RIVAL ${this.shell.save.player.rival}`, "OPP_RIVAL1", party, () => {
+        flags.EVENT_BEAT_CERULEAN_RIVAL = true;
+        this.shell.showText(`${this.shell.save.player.rival}: I went to see\nBILL! Smell ya!`);
+      });
+    });
+    return true;
+  }
+
+  /** PalletTownOakHeyWaitScript, before warp and encounter processing. */
+  private tryPalletOakEvent(): boolean {
+    const flags = this.shell.save.flags;
+    if (
+      this.map.id !== "PALLET_TOWN" ||
+      this.player.cellY !== 1 ||
+      flags.EVENT_FOLLOWED_OAK_INTO_LAB ||
+      this.oakEventRunning
+    ) {
+      return false;
+    }
+    this.oakEventRunning = true;
+    this.player.facing = "down";
+    const text = this.shell.data.text as Record<string, string> | undefined;
+    const walkPath = (entity: Player | NPC, steps: Dir[], done?: () => void): void => {
+      const next = (i: number): void => {
+        const dir = steps[i];
+        if (!dir) { done?.(); return; }
+        this.scriptMove(entity, dir, 1, () => next(i + 1));
+      };
+      next(0);
+    };
+    this.shell.showText(
+      text?._PalletTownOakHeyWaitDontGoOutText ?? "OAK: Hey! Wait!\nDon't go out!",
+      () => {
+        const oakDef = this.map.def.objects.find((obj) => obj.name === "PALLETTOWN_OAK");
+        if (!oakDef) { this.oakEventRunning = false; return; }
+        const oak = new NPC(this.map.id, oakDef, this.shell.npcRng);
+        oak.frozen = true;
+        // Keep the escort synchronized with the current player setting.
+        // Music-on mode deliberately lengthens player steps, so Oak must use
+        // that same duration instead of the NPC default or he pulls ahead.
+        oak.stepFrames = this.player.stepFrames;
+        this.npcs.push(oak);
+        this.entities = [this.player, ...this.npcs];
+        const approach: Dir[] = [];
+        while (oak.cellX + approach.filter((d) => d === "right").length - approach.filter((d) => d === "left").length !== this.player.cellX) {
+          const projected = oak.cellX + approach.filter((d) => d === "right").length - approach.filter((d) => d === "left").length;
+          approach.push(projected < this.player.cellX ? "right" : "left");
+        }
+        approach.push("up", "up", "up");
+        walkPath(oak, approach, () => this.shell.showText(
+          text?._PalletTownOakItsUnsafeText ?? "OAK: It's unsafe!\nWild POKéMON live\nin tall grass!",
+          () => {
+            const oakSteps: Dir[] = ["down", "down", "down", "down", "down", "left", "down", "down", "down", "down", "down", "right", "right", "right", "up"];
+            const playerSteps: Dir[] = ["down", ...oakSteps];
+            walkPath(oak, oakSteps);
+            walkPath(this.player, playerSteps, () => {
+              // This is a fully scripted entrance. Do not arm the generic
+              // door walk-out: it would queue a south step at the same time
+              // as the escort queues its northbound lab path. The desktop
+              // scheduler happened to serialize those moves, but the PSP
+              // could stall on that conflicting transition-frame pair.
+              this.doorWarp = false;
+              this.shell.audio.playSfx("Go_Inside");
+              this.startWarpTo("OAKS_LAB", 5, 11, "up", () => {
+                const labOakDef = this.map.def.objects.find((obj) => obj.name === "OAKSLAB_OAK2");
+                if (labOakDef) {
+                  const labOak = new NPC(this.map.id, labOakDef, this.shell.npcRng);
+                  labOak.frozen = true;
+                  this.npcs.push(labOak);
+                  this.entities = [this.player, ...this.npcs];
+                  walkPath(labOak, ["up", "up", "up"]);
+                }
+                // Seven north steps from y=11 reaches the same y=4 endpoint
+                // as the old automatic south step followed by eight north.
+                walkPath(this.player, ["up", "up", "up", "up", "up", "up", "up"], () => {
+                  flags.EVENT_FOLLOWED_OAK_INTO_LAB = true;
+                  flags.EVENT_FOLLOWED_OAK_INTO_LAB_2 = true;
+                  flags.EVENT_OAK_ASKED_TO_CHOOSE_MON = true;
+                  this.shell.showText(text?._OaksLabOakChooseMonText ?? "OAK: Choose a POKéMON!", () => {
+                    this.oakEventRunning = false;
+                  });
+                });
+              });
+            });
+          },
+        ));
+      },
+    );
+    return true;
+  }
+
   // OverworldController.lua:3907 takeWarp
   takeWarp(warpDef: MapWarp): void {
     let last = this.lastOutdoor;
@@ -790,7 +1293,41 @@ export class Overworld implements ScriptWorld {
       const heal = this.shell.save.lastHeal;
       if (heal) last = { id: heal.map, x: heal.x, y: heal.y };
     }
-    const dest = destination(this.shell.data, warpDef, last);
+    // Diglett's Cave has an indoor foyer at each end. `LAST_MAP` alone would
+    // retain the route used at the *other* mouth while traversing the cave,
+    // sending the far exit back across the world. Pin each foyer to its
+    // physical outdoor doorway instead.
+    const caveParent = this.map.id === "DIGLETTS_CAVE_ROUTE_2"
+      ? "ROUTE_2"
+      : this.map.id === "DIGLETTS_CAVE_ROUTE_11"
+        ? "ROUTE_11"
+        : undefined;
+    const parentWarp = caveParent && warpDef.destMap === "LAST_MAP"
+      ? this.shell.data.maps?.[caveParent]?.warps.find((w) => w.destMap === this.map.id)
+      : undefined;
+    const dest = parentWarp && caveParent
+      ? { map: caveParent, x: parentWarp.x, y: parentWarp.y }
+      : destination(this.shell.data, warpDef, last);
+    // VermilionDockScript: the sailor checks the S.S.TICKET before admitting
+    // Red. Once HM01 has been collected and the ship has been exited, it
+    // departs and cannot be boarded again.
+    if (this.map.id === "VERMILION_CITY" && dest.map === "VERMILION_DOCK") {
+      if (this.shell.save.flags.EVENT_SS_ANNE_LEFT) {
+        this.shell.showText("The S.S.ANNE has\nset sail!");
+        return;
+      }
+      if (!this.shell.save.inventory.SS_TICKET) {
+        this.shell.showText("You need an\nS.S.TICKET to board!");
+        return;
+      }
+    }
+    if (
+      this.map.id === "SS_ANNE_1F" &&
+      dest.map === "VERMILION_DOCK" &&
+      this.shell.save.flags.EVENT_GOT_HM01
+    ) {
+      this.shell.save.flags.EVENT_SS_ANNE_LEFT = true;
+    }
     // facing carries across the warp (leaving a gate sideways keeps you
     // walking sideways; house exit mats are stepped onto facing down)
     const facing = this.player.facing;
@@ -812,7 +1349,14 @@ export class Overworld implements ScriptWorld {
   // OverworldController.lua:4004 startWarpTo — the fade out (32 ticks,
   // Timing WARP_FADE_OUT), the map switch at the midpoint, no fade back in
   // (LoadGBPal restores the palettes in one write).
-  startWarpTo(mapId: string, x: number, y: number, facing?: Dir, onDone?: () => void): void {
+  startWarpTo(
+    mapId: string,
+    x: number,
+    y: number,
+    facing?: Dir,
+    onDone?: () => void,
+    rememberSource = true,
+  ): void {
     if (!this.isCooked(mapId)) {
       // The door is locked: a warp into a map the pak has no geometry for
       // would land the player in an invisible world. The warp never happens,
@@ -826,7 +1370,7 @@ export class Overworld implements ScriptWorld {
     }
     // ANY transition off an outdoor map remembers the outdoor side, so
     // LAST_MAP exits keep working (CheckIfInOutsideMap includes PLATEAU).
-    if (isOutside(this.map.def) && mapId !== this.map.id) {
+    if (rememberSource && isOutside(this.map.def) && mapId !== this.map.id) {
       this.rememberOutdoor(this.map.id, this.player.cellX, this.player.cellY);
     }
     this.transitioning = true;
@@ -836,6 +1380,12 @@ export class Overworld implements ScriptWorld {
       WARP_FADE_OUT,
       () => {
         this.setMap(mapId, x, y, facing ?? "down");
+        // Entering the lab voluntarily means Oak no longer needs to fetch
+        // the player from Pallet's grass. It does not grant a starter.
+        if (mapId === "OAKS_LAB") {
+          this.shell.save.flags.EVENT_FOLLOWED_OAK_INTO_LAB = true;
+          this.shell.save.flags.EVENT_FOLLOWED_OAK_INTO_LAB_2 = true;
+        }
         // The warp we land ON stays inert until we physically step off it,
         // so a warp whose destination cell is itself a warp cannot bounce
         // us straight back. BIT_STANDING_ON_WARP is deliberately NOT

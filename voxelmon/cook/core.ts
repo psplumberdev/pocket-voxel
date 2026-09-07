@@ -51,10 +51,70 @@ export const DEFAULT_MAPS: readonly string[] = [
   "OAKS_LAB",
   "ROUTE_1",
   "VIRIDIAN_CITY",
-  // Viridian's north exit is a real ROM connection. Route 2 prevents the
-  // border tree ring from painting across it.
+  "VIRIDIAN_POKECENTER",
+  "VIRIDIAN_MART",
+  // The first complete campaign chapter. Geometry remains file-backed on
+  // PSP-1000, so adding these maps costs storage rather than resident RAM.
   "ROUTE_2",
+  "ROUTE_2_GATE",
+  "VIRIDIAN_FOREST_SOUTH_GATE",
+  "VIRIDIAN_FOREST",
+  "VIRIDIAN_FOREST_NORTH_GATE",
+  "PEWTER_CITY",
+  "PEWTER_POKECENTER",
+  "PEWTER_MART",
+  "PEWTER_GYM",
   "BLUES_HOUSE",
+  // West rival/Nidoran detour and the complete Brock-to-Misty chapter.
+  "ROUTE_22",
+  "ROUTE_22_GATE",
+  "ROUTE_3",
+  "ROUTE_4",
+  "MT_MOON_POKECENTER",
+  "MT_MOON_1F",
+  "MT_MOON_B1F",
+  "MT_MOON_B2F",
+  "CERULEAN_CITY",
+  "CERULEAN_POKECENTER",
+  "CERULEAN_MART",
+  "CERULEAN_GYM",
+  // Nugget Bridge/Bill, the southbound Underground Path, Vermilion, and
+  // every accessible deck and cabin of the S.S. Anne.
+  "CERULEAN_TRASHED_HOUSE",
+  "ROUTE_24",
+  "ROUTE_25",
+  "BILLS_HOUSE",
+  "ROUTE_5",
+  "ROUTE_5_GATE",
+  "UNDERGROUND_PATH_ROUTE_5",
+  "UNDERGROUND_PATH_NORTH_SOUTH",
+  "UNDERGROUND_PATH_ROUTE_6",
+  "ROUTE_6_GATE",
+  "ROUTE_6",
+  "VERMILION_CITY",
+  "VERMILION_POKECENTER",
+  "VERMILION_MART",
+  "VERMILION_OLD_ROD_HOUSE",
+  "VERMILION_PIDGEY_HOUSE",
+  "VERMILION_TRADE_HOUSE",
+  // East Vermilion and both mouths of Diglett's Cave. Route 11's east gate
+  // remains the chapter boundary; the full tunnel loop back to Route 2 is
+  // playable and carries its native cave encounters.
+  "ROUTE_11",
+  "DIGLETTS_CAVE_ROUTE_11",
+  "DIGLETTS_CAVE",
+  "DIGLETTS_CAVE_ROUTE_2",
+  "VERMILION_DOCK",
+  "SS_ANNE_1F",
+  "SS_ANNE_1F_ROOMS",
+  "SS_ANNE_2F",
+  "SS_ANNE_2F_ROOMS",
+  "SS_ANNE_3F",
+  "SS_ANNE_B1F",
+  "SS_ANNE_B1F_ROOMS",
+  "SS_ANNE_BOW",
+  "SS_ANNE_KITCHEN",
+  "SS_ANNE_CAPTAINS_ROOM",
 ];
 
 export interface CookOptions {
@@ -245,12 +305,16 @@ export function cookVoxelPak(
         z1: oy + destination.height * 32,
       });
     }
+    // Viridian Forest's dense continuous canopy expands to ~2.9M carved
+    // vertices, far beyond one PSP-1000 current-map cache. Its box canopy
+    // preserves the maze silhouette at a fraction of that footprint.
+    const treeBoxesForMap = (options.treeBoxes ?? false) || map.id === "VIRIDIAN_FOREST";
     let analysis: ReturnType<typeof analyseMap> | null = analyseMap(
       gen,
       map,
       profile,
       buildingStats,
-      options.treeBoxes ?? false,
+      treeBoxesForMap,
     );
     let geometry: MapGeometry | null = runGeometry(
       map,
@@ -263,7 +327,10 @@ export function cookVoxelPak(
     analysis = null;
 
     const uvt: UvTransform = {
-      baseY: terrain.baseY.get(sheetKey(map)) ?? 0,
+      baseX: terrain.baseX.get(`${sheetKey(map)}#${map.tileset.id}`) ??
+        terrain.baseX.get(sheetKey(map)) ?? 0,
+      baseY: terrain.baseY.get(`${sheetKey(map)}#${map.tileset.id}`) ??
+        terrain.baseY.get(sheetKey(map)) ?? 0,
       pageW: terrain.page.w,
       pageH: terrain.page.h,
     };

@@ -135,6 +135,7 @@ export interface ItemDef {
   index: number;
   name: string;
   price: number;
+  keyItem?: boolean;
   tossable?: boolean;
   ball?: string;
   machine?: { kind: string; number: number; move: string };
@@ -170,6 +171,10 @@ export interface MapObject {
   text: string;
   x: number;
   y: number;
+  trainerClass?: string;
+  trainerParty?: number;
+  item?: string;
+  hidden?: boolean;
 }
 
 export interface MapSign {

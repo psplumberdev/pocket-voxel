@@ -96,6 +96,7 @@ function makeSave(party: PartyMon[], inventory: Record<string, number> = {}): Ba
 }
 
 interface BattleOpts {
+  data?: VoxelmonData;
   playerMon?: PartyMon;
   inventory?: Record<string, number>;
   species?: string;
@@ -106,10 +107,11 @@ interface BattleOpts {
 }
 
 function makeBattle(opts: BattleOpts): { b: WildBattle; input: FakeInput; save: BattleSave } {
-  const playerMon = opts.playerMon ?? newMon(data!, "SQUIRTLE", 5);
+  const battleData = opts.data ?? data!;
+  const playerMon = opts.playerMon ?? newMon(battleData, "SQUIRTLE", 5);
   const save = makeSave([playerMon], opts.inventory ?? {});
   const b = new WildBattle(
-    data!,
+    battleData,
     save,
     seqRng(...opts.rolls),
     opts.species ?? "PIDGEY",
@@ -352,6 +354,24 @@ describe("scripted wild battle", () => {
     expect(b.result).toBeNull();
     expect(b.phase).toBe("menu");
     expect(save.party.length).toBe(1);
+  });
+
+  test.skipIf(!hasGen)("a data-defined ball uses its declared capture profile", () => {
+    const customData = structuredClone(data!);
+    customData.items!.FIX_BALL = {
+      id: "FIX_BALL", index: 250, name: "FIX BALL", price: 200, ball: "MASTER_BALL",
+    };
+    const { b, input, save } = makeBattle({
+      data: customData,
+      inventory: { FIX_BALL: 1 },
+      rolls: [0, 0, 0, 0],
+    });
+    tick(b, input, ["down"]);
+    tick(b, input, ["a"]);
+    tick(b, input, ["a"]);
+    settle(b, input);
+    expect(b.finished).toBe("caught");
+    expect(save.inventory.FIX_BALL).toBeUndefined();
   });
 
   test.skipIf(!hasGen)("paralysis: the 63/256 roll blocks the move", () => {
@@ -634,6 +654,9 @@ async function runBattleTapeInProcess(): Promise<RecorderHost> {
   const host = new RecorderHost();
   const game = new VoxelmonGame(data!, host, BATTLE_SEED);
   game.newGame();
+  // This tape is a battle fixture, not the new-game story: grant its
+  // historical Squirtle explicitly now that production no longer does.
+  game.chooseStarter("SQUIRTLE");
   const tapeText = await Bun.file(join(root, "voxelmon/tapes/battle.tape")).text();
   const tape = new TapePlayer(parseTape(tapeText));
   while (!tape.done && game.tickIndex < 100_000) {

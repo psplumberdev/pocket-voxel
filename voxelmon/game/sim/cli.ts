@@ -43,6 +43,9 @@ const game = new VoxelmonGame(data, host, seed);
 // `audiodata` op). Bun mounts no audio module, so nothing is synthesized.
 game.setAudio(await loadAudioBanks(genDir));
 game.newGame();
+// The deterministic legacy story tape predates the interactive title/Oak
+// flow and starts from its post-choice fixture explicitly.
+game.chooseStarter("SQUIRTLE");
 const tape = new TapePlayer(commands);
 
 // hard ceiling so a broken tape can never spin the process forever
@@ -65,7 +68,11 @@ try {
 }
 
 if (!tape.done) {
-  console.error(`tape did not finish within ${MAX_TICKS} ticks`);
+  console.error(
+    `tape did not finish within ${MAX_TICKS} ticks at ${game.overworld.map.id} ` +
+      `(${game.overworld.player.cellX},${game.overworld.player.cellY}) ` +
+      `[${game.stackKinds().join(",")}]`,
+  );
   process.exit(1);
 }
 

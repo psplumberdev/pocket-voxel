@@ -33,6 +33,20 @@ overlay, and the chip synth that renders the ROM's own sound programs to PCM.
 Steady-state boundary traffic is a few ops per tick against a measured QuickJS
 budget of ~8k ops per frame.
 
+## PSP-1000 source and findings
+
+The latest source checkpoint adds file-backed geometry and atlas streaming,
+host-compiled QuickJS bytecode, memory telemetry, persistent PSP saves, and
+expanded early-game progression. Read [the PSP-1000 engineering findings](docs/PSP1000-FINDINGS.md)
+for the implementation, memory tradeoffs, reproduction steps, and validation
+limits. This is a development checkpoint; the older hardware captures above
+are not evidence for this revision.
+
+The PSP now loads serialized bytecode while Vita uses the JavaScript guest
+bundle. They share gameplay source. The PSP memory settings also introduce
+distance culling and reduced detail; historical fidelity and parity claims
+below describe the earlier baseline and require revalidation for this revision.
+
 ## You bring the ROM
 
 This repository is **ROM-fed, exactly like upstream gen1recomp**: the only
