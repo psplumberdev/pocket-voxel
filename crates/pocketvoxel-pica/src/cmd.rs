@@ -60,7 +60,7 @@ const _: () = assert!(core::mem::size_of::<FlatVert>() == 16);
 /// Vertex format ids (`PvPicaCmd.vfmt`).
 pub mod vfmt {
     /// [`super::WorldVert`]: texcoord(2 x GPU_SHORT), colour(4 x
-    /// GPU_UNSIGNED_BYTE), position(3 x GPU_SHORT), stride 16.
+    /// GPU_UNSIGNED_BYTE), position + pad(4 x GPU_SHORT), stride 16.
     pub const WORLD: u8 = 0;
     /// [`super::FlatVert`]: position(3 x GPU_FLOAT), colour(4 x
     /// GPU_UNSIGNED_BYTE), stride 16.

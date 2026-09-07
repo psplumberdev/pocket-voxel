@@ -283,10 +283,11 @@ void pv_pica_tex_cost(uint32_t *textures, uint32_t *bytes);
  *    Both vertices are 16 bytes.
  *
  *      AttrInfo_Init(&world);
- *      AttrInfo_AddLoader(&world, 0, GPU_SHORT, 3);         // v0 position
+ *      AttrInfo_AddLoader(&world, 0, GPU_SHORT, 4);         // v0 xyz + pad
  *      AttrInfo_AddLoader(&world, 1, GPU_SHORT, 2);         // v1 texcoord
  *      AttrInfo_AddLoader(&world, 2, GPU_UNSIGNED_BYTE, 4); // v2 colour
  *      // buffer order is [texcoord][colour][position] -> permutation 0x021
+ *      // Consume all 16 bytes; the shader replaces the loaded pad with w=1.
  *
  *      AttrInfo_Init(&flat);
  *      AttrInfo_AddLoader(&flat, 0, GPU_FLOAT, 3);          // v0 position
@@ -304,6 +305,10 @@ void pv_pica_tex_cost(uint32_t *textures, uint32_t *bytes);
  *      gl_Position   = mtx * vec4(position, 1.0)
  *      out texcoord  = texcoord * uv_scale
  *      out colour    = colour
+ *
+ *    Every component of a mapped output must be written exactly once. Scale
+ *    UVs in a temporary and write the complete output register; writing only
+ *    xy can pass emulator captures while freezing the physical GPU.
  *
  *    `mtx` is one uniform, uploaded per command from PvPicaFrame.matrices;
  *    `uv_scale` is a second. Remember picasso freezes the PICA200 on two

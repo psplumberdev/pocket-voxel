@@ -53,6 +53,7 @@
 
 import { $ } from "bun";
 import { build3dsArtwork } from "./3ds-artwork.ts";
+import { verifyVoxel3dsShader } from "./3ds-shader.ts";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
@@ -994,6 +995,7 @@ export async function buildVoxel3ds(argv: readonly string[]): Promise<string> {
   if (!existsSync(output)) {
     throw new Error(`voxel 3ds: the container build did not produce ${output}`);
   }
+  verifyVoxel3dsShader(readFileSync(join(buildDirectory, "vshader.shbin")));
   const files: Record<string, string> = {};
   for (const path of [output, ...(args.cia ? [ciaOutput] : [])]) {
     files[path.split("/").at(-1)!] = createHash("sha256").update(readFileSync(path)).digest("hex");

@@ -706,7 +706,9 @@ bool voxel_gfx_init(void) {
    * texcoords need the shader's uv_scale.
    */
   AttrInfo_Init(&attr_world);
-  AttrInfo_AddLoader(&attr_world, 0, GPU_SHORT, 3);
+  // Consume the trailing s16 pad as position.w: the PICA loader must account
+  // for all 16 stride bytes. The shader replaces w with 1 before projection.
+  AttrInfo_AddLoader(&attr_world, 0, GPU_SHORT, 4);
   AttrInfo_AddLoader(&attr_world, 1, GPU_SHORT, 2);
   AttrInfo_AddLoader(&attr_world, 2, GPU_UNSIGNED_BYTE, 4);
 

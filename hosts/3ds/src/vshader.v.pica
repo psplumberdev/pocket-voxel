@@ -53,7 +53,13 @@
     dp4 outpos.y, mtx[1], r0
     dp4 outpos.z, mtx[2], r0
     dp4 outpos.w, mtx[3], r0
-    mul outtex.xy, uvscale.xy, intex.xy
+    ; Every component of a mapped output must be written exactly once.
+    ; Writing only outtex.xy wedges the first draw on real PICA200 hardware,
+    ; although Azahar finishes it. Keep the loader's padded z/w while scaling
+    ; UVs in a temporary, then publish the whole output (as PocketJS does).
+    mov r1, intex
+    mul r1.xy, uvscale.xy, r1.xy
+    mov outtex, r1
     mul outclr, inv255, inclr
     end
 .end

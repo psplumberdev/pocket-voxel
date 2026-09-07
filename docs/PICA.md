@@ -4,6 +4,15 @@
 > ghost pass, native audio, screen layout, and validation are documented in
 > [the 3DS host guide](./guide/3ds.md).
 
+Hardware correction (2026-09-07): the first playable run timed out waiting for
+frame 0. Its assembled shader declared all four components of the texture
+coordinate output but wrote only xy. Voxel now follows PocketJS's complete
+output write, and the package build rejects incomplete or duplicate writes in
+the assembled SHBIN. The world loader also consumes xyz **and the s16 pad**,
+so its declared attributes account for the full 16-byte vertex stride. The
+shader sets position.w to 1, preserving the scene's transforms. Emulator
+goldens cannot detect these hardware restrictions; physical retesting is required.
+
 The Nintendo 3DS backend (`crates/pocketvoxel-pica`) is the **third**
 implementation of one `DrawList`. The other two already exist and already had
 to agree with each other:
@@ -354,7 +363,10 @@ Attribute layout for a `BufInfo_Add` over the pak vertex, stride 16:
 |---|---|---|---|
 | 0 uv | `GPU_SHORT` | 2 | 0 |
 | 1 rgba | `GPU_UNSIGNED_BYTE` | 4 | 4 |
-| 2 xyz | `GPU_SHORT` | 3 | 8 |
+| 2 xyz + pad | `GPU_SHORT` | 4 | 8 |
+
+Consume the trailing s16 pad to account for all 16 stride bytes. The shader
+replaces that fourth component with 1 before multiplying the position.
 
 `u` and `v` are declared **unsigned** in the pak but must be fed as `GPU_SHORT`.
 That is safe only because the cook insets UVs (the 0.02-texel inset noted at
