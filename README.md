@@ -197,7 +197,7 @@ billboards blend instead of clipping, and give up their baked ambient
 occlusion to do it. Solid geometry and the Game Boy UI layer are unaffected —
 [docs/VOXEL.md §12](docs/VOXEL.md) has the per-pass accounting.
 
-### iPhone 4S (iOS 6)
+### iPhone 4S / iPod touch 4 (iOS 6)
 
 The jailbroken iPhone 4S target is a standalone portrait application. It uses
 PocketJS's pinned iOS 6 ARMv7 toolchain and GLES 1.1 shell, embeds the cooked
@@ -225,6 +225,30 @@ The deploy command accepts only the validated iPhone 4S/iOS 6.1.3 identity,
 uses key-only USB SSH, verifies every staged file byte-for-byte, and atomically
 replaces only `/Applications/PocketVoxel.app`. The installed app launches from
 its own SpringBoard icon and does not need a companion process or pak file.
+
+For an iPod touch 4 (`iPod4,1`, iOS 6.1.6), use the same cooked content and
+select the physical device explicitly:
+
+```sh
+export POCKETJS_IPODTOUCH4_UDID=<device UDID from idevice_id -l>
+bun ipodtouch4 doctor
+bun ipodtouch4 deploy
+bun ipodtouch4 launch
+# Press and release the controls on the device, then check the fresh receipt.
+bun ipodtouch4 status --require-action
+bun ipodtouch4 capture
+```
+
+The iPod uses PocketJS's MobileInstallation helper and AppSync Unified to
+install a removable User app. Updates preserve its data container, and every
+installed file is checked against the build receipt. Pocket Voxel's opaque
+icon receives SpringBoard's native mask and shadow. Build artifacts and device
+receipts are under `dist/ipodtouch4`. If iOS 6 retains an old icon after an
+update, reboot the device once to reload SpringBoard's in-memory icon cache.
+Runtime and audio receipts live inside the app's own container. Both targets
+share the ARMv7 renderer and support
+simultaneous D-pad and A/B contacts. `input_chord_frames` in the status receipt
+records frames that received a direction and A/B together.
 
 ## Tests
 

@@ -10,6 +10,9 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertLegacyIosIdentity, legacyIosDevice } from './ios-device.ts';
+import { rasterizeVoxelIcon } from './ios-artwork.ts';
+import { IPOD_INSTALLER, ipodAppReceiptPaths, parseInstalledIPodApp, shellQuote, userDeploymentScript } from '../vendor/pocketjs/tools/ipodtouch4-installation.ts';
 
 import {
   IPHONE4S_TOOLCHAIN,
@@ -21,6 +24,7 @@ import {
 } from '../vendor/pocketjs/tools/iphone4s-toolchain.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const DEVICE = legacyIosDevice(process.env.POCKETVOXEL_IOS_DEVICE);
 const BUNDLE = 'PocketVoxel.app';
 const EXECUTABLE = 'PocketVoxel';
 const BUNDLE_ID = 'dev.pocket-stack.voxel.iphone4s';
@@ -29,16 +33,16 @@ const STATUS_PATH = '/private/var/tmp/pocketvoxel-iphone4s.status';
 const FRAME_PATH = '/private/var/tmp/pocketvoxel-iphone4s.frame.rgba';
 const CAPTURE_PATH = '/private/var/tmp/pocketvoxel-iphone4s.capture';
 const AUDIO_STATUS_PATH = '/private/var/tmp/pocketvoxel-iphone4s.audio';
-const BUILD_ROOT = join(ROOT, '.pocket-build/iphone4s');
-const OUTPUT_ROOT = join(ROOT, 'dist/iphone4s');
+const BUILD_ROOT = join(ROOT, '.pocket-build', DEVICE.name);
+const OUTPUT_ROOT = join(ROOT, 'dist', DEVICE.name);
 const BUNDLE_PATH = join(OUTPUT_ROOT, BUNDLE);
 const RECEIPT_PATH = join(BUNDLE_PATH, 'build-receipt.json');
 const PAK = join(ROOT, 'dist/voxelmon/voxelmon.vxpak');
 const ICON_SOURCE = join(ROOT, 'web/favicon.svg');
-const ICON_BASENAME = 'PocketVoxelMark-v3';
-const KEY = process.env.POCKETJS_IPHONE4S_KEY ?? join(iphone4sCacheRoot(), 'ssh/id_rsa');
-const KNOWN_HOSTS = process.env.POCKETJS_IPHONE4S_KNOWN_HOSTS ?? join(iphone4sCacheRoot(), 'ssh/known_hosts');
-const KNOWN_HOST_ALIAS = `[127.0.0.1]:${IPHONE4S_TOOLCHAIN.deployment.localPort}`;
+const ICON_BASENAME = DEVICE.userApp ? 'PocketVoxelMark-User-v5' : 'PocketVoxelMark-v3';
+const KEY = process.env[`${DEVICE.prefix}_KEY`] ?? join(DEVICE.cacheRoot, 'ssh/id_rsa');
+const KNOWN_HOSTS = process.env[`${DEVICE.prefix}_KNOWN_HOSTS`] ?? join(DEVICE.cacheRoot, 'ssh/known_hosts');
+const KNOWN_HOST_ALIAS = `[127.0.0.1]:${DEVICE.deployment.localPort}`;
 
 interface CommandResult {
   exitCode: number;
@@ -53,6 +57,7 @@ interface Receipt {
   target: string;
   hostAbi: number;
   deploymentTarget: string;
+  pocketjsCommit: string;
   files: Record<string, string>;
 }
 
@@ -91,10 +96,10 @@ function buildId(inputs: readonly string[]): string {
 }
 
 function deviceUdid(): string {
-  const requested = process.env.POCKETJS_IPHONE4S_UDID?.trim();
+  const requested = process.env[`${DEVICE.prefix}_UDID`]?.trim();
   if (requested) return requested;
   const devices = mustRun('idevice_id', ['-l']).split('\n').map((value) => value.trim()).filter(Boolean);
-  if (devices.length !== 1) throw new Error(`expected one USB iPhone, found ${devices.length}`);
+  if (devices.length !== 1) throw new Error(`expected one USB device, found ${devices.length}; set ${DEVICE.prefix}_UDID`);
   return devices[0];
 }
 
@@ -102,10 +107,7 @@ function verifyDevice(): string {
   const udid = deviceUdid();
   const value = (key: string) => mustRun('ideviceinfo', ['-u', udid, '-k', key]);
   const identity = [value('ProductType'), value('HardwareModel'), value('ProductVersion'), value('BuildVersion'), value('ActivationState')];
-  const expected = ['iPhone4,1', 'N94AP', '6.1.3', '10B329', 'Activated'];
-  if (identity.some((entry, index) => entry !== expected[index])) {
-    throw new Error(`refusing device ${identity.join('/')} (expected ${expected.join('/')})`);
-  }
+  assertLegacyIosIdentity(DEVICE.identity, identity);
   return udid;
 }
 
@@ -148,7 +150,7 @@ async function withTunnel<T>(operation: (port: number) => Promise<T> | T): Promi
   const udid = verifyDevice();
   const port = await openPort();
   const tunnel = Bun.spawn({
-    cmd: ['iproxy', '-u', udid, `${port}:${IPHONE4S_TOOLCHAIN.deployment.devicePort}`],
+    cmd: ['iproxy', '-u', udid, `${port}:${DEVICE.deployment.devicePort}`],
     cwd: ROOT,
     stdout: 'ignore',
     stderr: 'pipe',
@@ -159,6 +161,8 @@ async function withTunnel<T>(operation: (port: number) => Promise<T> | T): Promi
       if (remote(port, 'true').exitCode === 0) return await operation(port);
       if (tunnel.exitCode !== null) break;
     }
+    if (tunnel.exitCode === null) tunnel.kill();
+    await tunnel.exited;
     const stderr = await new Response(tunnel.stderr as ReadableStream).text();
     throw new Error(`USB SSH tunnel did not become ready${stderr ? `:\n${stderr}` : ''}`);
   } finally {
@@ -169,15 +173,16 @@ async function withTunnel<T>(operation: (port: number) => Promise<T> | T): Promi
 
 async function bakeArtwork(): Promise<void> {
   const font = join(ROOT, 'vendor/pocketjs/assets/fonts/InterDisplay-Bold.ttf');
+  // User applications receive SpringBoard's native mask and shadow. Fill the
+  // source's transparent corners with its own face color to avoid a second rim.
   for (const [name, size] of [[`${ICON_BASENAME}.png`, 57], [`${ICON_BASENAME}@2x.png`, 114]] as const) {
     const output = join(BUNDLE_PATH, name);
-    mustRun('magick', [
-      '-background', 'none', '-density', '768', ICON_SOURCE, '-colorspace', 'sRGB',
-      '-filter', 'Lanczos', '-resize', `${size}x${size}!`, '-strip', '-depth', '8', `PNG32:${output}`,
-    ]);
-    const alpha = mustRun('magick', ['identify', '-format', `%[channels] %[fx:p{0,0}.a] %[fx:p{${Math.floor(size / 2)},${Math.floor(size / 2)}}.a]`, output]);
-    if (alpha !== 'srgba 4.0 0 1') throw new Error(`${name} must have transparent corners and an opaque center; got ${alpha}`);
+    writeFileSync(output, (await rasterizeVoxelIcon(size, DEVICE.userApp)).toBuffer('image/png'));
+    const alpha = mustRun('magick', ['identify', '-format', `%[fx:p{0,0}.a] %[fx:p{${Math.floor(size / 2)},${Math.floor(size / 2)}}.a] %[opaque]`, output]);
+    if (alpha.toLowerCase() !== (DEVICE.userApp ? '1 1 true' : '0 1 false')) throw new Error(`${name} has an invalid installation mask: ${alpha}`);
   }
+  const mark = join(BUILD_ROOT, 'voxel-mark.png');
+  writeFileSync(mark, (await rasterizeVoxelIcon(512)).toBuffer('image/png'));
 
   const launch = join(BUILD_ROOT, 'launch-640x960.png');
   mustRun('magick', [
@@ -186,7 +191,7 @@ async function bakeArtwork(): Promise<void> {
     '-draw', 'roundrectangle 19,19 620,940 38,38',
     '-stroke', '#8798ad', '-strokewidth', '2',
     '-draw', 'roundrectangle 24,24 615,935 34,34',
-    '(', '-background', 'none', '-density', '768', ICON_SOURCE,
+    '(', mark,
     '-filter', 'Lanczos', '-resize', '248x248!', ')',
     '-gravity', 'north', '-geometry', '+0+248', '-composite', '-density', '72',
     '-font', font, '-gravity', 'north',
@@ -258,7 +263,7 @@ function bakeControlTextures(): Record<string, string> {
     POCKETVOXEL_POPUP_SUBTITLE: bakeLabel('popup-subtitle', 'A WORLD IN YOUR POCKET', 320, 30, 17, '#514557'),
     POCKETVOXEL_POPUP_CREDIT: bakeLabel('popup-credit', 'MOTION STUDIES BY yui540', 320, 30, 16, '#514557'),
     POCKETVOXEL_DONE_LABEL: bakeLabel('done-label', 'DONE', 96, 28, 18),
-    POCKETVOXEL_POPUP_ICON: bakeImage('popup-icon', ICON_SOURCE, 112, 112),
+    POCKETVOXEL_POPUP_ICON: bakeImage('popup-icon', join(BUILD_ROOT, 'voxel-mark.png'), 112, 112),
     POCKETVOXEL_DPAD_IDLE: bakeDpad('dpad-idle'),
     POCKETVOXEL_DPAD_UP: bakeDpad('dpad-up', '0,0 6,7 255,0 249,7 0,255 0,252 255,255 255,252'),
     POCKETVOXEL_DPAD_RIGHT: bakeDpad('dpad-right', '0,0 4,0 255,0 248,6 0,255 4,255 255,255 248,249'),
@@ -300,6 +305,7 @@ async function build(): Promise<void> {
   rmSync(BUNDLE_PATH, { recursive: true, force: true });
   mkdirSync(BUILD_ROOT, { recursive: true });
   mkdirSync(BUNDLE_PATH, { recursive: true });
+  await bakeArtwork();
   const controlTextures = bakeControlTextures();
   const compatibilityFrameworks = writeAudioToolboxStub();
 
@@ -318,6 +324,8 @@ async function build(): Promise<void> {
     '-march=armv7', '-Os', '-fno-stack-protector', '-fno-builtin', '-fno-common',
     '-fwrapv', '-funsigned-char', '-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=0',
     '-isysroot', macosSdk,
+    '-I', join(ROOT, 'vendor/pocketjs/engine/quickjs-c'),
+    ...(DEVICE.userApp ? ['-DPOCKETVOXEL_USER_APP'] : []),
   ];
   const warnings = ['-Wall', '-Wextra', '-Werror', '-Wno-incompatible-sysroot'];
   const compile = (source: string, output: string, extra: readonly string[] = []) =>
@@ -360,8 +368,8 @@ async function build(): Promise<void> {
   const crt = join(BUILD_ROOT, 'crt_globals.o');
   const compat = join(BUILD_ROOT, 'compat.o');
   const pocketRuntime = join(BUILD_ROOT, 'pocket_runtime.o');
-  compile(join(ROOT, 'vendor/pocketjs/hosts/iphone2g/crt_globals.c'), crt, warnings);
-  compile(join(ROOT, 'vendor/pocketjs/hosts/iphone2g/compat.c'), compat, warnings);
+  compile(join(ROOT, 'vendor/pocketjs/hosts/ios-legacy/crt_globals.c'), crt, warnings);
+  compile(join(ROOT, 'vendor/pocketjs/hosts/ios-legacy/compat.c'), compat, warnings);
   compile(join(ROOT, 'host/iphone4s/pocket_runtime.c'), pocketRuntime, [
     ...warnings,
     '-Wno-cast-function-type-mismatch',
@@ -369,8 +377,11 @@ async function build(): Promise<void> {
   ]);
 
   cpSync(join(ROOT, 'host/iphone4s/Info.plist'), join(BUNDLE_PATH, 'Info.plist'));
+  if (DEVICE.userApp) {
+    const plist = join(BUNDLE_PATH, 'Info.plist');
+    writeFileSync(plist, readFileSync(plist, 'utf8').replaceAll('PocketVoxelMark-v3', ICON_BASENAME).replaceAll('0.2.2', '0.2.4'));
+  }
   cpSync(join(ROOT, 'host/iphone4s/PkgInfo'), join(BUNDLE_PATH, 'PkgInfo'));
-  await bakeArtwork();
 
   const runtimeIdentity = join(BUILD_ROOT, 'runtime.identity.o');
   const firstParty = [...warnings, '-DPOCKET_LOGICAL_WIDTH=320', '-DPOCKET_LOGICAL_HEIGHT=480', '-DPOCKET_RASTER_DENSITY=2', '-Wno-cast-function-type-mismatch'];
@@ -379,13 +390,18 @@ async function build(): Promise<void> {
     guest, PAK,
     join(ROOT, 'host/iphone4s/runtime.c'),
     join(ROOT, 'host/iphone4s/pocket_runtime.c'),
-    join(ROOT, 'host/iphone4s/Info.plist'),
+    join(ROOT, 'host/iphone4s/controls.h'),
+    join(BUNDLE_PATH, 'Info.plist'),
     join(ROOT, 'host/iphone4s/dpad.svg'),
     ICON_SOURCE,
     join(ROOT, 'tools/iphone4s.ts'),
+    join(ROOT, 'tools/ios-device.ts'),
+    join(ROOT, 'tools/ios-artwork.ts'),
     join(ROOT, 'crates/pocketvoxel-iphone4s/src/lib.rs'),
     join(ROOT, 'crates/pocketvoxel-iphone4s/src/gles1.rs'),
     rustLibrary, runtimeIdentity, pocketRuntime,
+    join(BUNDLE_PATH, `${ICON_BASENAME}.png`), join(BUNDLE_PATH, `${ICON_BASENAME}@2x.png`),
+    join(BUNDLE_PATH, 'Default@2x.png'), join(BUNDLE_PATH, 'Default-568h@2x.png'),
     ...quickJsObjects,
   ]);
   const runtime = join(BUILD_ROOT, 'runtime.o');
@@ -426,29 +442,60 @@ async function build(): Promise<void> {
     schema: 1,
     buildId: identity,
     bundleId: BUNDLE_ID,
-    target: 'iphone4s-ios6-armv7',
+    target: `${DEVICE.name}-ios6-armv7`,
     hostAbi: 2,
     deploymentTarget: IPHONE4S_TOOLCHAIN.compiler.minimumVersion,
+    pocketjsCommit: mustRun('git', ['-C', join(ROOT, 'vendor/pocketjs'), 'rev-parse', 'HEAD']),
     files: Object.fromEntries(names.map((name) => [name, sha256(join(BUNDLE_PATH, name))])),
   };
   writeFileSync(RECEIPT_PATH, JSON.stringify(receipt, null, 2) + '\n');
+  if (DEVICE.userApp) {
+    const installerObject = join(BUILD_ROOT, 'installer.o');
+    const installer = join(OUTPUT_ROOT, 'installer');
+    compile(join(ROOT, 'vendor/pocketjs/hosts/ipodtouch4/installer.c'), installerObject,
+      [...warnings, '-Wno-cast-function-type-mismatch']);
+    mustRun(linker, ['-arch', 'armv7', '-syslibroot', sysroot, '-L/usr/lib',
+      '-F/System/Library/Frameworks', '-iphoneos_version_min', IPHONE4S_TOOLCHAIN.compiler.minimumVersion,
+      '-no_pie', '-no_uuid', '-no_function_starts', '-no_data_in_code_info',
+      '-no_source_version', '-no_compact_unwind', '-no_adhoc_codesign', '-no_encryption',
+      '-e', 'start', '-o', installer, join(BUILD_ROOT, 'csu-start.o'),
+      join(BUILD_ROOT, 'csu-dyld-glue.o'), crt, installerObject,
+      '-framework', 'Foundation', '-lobjc', '-lSystem', '-lgcc_s.1']);
+    chmodSync(installer, 0o755);
+    mustRun('ldid', [`-S${join(ROOT, 'vendor/pocketjs/hosts/ipodtouch4/installer-entitlements.plist')}`, installer]);
+    const packageRoot = join(BUILD_ROOT, 'package');
+    const payload = join(packageRoot, 'Payload', BUNDLE);
+    mkdirSync(dirname(payload), { recursive: true });
+    cpSync(BUNDLE_PATH, payload, { recursive: true });
+    rmSync(ipaPath(), { force: true });
+    mustRun('zip', ['-q', '-r', ipaPath(), 'Payload'], packageRoot);
+  }
   console.log(`built ${BUNDLE_PATH}`);
   console.log(fileInfo);
   console.log(`build_id=${identity}`);
 }
 
 function receipt(): Receipt {
-  if (!existsSync(RECEIPT_PATH)) throw new Error('no built app; run `bun iphone4s build`');
-  return JSON.parse(readFileSync(RECEIPT_PATH, 'utf8')) as Receipt;
+  if (!existsSync(RECEIPT_PATH)) throw new Error(`no built app; run bun ${DEVICE.name} build`);
+  const result = JSON.parse(readFileSync(RECEIPT_PATH, 'utf8')) as Receipt;
+  if (result.target !== `${DEVICE.name}-ios6-armv7` || result.bundleId !== BUNDLE_ID) throw new Error('build receipt has the wrong device or app identity');
+  return result;
 }
 
-function verifyInstalled(port: number, expected: Receipt): void {
-  const actual = JSON.parse(mustRemote(port, `cat ${INSTALL_PATH}/build-receipt.json`)) as Receipt;
+function verifyInstalled(port: number, expected: Receipt) {
+  const app = DEVICE.userApp ? parseInstalledIPodApp(
+    mustRemote(port, `${IPOD_INSTALLER} lookup ${shellQuote(BUNDLE_ID)}`), BUNDLE_ID, BUNDLE,
+  ) : null;
+  const actual = JSON.parse(mustRemote(port, `cat ${shellQuote((app?.Path ?? INSTALL_PATH) + '/build-receipt.json')}`)) as Receipt;
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('installed receipt does not match local build');
+  return app ? { ...ipodAppReceiptPaths(app), audio: `${app.Container}/tmp/pocketvoxel.audio` }
+    : { status: STATUS_PATH, frame: FRAME_PATH, capture: CAPTURE_PATH, audio: AUDIO_STATUS_PATH };
 }
 
 async function deploy(): Promise<void> {
+  verifyDevice();
   await build();
+  if (DEVICE.userApp) return await deployUserApp();
   const expected = receipt();
   const transaction = randomBytes(12).toString('hex');
   const archive = join(BUILD_ROOT, `${BUNDLE}-${transaction}.tar`);
@@ -509,6 +556,53 @@ async function deploy(): Promise<void> {
   console.log(`deployed ${expected.buildId} to ${INSTALL_PATH} with byte-exact readback`);
 }
 
+function ipaPath(): string {
+  return join(OUTPUT_ROOT, 'PocketVoxel.ipa');
+}
+
+function copyToDevice(port: number, source: string, destination: string): void {
+  mustRun('scp', ['-O', '-i', KEY, '-P', String(port), '-o', 'BatchMode=yes',
+    '-o', `HostKeyAlias=${KNOWN_HOST_ALIAS}`, '-o', 'StrictHostKeyChecking=yes',
+    '-o', `UserKnownHostsFile=${KNOWN_HOSTS}`, '-o', 'HostKeyAlgorithms=+ssh-rsa',
+    '-o', 'PubkeyAcceptedAlgorithms=+ssh-rsa', source, `root@127.0.0.1:${destination}`]);
+}
+
+async function deployUserApp(): Promise<void> {
+  const expected = receipt();
+  const transaction = randomBytes(12).toString('hex');
+  const remoteRoot = `/private/var/tmp/pocketvoxel-user-${transaction}`;
+  const archive = `${remoteRoot}/app.ipa`;
+  const script = join(BUILD_ROOT, `deploy-${transaction}.sh`);
+  // Executed under the upstream installation lock: iOS 6 can wait indefinitely
+  // for a foreground app to exit before replacing its User bundle.
+  writeFileSync(script, `killall ${EXECUTABLE} 2>/dev/null || true\n` + userDeploymentScript({
+    bundleId: BUNDLE_ID, bundleName: BUNDLE, executable: EXECUTABLE,
+    archive, archiveHash: sha256(ipaPath()),
+    files: { ...expected.files, 'build-receipt.json': sha256(RECEIPT_PATH) },
+  }));
+  try {
+    await withTunnel((port) => {
+      mustRemote(port, `set -eu; mkdir -p /var/root/Library/PocketJS; chmod 700 /var/root/Library/PocketJS; mkdir -m 755 ${remoteRoot}`);
+      try {
+        const installer = join(OUTPUT_ROOT, 'installer');
+        copyToDevice(port, installer, `${remoteRoot}/installer`);
+        copyToDevice(port, ipaPath(), archive);
+        copyToDevice(port, script, `${remoteRoot}/deploy.sh`);
+        mustRemote(port, `set -eu; test "$(/usr/bin/openssl dgst -sha256 ${remoteRoot}/installer)" = ` +
+          shellQuote(`SHA256(${remoteRoot}/installer)= ${sha256(installer)}`) +
+          `; chmod 700 ${remoteRoot}/installer; mv ${remoteRoot}/installer ${IPOD_INSTALLER}; ` +
+          `${IPOD_INSTALLER} lock ${shellQuote(BUNDLE_ID)} ${remoteRoot}/deploy.sh`);
+        verifyInstalled(port, expected);
+      } finally {
+        remote(port, `rm -rf ${remoteRoot}`);
+      }
+    });
+  } finally {
+    rmSync(script, { force: true });
+  }
+  console.log(`deployed User app ${expected.buildId} with byte-exact readback`);
+}
+
 function parseStatus(raw: string): Record<string, string> {
   return Object.fromEntries(raw.trim().split('\n').map((line) => {
     const separator = line.indexOf('=');
@@ -519,12 +613,12 @@ function parseStatus(raw: string): Record<string, string> {
 async function status(requireAction = false): Promise<Record<string, string>> {
   const expected = receipt();
   return await withTunnel(async (port) => {
-    verifyInstalled(port, expected);
-    const first = parseStatus(mustRemote(port, `cat ${STATUS_PATH}`));
-    const firstAudio = parseStatus(mustRemote(port, `cat ${AUDIO_STATUS_PATH}`));
+    const paths = verifyInstalled(port, expected);
+    const first = parseStatus(mustRemote(port, `cat ${paths.status}`));
+    const firstAudio = parseStatus(mustRemote(port, `cat ${paths.audio}`));
     await Bun.sleep(1300);
-    const current = parseStatus(mustRemote(port, `cat ${STATUS_PATH}`));
-    const audio = parseStatus(mustRemote(port, `cat ${AUDIO_STATUS_PATH}`));
+    const current = parseStatus(mustRemote(port, `cat ${paths.status}`));
+    const audio = parseStatus(mustRemote(port, `cat ${paths.audio}`));
     if (current.schema !== '2' || current.build_id !== expected.buildId || current.state !== 'running' || current.error !== '') {
       throw new Error(`runtime is not healthy: ${JSON.stringify(current)}`);
     }
@@ -544,6 +638,7 @@ async function status(requireAction = false): Promise<Record<string, string>> {
       throw new Error('no completed Pocket Voxel control touch has been observed yet');
     }
     const accepted = { ...current, ...audio };
+    writeFileSync(join(OUTPUT_ROOT, requireAction ? 'device-action.json' : 'device-status.json'), JSON.stringify(accepted, null, 2) + '\n');
     console.log(JSON.stringify(accepted, null, 2));
     return accepted;
   });
@@ -552,9 +647,9 @@ async function status(requireAction = false): Promise<Record<string, string>> {
 async function launch(): Promise<void> {
   const expected = receipt();
   await withTunnel(async (port) => {
-    verifyInstalled(port, expected);
+    const paths = verifyInstalled(port, expected);
     mustRemote(port,
-      `killall ${EXECUTABLE} 2>/dev/null || true; rm -f ${STATUS_PATH} ${FRAME_PATH} ${CAPTURE_PATH} ${AUDIO_STATUS_PATH}; ` +
+      `killall ${EXECUTABLE} 2>/dev/null || true; rm -f ${paths.status} ${paths.frame} ${paths.capture} ${paths.audio}; ` +
       `/bin/su mobile -c '/usr/bin/uiopen pocketvoxel://launch'; echo launch-requested`);
     await Bun.sleep(2500);
   });
@@ -567,22 +662,25 @@ async function capture(): Promise<void> {
   rmSync(raw, { force: true });
   rmSync(png, { force: true });
   await withTunnel(async (port) => {
-    const current = parseStatus(mustRemote(port, `cat ${STATUS_PATH}`));
+    const expected = receipt();
+    const paths = verifyInstalled(port, expected);
+    const current = parseStatus(mustRemote(port, `cat ${paths.status}`));
+    if (current.build_id !== expected.buildId || current.state !== 'running' || current.error !== '') throw new Error('refusing a stale or unhealthy capture');
     if (current.renderer !== 'gles1' || current.drawable_width !== '640' || current.drawable_height !== '960') {
       throw new Error('refusing a non-Retina GLES1 capture');
     }
     try {
-      mustRemote(port, `rm -f ${FRAME_PATH} ${CAPTURE_PATH}; /bin/su mobile -c 'touch ${CAPTURE_PATH}'`);
+      mustRemote(port, `rm -f ${paths.frame} ${paths.capture}; /bin/su mobile -c 'touch ${paths.capture}'`);
       for (let attempt = 0; attempt < 40; attempt += 1) {
         await Bun.sleep(200);
-        if (remote(port, `test -s ${FRAME_PATH}`).exitCode === 0) break;
+        if (remote(port, `test -s ${paths.frame}`).exitCode === 0) break;
       }
-      mustRemote(port, `test -s ${FRAME_PATH}`);
-      const result = Bun.spawnSync({ cmd: ['ssh', ...sshArgs(port, `cat ${FRAME_PATH}`)], cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+      mustRemote(port, `test -s ${paths.frame}`);
+      const result = Bun.spawnSync({ cmd: ['ssh', ...sshArgs(port, `cat ${paths.frame}`)], cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
       if (result.exitCode !== 0) throw new Error(`frame download failed: ${result.stderr.toString()}`);
       writeFileSync(raw, result.stdout);
     } finally {
-      remote(port, `rm -f ${CAPTURE_PATH} ${FRAME_PATH}`);
+      remote(port, `rm -f ${paths.capture} ${paths.frame}`);
     }
   });
   if (readFileSync(raw).byteLength !== 640 * 960 * 4) throw new Error('captured frame length is wrong');
@@ -591,20 +689,20 @@ async function capture(): Promise<void> {
 }
 
 function usage(): void {
-  console.log(`Pocket Voxel iPhone 4S tool
+  console.log(`Pocket Voxel ${DEVICE.name} tool
 
-  bun iphone4s doctor
-  bun iphone4s build
-  bun iphone4s deploy
-  bun iphone4s launch
-  bun iphone4s status [--require-action]
-  bun iphone4s capture`);
+  bun ${DEVICE.name} doctor
+  bun ${DEVICE.name} build
+  bun ${DEVICE.name} deploy
+  bun ${DEVICE.name} launch
+  bun ${DEVICE.name} status [--require-action]
+  bun ${DEVICE.name} capture`);
 }
 
 export async function main(args = Bun.argv.slice(2)): Promise<void> {
   switch (args[0] ?? 'doctor') {
     case 'doctor':
-      console.log(mustRun('bun', ['tools/iphone4s.ts', 'doctor'], join(ROOT, 'vendor/pocketjs')));
+      console.log(mustRun('bun', [`tools/${DEVICE.name}.ts`, 'doctor'], join(ROOT, 'vendor/pocketjs')));
       break;
     case 'build': await build(); break;
     case 'deploy': await deploy(); break;

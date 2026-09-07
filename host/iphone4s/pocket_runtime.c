@@ -1,6 +1,7 @@
-#include "../../vendor/pocketjs/hosts/iphone2g/pocket_runtime.h"
+#include "../../vendor/pocketjs/engine/quickjs-c/pocket_runtime.h"
 
 #include "quickjs.h"
+#include "controls.h"
 
 #include <AudioToolbox/AudioQueue.h>
 #include <AudioToolbox/AudioSession.h>
@@ -27,8 +28,25 @@ extern int pocketvoxel_gl_initialize(int width, int height);
 extern void pocketvoxel_gl_shutdown(void);
 extern void pocketvoxel_shutdown(void);
 
+#ifdef POCKETVOXEL_USER_APP
+extern void *NSTemporaryDirectory(void);
+extern void *sel_registerName(const char *name);
+extern void *objc_msgSend(void);
+static const char *audio_status_path(unsigned index, const char *suffix) {
+  static char paths[2][4096];
+  if (!paths[index][0]) {
+    const char *tmp = ((const char *(*)(void *, void *))objc_msgSend)(
+      NSTemporaryDirectory(), sel_registerName("UTF8String"));
+    snprintf(paths[index], sizeof(paths[index]), "%spocketvoxel.%s", tmp, suffix);
+  }
+  return paths[index];
+}
+#define AUDIO_STATUS_PATH audio_status_path(0, "audio")
+#define AUDIO_STATUS_TEMP audio_status_path(1, "audio.new")
+#else
 #define AUDIO_STATUS_PATH "/private/var/tmp/pocketvoxel-iphone4s.audio"
 #define AUDIO_STATUS_TEMP "/private/var/tmp/pocketvoxel-iphone4s.audio.new"
+#endif
 #define AUDIO_BUFFER_COUNT 4
 #define AUDIO_BUFFER_FRAMES 735
 #define AUDIO_BUFFER_BYTES (AUDIO_BUFFER_FRAMES * 2 * sizeof(int16_t))
@@ -72,30 +90,13 @@ enum {
   OP_SKY = 75
 };
 
-enum {
-  BTN_UP = 1,
-  BTN_DOWN = 2,
-  BTN_LEFT = 4,
-  BTN_RIGHT = 8,
-  BTN_A = 16,
-  BTN_B = 32,
-  BTN_START = 64,
-  BTN_SELECT = 128
-};
+
 
 static JSRuntime *runtime;
 static JSContext *context;
 static JSValue global;
 static JSValue frame_function;
 static char last_error[512];
-static uint32_t buttons;
-static uint32_t previous_buttons;
-static int menu_open;
-static int menu_pressed;
-static int popup_pressed;
-static int touch_was_down;
-static int menu_touch_consumed;
-static unsigned long action_sequence;
 static pthread_mutex_t scene_lock = PTHREAD_MUTEX_INITIALIZER;
 static AudioQueueRef audio_queue;
 static AudioQueueBufferRef audio_buffers[AUDIO_BUFFER_COUNT];
@@ -143,13 +144,17 @@ static void write_audio_status(void) {
     file,
     "audio_state=%s\naudio_rate=11025\naudio_channels=2\n"
     "audio_callbacks=%lu\naudio_frames=%lu\naudio_nonzero_buffers=%lu\n"
-    "audio_peak=%d\naudio_error=%s\n",
+    "audio_peak=%d\naudio_error=%s\n"
+    "input_max_contacts=%u\ninput_buttons_seen=%u\ninput_chord_frames=%lu\n",
     state,
     callbacks,
     frames,
     nonzero_buffers,
     peak,
-    error
+    error,
+    input_max_contacts,
+    input_buttons_seen,
+    input_chord_frames
   );
   if (fflush(file) != 0 || fclose(file) != 0) {
     remove(AUDIO_STATUS_TEMP);
@@ -520,78 +525,6 @@ static void register_voxel(JSContext *ctx, JSValue root) {
   JS_SetPropertyStr(ctx, root, "voxel", voxel);
 }
 
-static uint32_t touch_buttons(int down, int x, int y) {
-  int dx;
-  int dy;
-  int abs_x;
-  int abs_y;
-  if (!down || y < 240) return 0;
-
-  dx = x - 75;
-  dy = y - 350;
-  abs_x = dx < 0 ? -dx : dx;
-  abs_y = dy < 0 ? -dy : dy;
-  if ((abs_x <= 23 && abs_y <= 65) || (abs_y <= 23 && abs_x <= 65)) {
-    if (abs_x > abs_y && abs_x > 12) return dx < 0 ? BTN_LEFT : BTN_RIGHT;
-    if (abs_y > 12) return dy < 0 ? BTN_UP : BTN_DOWN;
-  }
-
-  dx = x - 260;
-  dy = y - 320;
-  if (dx * dx + dy * dy <= 42 * 42) return BTN_A;
-  dx = x - 202;
-  dy = y - 375;
-  if (dx * dx + dy * dy <= 40 * 40) return BTN_B;
-  if (x >= 98 && x <= 144 && y >= 448 && y <= 474) return BTN_SELECT;
-  if (x >= 169 && x <= 215 && y >= 448 && y <= 474) return BTN_START;
-  return 0;
-}
-
-static int point_in_rect(int x, int y, int left, int top, int right, int bottom) {
-  return x >= left && x <= right && y >= top && y <= bottom;
-}
-
-static void update_menu_touch(int down, int x, int y) {
-  int menu_hit = point_in_rect(x, y, 137, 250, 183, 273);
-  int popup_hit = point_in_rect(x, y, 36, 92, 284, 352);
-  int done_hit = point_in_rect(x, y, 122, 305, 198, 333);
-
-  if (!down) {
-    if (popup_pressed && done_hit) {
-      menu_open = 0;
-      action_sequence += 1;
-    } else if (menu_pressed && menu_hit) {
-      menu_open = !menu_open;
-      action_sequence += 1;
-    }
-    touch_was_down = 0;
-    menu_pressed = 0;
-    popup_pressed = 0;
-    menu_touch_consumed = 0;
-    return;
-  }
-  if (touch_was_down) return;
-  touch_was_down = 1;
-
-  if (menu_open) {
-    menu_touch_consumed = 1;
-    if (done_hit) {
-      popup_pressed = 1;
-    } else if (menu_hit) {
-      menu_pressed = 1;
-    } else if (!popup_hit) {
-      menu_open = 0;
-      action_sequence += 1;
-    }
-    return;
-  }
-
-  if (menu_hit) {
-    menu_touch_consumed = 1;
-    menu_pressed = 1;
-  }
-}
-
 int pocket_runtime_boot(
   const char *java_script,
   size_t java_script_length,
@@ -642,17 +575,13 @@ int pocket_runtime_boot(
   return 1;
 }
 
-int pocket_runtime_frame(int touch_down, int touch_x, int touch_y, int touch_hit) {
+static int voxel_frame(const PocketRuntimeContactsInput *input) {
   JSValue argument;
   JSValue result;
   JSContext *pending;
   int job;
-  (void)touch_hit;
   if (context == NULL) return 0;
-  update_menu_touch(touch_down, touch_x, touch_y);
-  buttons = menu_open || menu_touch_consumed ? 0 : touch_buttons(touch_down, touch_x, touch_y);
-  if (buttons != 0 && buttons != previous_buttons) action_sequence += 1;
-  previous_buttons = buttons;
+  voxel_controls_sample(input);
   argument = JS_NewInt32(context, (int32_t)buttons);
   result = JS_Call(context, frame_function, global, 1, &argument);
   JS_FreeValue(context, argument);
@@ -686,18 +615,38 @@ int pocket_runtime_frame(int touch_down, int touch_x, int touch_y, int touch_hit
   return 1;
 }
 
-int pocket_runtime_frame_ticks(
-  int touch_down,
-  int touch_x,
-  int touch_y,
-  int touch_hit,
-  unsigned int tick_count
-) {
+int pocket_runtime_frame_contacts(const PocketRuntimeContactsInput *input, unsigned int tick_count) {
   unsigned int index;
+  if (input == NULL || input->contact_count > POCKET_RUNTIME_MAX_CONTACTS) return 0;
   for (index = 0; index < tick_count; index += 1) {
-    if (!pocket_runtime_frame(touch_down, touch_x, touch_y, touch_hit)) return 0;
+    if (!voxel_frame(input)) return 0;
   }
   return 1;
+}
+
+int pocket_runtime_tick_contacts(const PocketRuntimeContactsInput *input) {
+  return pocket_runtime_frame_contacts(input, 1);
+}
+
+int pocket_runtime_tick(const PocketRuntimeInput *input) {
+  PocketRuntimeContactsInput contacts = {0};
+  if (input != NULL) {
+    contacts.buttons = input->buttons;
+    contacts.contact_count = input->touch_down ? 1 : 0;
+    contacts.contacts[0] = (PocketRuntimeContact){0, input->touch_x, input->touch_y, input->touch_hit};
+  }
+  return pocket_runtime_tick_contacts(&contacts);
+}
+
+int pocket_runtime_frame_ticks(int down, int x, int y, int hit, unsigned int tick_count) {
+  PocketRuntimeContactsInput contacts = {0};
+  contacts.contact_count = down ? 1 : 0;
+  contacts.contacts[0] = (PocketRuntimeContact){0, x, y, hit};
+  return pocket_runtime_frame_contacts(&contacts, tick_count);
+}
+
+int pocket_runtime_frame(int down, int x, int y, int hit) {
+  return pocket_runtime_frame_ticks(down, x, y, hit, 1);
 }
 
 int pocket_runtime_hit_test(float x, float y) {

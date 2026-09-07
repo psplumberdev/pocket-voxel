@@ -11,6 +11,7 @@
     "psp": "bun tools/voxel.ts psp --release",
     "vita": "bun tools/voxel.ts vita --release",
     "iphone4s": "bun tools/iphone4s.ts",
+    "ipodtouch4": "bun tools/ipodtouch4.ts",
     "desktop:serve": "bun host/desktop-stream/serve.ts",
     "web:refs": "bun web/scripts/build-reference.ts",
     "web:build": "bun web/scripts/build.ts",
@@ -24,6 +25,7 @@
     "tsc": "bunx tsc --noEmit -p . && bunx tsc --noEmit -p worker/tsconfig.json"
   },
   "devDependencies": {
+    "@napi-rs/canvas": "1.0.2",
     "@types/bun": "^1.2.0",
     "@types/three": "^0.185.0",
     "typescript": "^5.7.0",
