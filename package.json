@@ -11,13 +11,38 @@
     "psp": "bun tools/voxel.ts psp --release",
     "vita": "bun tools/voxel.ts vita --release",
     "3ds": "bun tools/voxel-3ds.ts",
+    "iphone4s": "bun tools/iphone4s.ts",
+    "ipodtouch4": "bun tools/ipodtouch4.ts",
+    "cardputer": "bun tools/voxel.ts cardputer",
+    "cardputer:install": "bun tools/voxel.ts cardputer --install",
+    "desktop:serve": "bun host/desktop-stream/serve.ts",
+    "web:refs": "bun web/scripts/build-reference.ts",
+    "web:build": "bun web/scripts/build.ts",
+    "web:serve": "bun web/scripts/serve.ts",
+    "web:smoke": "bun web/scripts/smoke-wasm.ts",
+    "web:smoke:packages": "bun web/scripts/smoke-packager.ts",
+    "web:deploy": "bun run web:build && wrangler deploy",
+    "web:e2e": "bun web/scripts/e2e-chrome.ts",
     "e2e": "bun tests/e2e/voxel-ppsspp.ts",
     "e2e:3ds": "bun tests/e2e/voxel-3ds.ts",
     "test": "bun test tests/",
-    "tsc": "bunx tsc --noEmit -p ."
+    "tsc": "bunx tsc --noEmit -p . && bunx tsc --noEmit -p worker/tsconfig.json",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:deploy": "wrangler deploy --config wrangler.docs.jsonc",
+    "docs:preview": "vitepress preview docs"
   },
   "devDependencies": {
+    "@napi-rs/canvas": "1.0.2",
     "@types/bun": "^1.2.0",
-    "typescript": "^5.7.0"
+    "@types/three": "^0.185.0",
+    "mermaid": "^11.16.1",
+    "typescript": "^5.7.0",
+    "vitepress": "^1.6.4",
+    "vitepress-plugin-mermaid": "^2.0.17",
+    "wrangler": "4.120.1"
+  },
+  "dependencies": {
+    "three": "^0.185.1"
   }
 }

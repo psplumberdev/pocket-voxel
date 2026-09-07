@@ -1,4 +1,4 @@
-# Pocket Voxel
+<h1><img src="./web/favicon.svg" width="40" height="40" alt="" align="absmiddle" /> Pocket Voxel</h1>
 
 <p align="center">
   <img src="docs/shots/psp-pallet-town.png" width="720" alt="Pallet Town as a voxel diorama on a real PSP — carved trees, gabled roofs, an NPC and the player between the houses." />
@@ -12,9 +12,9 @@
 <p align="center"><em>All three screenshots are captures from a real PSP-2000 over PSPLINK.
 The same build runs on a PS Vita at 960x544 — see <a href="#run-it">Run it</a>.</em></p>
 
-A Game Boy creature-RPG, presented as a voxelized 3D diorama on handheld
-hardware — **a real PSP and a real PS Vita, from one cooked pak and one
-guest bundle**. The gameplay is a TypeScript port of the
+A Game Boy creature-RPG, presented as a voxelized 3D diorama in the browser
+and on handheld hardware — **the Web Player, a real PSP and a real PS Vita,
+from one cooked pak and one guest bundle**. The gameplay is a TypeScript port of the
 [gen1recomp](https://github.com/bryanthaboi/gen1recomp) Lua engine running in
 an embedded QuickJS guest; the presentation is a Rust reimplementation of the
 [DramaticShape Voxel Mod](https://github.com/DramaticShape/DramaticShapeVoxelMod)
@@ -28,9 +28,10 @@ Pocket Voxel is a specialized runtime of
 split inverted: **the game state lives in the guest** (world, battle, script
 VM, menus, saves — every formula cites the Lua it ports), and the Rust core
 owns only the retained scene — cooked voxel chunks, entity billboards, camera
-rungs, the battle stage, a GB UI tile layer, and the chip synth that renders
-the ROM's own sound programs to PCM. Steady-state boundary traffic is a few
-ops per tick against a measured QuickJS budget of ~8k ops per frame.
+rungs, the battle stage, a GB UI tile layer, a bounded native-pixel colour
+overlay, and the chip synth that renders the ROM's own sound programs to PCM.
+Steady-state boundary traffic is a few ops per tick against a measured QuickJS
+budget of ~8k ops per frame.
 
 ## You bring the ROM
 
@@ -58,7 +59,7 @@ cook time (Bun, your machine)            run time (PSP / PS Vita)
 ```
 
 - **One pak, many machines.** Fidelity is a runtime *ladder*, not a build
-  flag: the same 31 MB pak serves the PSP rung (30 fps present lock, 60 Hz
+  flag: the same 29.7 MB pak serves the PSP rung (30 fps present lock, 60 Hz
   logic), the Vita rung, and the desktop identity rung — which replays the
   pre-ladder picture pixel-for-pixel and is pinned by committed frame hashes
   no dial edit may move. **The rung is named by the HOST, not the guest**, so
@@ -100,6 +101,37 @@ bun tools/voxel.ts check    # replay the tapes, assert both rungs' hashes
 
 ## Run it
 
+### Web
+
+The browser build contains the renderer and non-ROM reference metadata, but no
+game content. It verifies and bakes a ROM you select entirely in a local Web
+Worker, then offers three independent targets from the same cooked world:
+the in-page Web Player, a PSP memory-stick ZIP, or a PS Vita VPK. A second,
+lazy-loaded WASM packager validates the ROM-independent native templates and
+assembles either console download locally; it does not upload the ROM or run a
+cross-compiler in the tab.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.126 --locked
+bun run web:build
+bun run web:serve            # http://127.0.0.1:8131/
+bun run web:smoke:packages   # verify PSP/Vita archives + embedded VXPK
+bun run web:deploy           # publish static assets to pocketvoxel.games
+# Optional real-Chrome acceptance with VOXELMON_ROM (or the local default):
+bun run web:e2e
+```
+
+Drop your canonical US Pokémon Red ROM onto the page. The player maps its
+480×272 framebuffer onto a demand-rendered 3D Game Boy; the model's D-pad,
+face buttons, Start, and Select are interactive alongside keyboard and standard
+gamepad input. The ROM and cooked pak remain in memory for this tab only; they
+are neither uploaded nor written to browser storage. The attributed stage model
+and its license ship under `web/assets/game-boy/`. PSP output is a ZIP whose
+`PSP/GAME/VOXELMON/` directory contains both the generated `EBOOT.PBP` and its
+required `voxelmon.vxpak`; Vita output is one self-contained `.vpk`. Both
+downloads carry the native runtime's third-party notices.
+
 ### PSP
 
 Needs the [cargo-psp](https://github.com/overdrivenpotato/rust-psp) toolchain,
@@ -112,6 +144,25 @@ bun tools/voxel.ts psp --release   # the EBOOT
 Put `EBOOT.PBP` and `voxelmon.vxpak` in one folder under `ms0:/PSP/GAME/`, or
 develop over [PSPLINK](https://github.com/pspdev/psplinkusb) with the pak
 served from `host0:`.
+
+The bedroom computer can consume a live macOS desktop stream from the local
+companion daemon. It uses FFmpeg's AVFoundation capture, converts the selected
+display to **512×128 RGB332 CLUT8 at 12 fps**, pre-squashed for the 2:1 desktop
+window, and continuously publishes the fixed-size
+`pocket-svc/voxelmon/media/desktop.pkst` ring. macOS asks for Screen Recording
+permission the first time the terminal captures a display.
+
+```sh
+brew install ffmpeg
+bun run desktop:serve                         # Capture screen 0; ~/.config/ppsspp
+bun run desktop:serve -- --screen 1 --fps 20 # another display/rate
+bun run desktop:serve -- --dir /path/to/usbhostfs-root
+```
+
+Use `--device "Capture screen 0"` to bypass device discovery. `Ctrl-C` marks
+the stream ended, closes it, stops FFmpeg, and deletes `desktop.pkst` so the
+last captured frames do not persist on disk. The empty service `enable` file
+stays in place so the game can continue to show its waiting state.
 
 ### PS Vita
 
@@ -129,16 +180,116 @@ confirm — that is the whole install. It ships libvita2d's precompiled GXM
 shaders, so a stock HENkaku console does not need Sony's runtime shader
 compiler (`libshacccg.suprx`) the way most Vita 3D homebrew does.
 
+For REMOTE COMPUTER on a Vita, put the Mac and Vita on the same network and
+opt into the PKNT TCP stream plus its UDP discovery beacon:
+
+```sh
+bun run desktop:serve -- --tcp       # TCP 8622, or: --tcp 9000
+```
+
+**Network streaming is off by default.** `--tcp` broadcasts availability and
+serves the live screen to compatible `voxelmon` clients on the local network;
+PKNT does not authenticate peers, so enable it only on a network you trust.
+
 One honest difference from the PSP picture: the GE cuts sprite art out with a
 hardware alpha test and **GXM has none**, so grass, flowers and entity
 billboards blend instead of clipping, and give up their baked ambient
 occlusion to do it. Solid geometry and the Game Boy UI layer are unaffected —
 [docs/VOXEL.md §12](docs/VOXEL.md) has the per-pass accounting.
 
+### iPhone 4S / iPod touch 4 (iOS 6)
+
+The jailbroken iPhone 4S target is a standalone portrait application. It uses
+PocketJS's pinned iOS 6 ARMv7 toolchain and GLES 1.1 shell, embeds the cooked
+VXPK in `PocketVoxel.app`, renders the game in the upper half of the Retina
+display, streams the core's stereo PCM through Audio Queue Services, and draws
+touch D-pad, A/B, Start, and Select controls in the lower half. The raised
+controls reuse Motion Lab's baked-letter and D-pad visual vocabulary, with the
+required `(yui540)` credit kept on-screen; its accepted permission boundary is
+recorded in
+[`vendor/pocketjs/apps/motions/ATTRIBUTION.md`](vendor/pocketjs/apps/motions/ATTRIBUTION.md).
+Nothing ROM-derived is committed.
+
+```sh
+export VOXELMON_ROM=/path/to/PokemonRed.gb
+bun tools/voxel.ts import
+bun tools/voxel.ts cook
+bun iphone4s doctor
+bun iphone4s deploy
+bun iphone4s launch
+bun iphone4s status
+bun iphone4s capture
+```
+
+The deploy command accepts only the validated iPhone 4S/iOS 6.1.3 identity,
+uses key-only USB SSH, verifies every staged file byte-for-byte, and atomically
+replaces only `/Applications/PocketVoxel.app`. The installed app launches from
+its own SpringBoard icon and does not need a companion process or pak file.
+
+For an iPod touch 4 (`iPod4,1`, iOS 6.1.6), use the same cooked content and
+select the physical device explicitly:
+
+```sh
+export POCKETJS_IPODTOUCH4_UDID='<device-udid-from-idevice_id>'
+bun ipodtouch4 doctor
+bun ipodtouch4 deploy
+bun ipodtouch4 launch
+# Press and release the controls on the device, then check the fresh receipt.
+bun ipodtouch4 status --require-action
+bun ipodtouch4 capture
+```
+
+The iPod uses PocketJS's MobileInstallation helper and AppSync Unified to
+install a removable User app. Updates preserve its data container, and every
+installed file is checked against the build receipt. Pocket Voxel's opaque
+icon receives SpringBoard's native mask and shadow. Build artifacts and device
+receipts are under `dist/ipodtouch4`. If iOS 6 retains an old icon after an
+update, reboot the device once to reload SpringBoard's in-memory icon cache.
+Runtime and audio receipts live inside the app's own container. Both targets
+share the ARMv7 renderer and support simultaneous D-pad and A/B contacts. `input_chord_frames` in the status receipt
+records frames that received a direction and A/B together.
+
+### Cardputer Zero
+
+The native Cardputer Zero host targets its internal **320×170 RGB565** LCD
+and TCA8418 keyboard. Pocket Voxel keeps the **480×272 logical viewport** and
+renders directly at **300×170**, centered with 10-pixel black bars on both
+sides; the image is not stretched or cropped.
+
+Install the Rust target and cross-linker once, connect the device over ADB,
+then give VC4 a 64 MiB contiguous-memory pool once. The stock Cardputer Zero
+image uses 32 MiB, which cannot hold VC4's binner and the renderer's buffer
+objects at the same time:
+
+```sh
+adb shell "cp -p /boot/firmware/cmdline.txt /boot/firmware/cmdline.txt.pre-pocket-voxel-gpu && sed -i 's/cma=[^ ]*/cma=64M/' /boot/firmware/cmdline.txt && systemctl reboot"
+adb wait-for-device
+```
+
+Then build, cook the local ROM-derived pak, and add Pocket Voxel to APPLaunch:
+
+```sh
+rustup target add aarch64-unknown-linux-gnu --toolchain stable
+cargo install cargo-zigbuild
+VOXELMON_ROM=/path/to/PokemonRed.gb bun run cardputer:install
+```
+
+Use the arrow keys or `WASD` to move. `Enter`, `Space`, `Z`, or `J` confirms;
+`Backspace`, `X`, or `K` cancels; `P` is Start, `O`/`Q` is Select, and `Esc`
+returns to APPLaunch. **The SPI panel exposes a fixed 320×170 at 30 Hz DRM
+mode**, so the host preserves 60 Hz game logic and presents at the panel-native
+30 fps. **The host rasterizes geometry, indexed atlas textures, depth, and
+blending on the BCM2837 VC4/V3D GPU through GLES2.** The GPU is a separate DRM
+device from the SPI display, so each 300×170 result is read back and written to
+the RGB565 panel. `--software` selects the CPU rasterizer only for diagnostics;
+the default path rejects Mesa software renderers instead of silently using
+one. **The game clock remains 60 Hz and audio is prebuffered at 11.025 kHz
+stereo, so a skipped display frame does not slow music playback.**
+
 ## Tests
 
 ```sh
-bun test                    # 226 tests; ROM-gated suites skip with a reason
+bun test                    # 241 tests; ROM-gated suites skip with a reason
 bun tools/voxel.ts check    # both quality rungs' frame hashes
 bun tests/e2e/voxel-ppsspp.ts   # GE-vs-sim parity at 11 story marks
 ```

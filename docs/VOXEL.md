@@ -113,7 +113,8 @@ tick: `frame(buttons)`, exactly once.
 - retains the scene the guest drives through ops: camera, pitch rung, tint,
   up to 16 entity billboards, removable stamps, emotes, the battle stage, and
   a retained GB UI tile grid (20×18) with a reveal counter for typewriter
-  text;
+  text, plus a bounded native-pixel overlay for coloured modal application
+  chrome;
 - interprets the ROM's sound programs and renders PCM on demand (§8): the
   guest names a song, an effect or a cry in numbers and the core does the
   synthesis, because the same interpreter in QuickJS costs 2.3 s of CPU per
@@ -124,10 +125,12 @@ tick: `frame(buttons)`, exactly once.
   ramp. Both backends call it, so the software rasterizer and the GE can
   never bind different colours for the same draw;
 - builds one ordered draw list per frame. Draw order (from the mod, minus
-  shader-bound passes): sky bands → terrain chunks, each followed by its own
+  shader-bound passes): outdoor sky bands (or opaque-black indoor clear bands)
+  → terrain chunks, each followed by its own
   tree mesh at the level of detail this rung picked (§4a) → water (flat,
   animated atlas) → shadow decals → player ghost (inverted depth, no write) →
-  entity cards → grass mesh → flower mesh → GB UI quads.
+  entity cards → grass mesh → flower mesh → GB UI quads → optional
+  host-video quad → native overlay rectangles.
 
 Per-frame boundary traffic is **~10–40 ops** (camera + moving entities +
 a reveal counter); menu opens burst a few hundred `ui*` ops once. Against the
@@ -140,22 +143,38 @@ drift guard — the `mon-spec.ts` discipline unchanged. Op groups:
 
 - **world** — `mapShow(slot, mapId, ox, oy)` / `mapHide(slot)` (slot 0 =
   current, 1..4 = connected neighbours at their seam offsets), `cam(x, y)`,
-  `pitch(rung)`, `tint(abgr)`, `stamp(mapId, cx, cy, on)` (cut tree, moved
+  `pitch(rung)`, `tint(abgr)`, `sky(on)`, `stamp(mapId, cx, cy, on)` (cut tree, moved
   boulder — pre-cooked removable sub-meshes toggled at runtime),
   `palette(index)` (the SGB SuperPalette for the map, index into the pak's
   SGB set). On a pak cooked with the RED++ pack the per-map and per-page
   bindings in the `VCOL` section outrank `palette(index)` entirely, and
   **the guest emits the identical op stream either way** — no op, no flag
   and no gamedata field differs between the two colour models. Which model
-  a build uses is decided by the cook, not by the guest.
+  a build uses is decided by the cook, not by the guest. `sky` is append-only
+  op 75 and retained, defaults visible for old guests/traces, and is emitted
+  only when the map identity changes. `sky(0)` keeps black, zero-horizon
+  `SkyBands` in the draw list so PSP clears colour/depth and Vita/Web/sim see
+  the same tint-independent indoor void.
 - **entities** — `ent(slot, sheet, frame, x, y, lift, flags)`, `entHide`,
   `emote(slot, kind)`. Billboards lean back by camera pitch and pull toward
   the eye along each vertex's own ray — the mod's projection-invariant depth
-  bias, ported exactly.
+  bias, ported exactly. `lift` is the entity's absolute feet height above the
+  map plane: the tile's cooked support height plus any active hop lift.
 - **ui** — `uiTile(x, y, tile)`, `uiFill(x, y, w, h, tile)`,
   `uiText(x, y, str)` (glyphs resolved core-side through the cooked charmap),
   `uiReveal(n)`, `uiClear()`. The GB UI is a retained tile layer composited
   over the diorama, scaled to fit 480×272.
+- **overlay** — `uiRect(x, y, w, h, abgr)`,
+  `uiLabel(x, y, scale, abgr, str)`, `uiOverlayClear()`. These commands retain
+  native 480×272 pixel rectangles and transparent 5×7 labels, clipped and
+  capped at the core boundary, then composite them after the GB UI. The
+  bedroom PC uses this layer for its centred colour window while leaving the
+  world visible around it.
+- **host video** — `remotePlane(x, y, w, h)` retains one destination rectangle
+  between the GB UI and the native overlay. The guest owns only its geometry
+  and the modal `WAITING`/`LIVE` state. `remoteOpen()`, `remoteTick()` and
+  `remoteClose()` bind a host-owned video-only stream; no captured audio enters
+  the chip-synth path. A non-positive plane size removes it.
 - **battle** — `arena(mapId, x, y, shape, rig)`, `card(side, pic, x, y)`,
   `cardHide(side)`, `battleCam(orbit, pitch, zoom)`, `arenaEnd()`. The two
   solved camera rigs (tele / wide) and the spread correction come from the
@@ -195,7 +214,7 @@ Two rules make it a ladder and not a pile of switches:
   `VOXEL_TREE_BOXES=1` cook flag is the shape this replaces.
 - **The top rung is the identity.** It draws exactly what this runtime drew
   before the ladder existed. `tests/goldens/voxel/*-max.hashes` are the
-  pre-ladder frame hashes and `bun tools/voxel.ts check` replays both tapes at
+  pre-ladder frame hashes and `bun tools/voxel.ts check` replays every tape at
   the top rung against them byte-for-byte, so no later dial edit can quietly
   move the picture the ladder is supposed to preserve.
 
@@ -288,8 +307,8 @@ beyond. Measured over the story trace with this rung's other dials held
 coarse level costs the pak the CHNK growth of one more mesh range per chunk
 plus its quads (ROUTE_1 75 294 → 85 374 packed quads, ~+13%).
 
-Measured over both tapes at every tick, with the other dials held at this
-rung: the worst frame is **flat at 110 144 triangles from 128 px to 144 px and
+Measured over the story and battle tapes at every tick, with the other dials
+held at this rung: the worst frame is **flat at 110 144 triangles from 128 px to 144 px and
 jumps to 117 272 at 160 px**. 128 px is the point in that plateau where every
 pixel the swap costs sits at the horizon or the frame's top edge — 886 px of a
 480×272 frame at `battle-intro`, 438 px in an 11-px strip at the top of
@@ -309,6 +328,16 @@ level the pak holds rather than losing its trees. And the **chunk record grew
 two mesh ranges**, which is a VXPK version bump (3 → 4), so a stale pak is
 rejected instead of mis-read.
 
+VXPK v9 assigns the CHNK record's former reserved `u16` to chunk flags
+without changing the 128-byte record size. `VXPK_CHUNK_FLAG_BORDER_RING`
+(bit 0) marks geometry that belongs only to the current map's protective
+border; unknown bits fail pak validation. This lets the same map record be
+safe as slot 0 and as a neighbouring slot without duplicating its body mesh.
+The core, browser exporter and WASM console packager all require v9 exactly:
+v8 has no compatibility reader and must be re-cooked. Code and assets therefore
+ship as one version; GAME/save semantics did not change, so existing saves need
+no migration.
+
 **Where the two levels do not line up.** A quad joins the chunk its centroid
 falls in, and a hull is a ball wider than the cell it stands on, so a tree at
 a chunk seam can put a few of its hull quads in the neighbouring chunk while
@@ -321,8 +350,8 @@ the near level's quad order and therefore to the identity rung, so it needs
 the `-max` goldens re-proved, not re-recorded.
 
 The `vita` rung is a placeholder, not a measurement: at 192 px it is
-pixel-identical to the top rung across both tapes on the v1 maps, because
-128 px chunks inside a 340 px cap leave room for only two distinct settings
+pixel-identical to the top rung across the story and battle tapes on the v1
+maps, because 128 px chunks inside a 340 px cap leave room for only two distinct settings
 here. It is a labelled rung owed a number from the machine itself.
 
 **What is still over budget after this rung.** With the coarse carve in
@@ -402,6 +431,31 @@ Events are the standard packed batch wire (`u16 kind | u16 a | i32 b | i32 c
 the guest does not already know. The channel exists so mesh-streaming or
 host-side timing facts can append later without a wire change.
 
+### 4b. The remote-computer stream
+
+The macOS companion captures one selected AVFoundation screen through FFmpeg,
+scales it to a **512×128 RGB332 CLUT8 frame at 12 fps**, and assigns each
+file session or PKNT connection a non-zero stream epoch. The stored frame is
+anamorphic: the device stretches it into the bedroom PC's 360×180 plane,
+restoring the captured display's proportions while keeping each update near
+65 KiB. The fixed-size
+eight-slot ring bounds both disk use and reader work.
+
+PPSSPP and PSPLINK use the PocketJS service filesystem at
+`pocket-svc/voxelmon/media/desktop.pkst`. The PSP reads at most 26 KiB per
+game tick, validates a slot sequence before and after the chunked read, and
+copies complete CLUT8 pixels into persistent GE memory only after `sceGuSync`.
+The Vita uses PocketJS's PKNT transport over Wi-Fi: `streamOpen` installs the
+same ring image in RAM and video slots use latest-only backpressure. Network
+discovery and screen broadcast are enabled only by the daemon's explicit
+`--tcp` option; the default daemon writes only to the local PPSSPP/usbhostfs
+directory.
+
+The companion unlinks `desktop.pkst` when capture stops because the ring holds
+recent screenshots. Selecting the remote PC freezes the overworld in a normal
+modal game state, retries an absent companion without falling back to the local
+mock desktop, and releases the host stream on `B` or `START`.
+
 ## 5. The asset pipeline
 
 `bun tools/voxel.ts import` — TS port of the gen1recomp extractor, driven by
@@ -440,6 +494,27 @@ instead of every session on the handheld:
    including the GAME section the guest reads at boot, the AUDI section
    carrying `audio.json` + `programs.bin` verbatim, and the VCOL section
    naming each map's and each page's CLUT.
+
+### Connected-map border rings
+
+The Lua `ChunkMesher` keeps a protective wall around a map only where no
+loaded direct neighbour owns the other side. The cooker now makes that
+ownership explicit without duplicating body vertices:
+
+- only direct neighbours present in this cook open a mask; an exit to an
+  uncooked map stays closed and keeps its wall;
+- tile quads use the Lua strict/open mask, object quads use its closed mask,
+  and `own` eaves, outward boundary facades and round-tree stamp tests keep
+  their upstream ownership rules;
+- each quad is routed once to body or ring. Pure ring chunks carry
+  `VXPK_CHUNK_FLAG_BORDER_RING`; slot 0 draws body + ring, while neighbour
+  slots 1–4 reject ring records before every terrain, water and tree LOD pass;
+- ring records carry no ground-bake page and no grass/flower stream, preventing
+  the PSP bake from smuggling the removed neighbour wall back into the frame.
+
+Pallet Town ↔ Route 1, Route 1 ↔ Viridian City and Viridian City ↔ Route 2
+are pinned in both directions. Their body/ring quads are disjoint, while a
+synthetic uncooked exit remains sealed.
 
 ### The hidden-face cull
 
@@ -582,7 +657,8 @@ raster work but the fetches and transforms are already paid by then.
 
 Every item here is a deliberate limit with a stated reason:
 
-- **The GB UI, menus, textboxes and the battle screen stay grayscale.**
+- **The GB UI, menus, textboxes and the battle screen stay grayscale.** The
+  native overlay is a separate ABGR layer and does not recolour GB tiles.
   RED++ colours them through named SuperPalettes over SGB zones, which needs
   a `uiPal(x, y, w, h, pal)` op — a new op, so a new spec round. HP-bar
   colour by fill (`GetHealthBarColor`) waits on the same op.
@@ -799,15 +875,21 @@ script runner, the textbox typewriter — and the wild-battle core (damage /
 accuracy / crit / status / catch / run / exp through the oracle-verified
 rules; the early-route effect set; unknown effects degrade via the
 reference's own fallbacks) staged in the voxel arena with the classic GB
-battle screen composited over it. One tape drives Bun, the Rust rasterizer
-(committed hash goldens: 11 story + 4 battle marks, at two quality rungs
-each — §4a) and the PSP capture EBOOT. Sound is the ROM's own channel programs, interpreted and rendered to
-PCM core-side (`pocketvoxel-core/src/audio.rs`, sample-exact against the
-reference over all 303 of them): map themes, the wild-battle and victory
+battle screen composited over it. Three intent tapes drive Bun, the Rust
+rasterizer (committed hash goldens: 11 story + 4 battle + 7 bedroom-computer
+marks, at two quality rungs each — §4a) and the PSP capture EBOOT. Sound is
+the ROM's own channel programs, interpreted and rendered to PCM core-side
+(`pocketvoxel-core/src/audio.rs`, sample-exact against the reference over all
+303 of them): map themes, the wild-battle and victory
 themes, the textbox beep and species cries. Colour is RED++ / pokered-gbc
 **per tile**, baked into the terrain texel index and bound per map (§5),
 oracle-checked against the reference's own `PaletteFX`; the GB UI layer
-stays grayscale.
+stays grayscale, independently of the native colour overlay.
+
+Field entity feet also use the VoxelMod's cooked positive tile support:
+player hop lift is added to the source cell until landing, while NPCs and
+items use the cell height directly. The four shipped interiors explicitly
+request the black void; this is visibility state only, not a DayNight system.
 
 Later rungs, in dependency order: the GB UI colour layer (a `uiPal` op — the
 one piece of RED++ parity that needs a new op); pak slimming for the
@@ -923,6 +1005,89 @@ made, and cues fired from the wrong moment.
   one generator; the port partitions three seeded streams so ambience and
   battles cannot perturb the route. Changing the topology would move every
   committed hash to buy nothing a player could see. Kept, deliberately.
+
+### 11a. Scene parity repairs (2026-08-13)
+
+This pass compared gen1recomp `f0ed2efe` and DramaticShapeVoxelMod
+`8ef4d290` against the Pocket hosts, then fixed three presentation regressions
+without changing tall-grass classification, encounters, battle arena support,
+neighbour NPCs or DayNight.
+
+- **The screenshot's green obstruction was not generated grass.** It was a
+  connected map's tree boundary ring drawn over the current map body. The
+  v9 ring flag and the mask/slot rules in §5 remove only that duplicate;
+  uncooked exits remain protected.
+- **Entities recover Lua `groundAt`.** GAME tilesets carry a tile-id support
+  table derived from the same `TileShape` analysis. Missing shapes, stairs,
+  water/non-positive heights and off-map reads are zero. Mom and Daisy resolve
+  to 5 px; the Oak Lab balls and Pokédexes plus Blue's House Town Map resolve
+  to 6 px. A moving player keeps the departure cell until landing and adds
+  `hopLift`; NPCs and items do not.
+- **Interiors recover the Lua void.** `REDS_HOUSE_1F`, `REDS_HOUSE_2F`,
+  `OAKS_LAB` and `BLUES_HOUSE` send `sky(0)`; Pallet Town, the routes and
+  Viridian City send `sky(1)`. The state is delta-emitted on map identity,
+  defaults visible for old traces, and always clears through black bands when
+  hidden.
+
+The golden rebase was reviewed as PNG before/after pairs, not recorded blind.
+Counts below are RGB-changed pixels out of 130,560 per image; `psp` is the
+shipped rung and `desktop` the identity rung. Across all 30 images, 25 changed:
+415,775 pixel positions and RGB absolute error 139,221,079. Every non-zero
+pixel fell into one of the ring/bake, entity-foot or indoor-void regions.
+
+| tape / mark | psp px | desktop px | reviewed cause |
+| --- | ---: | ---: | --- |
+| story / bedroom | 0 | 0 | mark occurs before the pitch exposes the retained indoor void |
+| story / downstairs | 17,350 | 16,114 | black indoor void; Mom at 5 px support |
+| story / pallet-town | 5,911 | 9,398 | Route 1 neighbour ring removed at the top edge; PSP live-ring bake edge |
+| story / sign-read | 917 | 2,382 | neighbour ring removed at the top edge |
+| story / oaks-lab | 1,902 | 623 | black indoor void; 6 px item supports |
+| story / lab-exit | 68 | 0 | PSP Pallet protective ring no longer ground-baked |
+| story / route-1 | 47,201 | 54,551 | duplicate connected-map tree ring removed from the active view |
+| story / mid-route | 3,609 | 0 | PSP Route 1 east protective ring rendered live, matching desktop |
+| story / encounter-seen | 3,881 | 1,957 | neighbour top ring removed; PSP east ring rendered live |
+| story / viridian | 49,488 | 58,368 | duplicate connected-map tree ring removed from the active view |
+| story / done | 41,161 | 46,554 | duplicate connected-map tree ring removed from the active view |
+| battle / grass-edge | 3,608 | 0 | PSP Route 1 east protective ring rendered live |
+| battle / battle-intro | 11,586 | 11,695 | duplicate neighbour ring removed from the arena background |
+| battle / post-fight | 10,739 | 10,874 | duplicate neighbour ring removed from the arena background |
+| battle / escaped | 3,881 | 1,957 | same returned Route 1 frame as `encounter-seen` |
+
+The final deterministic cook is 29,689,744 bytes, 2,418,720 bytes (7.53%)
+smaller than the 32,108,464-byte pre-fix baseline; body vertices were not
+copied and ring records have zero baked pages. Both quality-rung tapes,
+the six directional connection checks, the eight named support objects,
+retained sky backend tests, Web playback, and PSP/Vita package assembly use
+the same v9 pak.
+
+### 11b. Player occlusion silhouette (2026-08-13)
+
+The player hint behind tall scenery now reuses the live card's atlas page,
+frame UVs, mirror flag, geometry and camera pull as an alpha mask. Visible
+sprite texels become the single translucent ghost colour; transparent card
+texels stay absent. This replaces the old untextured 16x16 quad, whose empty
+corners appeared as a grey rectangle above the player. The ordinary foot
+shadow is a separate decal and is unchanged.
+
+The software renderer samples the source alpha before substituting the flat
+colour. PSP binds a one-draw silhouette CLUT, while Vita caches an RGBA atlas
+variant keyed by the same flat colour; both retain the existing occluded-only
+depth test and never write depth.
+
+The story golden update was reviewed as RGB PNG diffs against the immediately
+preceding scene-repair baseline. Only six marks per quality rung changed, and
+every changed pixel lay inside the former player-card rectangle. The other
+five story marks and all eight battle hashes were byte-identical.
+
+| story mark | psp px | desktop px |
+| --- | ---: | ---: |
+| downstairs | 149 | 149 |
+| pallet-town | 211 | 211 |
+| lab-exit | 153 | 158 |
+| route-1 | 65 | 53 |
+| viridian | 65 | 53 |
+| done | 65 | 53 |
+| **total** | **708** | **677** |
 
 ## 12. The PS Vita port
 

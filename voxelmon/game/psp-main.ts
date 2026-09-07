@@ -32,6 +32,7 @@ interface VoxelNative {
   cam(x: number, y: number): void;
   pitch(rung: number): void;
   tint(abgr: number): void;
+  sky(on: number): void;
   stamp(mapId: number, cx: number, cy: number, on: number): void;
   palette(index: number): void;
   ent(
@@ -50,6 +51,13 @@ interface VoxelNative {
   uiText(x: number, y: number, str: string): void;
   uiReveal(n: number): void;
   uiClear(): void;
+  uiRect(x: number, y: number, w: number, h: number, abgr: number): void;
+  uiLabel(x: number, y: number, scale: number, abgr: number, str: string): void;
+  uiOverlayClear(): void;
+  remotePlane?(x: number, y: number, w: number, h: number): void;
+  remoteOpen?(): boolean;
+  remoteTick?(): number;
+  remoteClose?(): void;
   arena(mapId: number, x: number, y: number, shape: number, rig: number): void;
   card(side: number, pic: number, x: number, y: number): void;
   cardHide(side: number): void;
@@ -115,6 +123,9 @@ class QuickJsHost implements VoxelHost {
   tint(abgr: number): void {
     native.tint(abgr);
   }
+  sky(on: number): void {
+    native.sky(on);
+  }
   stamp(mapId: number, cx: number, cy: number, on: number): void {
     native.stamp(mapId, cx, cy, on);
   }
@@ -152,6 +163,27 @@ class QuickJsHost implements VoxelHost {
   }
   uiClear(): void {
     native.uiClear();
+  }
+  uiRect(x: number, y: number, w: number, h: number, abgr: number): void {
+    native.uiRect(x, y, w, h, abgr);
+  }
+  uiLabel(x: number, y: number, scale: number, abgr: number, str: string): void {
+    native.uiLabel(x, y, scale, abgr, str);
+  }
+  uiOverlayClear(): void {
+    native.uiOverlayClear();
+  }
+  remotePlane(x: number, y: number, w: number, h: number): void {
+    native.remotePlane?.(x, y, w, h);
+  }
+  remoteOpen(): boolean {
+    return native.remoteOpen?.() ?? false;
+  }
+  remoteTick(): number {
+    return native.remoteTick?.() ?? -1;
+  }
+  remoteClose(): void {
+    native.remoteClose?.();
   }
   arena(mapId: number, x: number, y: number, shape: number, rig: number): void {
     native.arena(mapId, x, y, shape, rig);

@@ -24,18 +24,26 @@ pub const H: usize = VIEW_H as usize;
 pub struct Frame {
     pub color: Vec<u32>,
     pub depth: Vec<f32>,
+    pub width: usize,
+    pub height: usize,
 }
 
 impl Frame {
     pub fn new() -> Self {
+        Self::with_size(W, H)
+    }
+
+    pub fn with_size(width: usize, height: usize) -> Self {
         Self {
-            color: vec![0xff00_0000; W * H],
-            depth: vec![f32::INFINITY; W * H],
+            color: vec![0xff00_0000; width * height],
+            depth: vec![f32::INFINITY; width * height],
+            width,
+            height,
         }
     }
 
     pub fn rgba_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(W * H * 4);
+        let mut out = Vec::with_capacity(self.width * self.height * 4);
         for c in &self.color {
             out.extend_from_slice(&c.to_le_bytes());
         }
@@ -153,15 +161,15 @@ struct SV {
     rgba: [f32; 4],
 }
 
-fn project(p: &PV) -> Option<SV> {
+fn project(p: &PV, width: usize, height: usize) -> Option<SV> {
     let w = p.clip[3];
     if w <= 0.0 {
         return None; // defensive: near clip leaves w > 0 for real cameras
     }
     let iw = 1.0 / w;
     Some(SV {
-        x: (p.clip[0] * iw * 0.5 + 0.5) * W as f32,
-        y: (1.0 - (p.clip[1] * iw * 0.5 + 0.5)) * H as f32,
+        x: (p.clip[0] * iw * 0.5 + 0.5) * width as f32,
+        y: (1.0 - (p.clip[1] * iw * 0.5 + 0.5)) * height as f32,
         z: p.clip[2] * iw,
         iw,
         u: p.u * iw,
@@ -180,6 +188,10 @@ struct TexCtx<'a> {
     w: usize,
     h: usize,
     pal: &'a [u32; 256],
+    /// Replace every alpha-tested-in texel with one flat ABGR color. The
+    /// player's occlusion ghost uses the sprite page only as a silhouette
+    /// mask; ordinary textured draws keep the palette color with `None`.
+    solid: Option<u32>,
 }
 
 impl TexCtx<'_> {
@@ -194,7 +206,7 @@ impl TexCtx<'_> {
         if (c >> 24) & 0xff < 0x80 {
             None
         } else {
-            Some(c)
+            Some(self.solid.unwrap_or(c))
         }
     }
 }
@@ -217,6 +229,40 @@ fn blend_over(dst: u32, rgb: [u32; 3], a: u32) -> u32 {
     0xff00_0000 | (b << 16) | (g << 8) | r
 }
 
+fn draw_overlay_rect(frame: &mut Frame, x: i32, y: i32, w: i32, h: i32, abgr: u32) {
+    let x0 = x.clamp(0, frame.width as i32) as usize;
+    let y0 = y.clamp(0, frame.height as i32) as usize;
+    let x1 = x.saturating_add(w.max(0)).clamp(0, frame.width as i32) as usize;
+    let y1 = y.saturating_add(h.max(0)).clamp(0, frame.height as i32) as usize;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let rgb = [abgr & 0xff, (abgr >> 8) & 0xff, (abgr >> 16) & 0xff];
+    let a = (abgr >> 24) & 0xff;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let dst = &mut frame.color[py * frame.width + px];
+            *dst = blend_over(*dst, rgb, a);
+        }
+    }
+}
+
+/// The sim has no live host stream. A deterministic dark checkerboard keeps
+/// the plane visible in screenshots and goldens without pretending it is a
+/// captured frame; device backends replace this entire item with live pixels.
+fn draw_video_placeholder(frame: &mut Frame, x: i32, y: i32, w: i32, h: i32) {
+    let x0 = x.clamp(0, frame.width as i32) as usize;
+    let y0 = y.clamp(0, frame.height as i32) as usize;
+    let x1 = x.saturating_add(w.max(0)).clamp(0, frame.width as i32) as usize;
+    let y1 = y.saturating_add(h.max(0)).clamp(0, frame.height as i32) as usize;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let cell = ((px - x0) / 8 + (py - y0) / 8) & 1;
+            frame.color[py * frame.width + px] = if cell == 0 { 0xff20_1810 } else { 0xff30_2818 };
+        }
+    }
+}
+
 fn draw_clip_tri(
     frame: &mut Frame,
     tri: [PV; 3],
@@ -228,11 +274,14 @@ fn draw_clip_tri(
     if poly.len() < 3 {
         return;
     }
-    let Some(first) = project(&poly[0]) else {
+    let Some(first) = project(&poly[0], frame.width, frame.height) else {
         return;
     };
     for i in 1..poly.len() - 1 {
-        let (Some(b), Some(c)) = (project(&poly[i]), project(&poly[i + 1])) else {
+        let (Some(b), Some(c)) = (
+            project(&poly[i], frame.width, frame.height),
+            project(&poly[i + 1], frame.width, frame.height),
+        ) else {
             continue;
         };
         raster_tri(frame, [first, b, c], tex, depth, blend);
@@ -259,7 +308,7 @@ fn raster_tri(frame: &mut Frame, v: [SV; 3], tex: Option<&TexCtx>, depth: DepthM
         .map(|p| p.x)
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil() as usize)
-        .min(W);
+        .min(frame.width);
     let min_y = v
         .iter()
         .map(|p| p.y)
@@ -271,7 +320,7 @@ fn raster_tri(frame: &mut Frame, v: [SV; 3], tex: Option<&TexCtx>, depth: DepthM
         .map(|p| p.y)
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil() as usize)
-        .min(H);
+        .min(frame.height);
 
     for py in min_y..max_y {
         let cy = py as f32 + 0.5;
@@ -285,7 +334,7 @@ fn raster_tri(frame: &mut Frame, v: [SV; 3], tex: Option<&TexCtx>, depth: DepthM
             if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
                 continue;
             }
-            let idx = py * W + px;
+            let idx = py * frame.width + px;
             let z = w0 * v[0].z + w1 * v[1].z + w2 * v[2].z;
             let pass = match depth {
                 DepthMode::LessWrite | DepthMode::LessNoWrite => z < frame.depth[idx],
@@ -384,7 +433,31 @@ fn quad_tris<F: FnMut([PV; 3])>(quad: [PV; 4], mut emit: F) {
 
 /// Rasterize one draw list against the pak's palettes and cached atlases.
 pub fn render(list: &DrawList, pak: &Pak, cache: &AtlasCache) -> Frame {
-    let mut frame = Frame::new();
+    render_at(list, pak, cache, W, H)
+}
+
+/// Rasterize at an aspect-compatible physical resolution.
+///
+/// World projection scales directly into `width` x `height`; screen-space UI
+/// and overlays retain their 480x272 logical coordinates and are mapped here.
+/// The simulator and committed goldens continue through [`render`] unchanged.
+pub fn render_at(
+    list: &DrawList,
+    pak: &Pak,
+    cache: &AtlasCache,
+    width: usize,
+    height: usize,
+) -> Frame {
+    let mut frame = Frame::with_size(width, height);
+    let sx = width as f32 / VIEW_W as f32;
+    let sy = height as f32 / VIEW_H as f32;
+    let scale_rect = |x: i32, y: i32, w: i32, h: i32| -> (i32, i32, i32, i32) {
+        let x0 = (x as f32 * sx).floor() as i32;
+        let y0 = (y as f32 * sy).floor() as i32;
+        let x1 = ((x.saturating_add(w.max(0))) as f32 * sx).ceil() as i32;
+        let y1 = ((y.saturating_add(h.max(0))) as f32 * sy).ceil() as i32;
+        (x0, y0, x1 - x0, y1 - y0)
+    };
     // Day tint = CLUT rewrite: 3D passes sample tinted palettes; the GB UI
     // layer composites verbatim.
     let tinted: Vec<[u32; 256]> = pak
@@ -417,6 +490,7 @@ pub fn render(list: &DrawList, pak: &Pak, cache: &AtlasCache) -> Frame {
             w: page.w,
             h: page.h,
             pal: tinted.get(pal_index(m.page, page.kind, m.pal))?,
+            solid: None,
         })
     };
 
@@ -426,13 +500,14 @@ pub fn render(list: &DrawList, pak: &Pak, cache: &AtlasCache) -> Frame {
                 colors,
                 horizon_row,
             } => {
-                let hr = (*horizon_row).clamp(0, H as i32) as usize;
+                let hr = ((*horizon_row as f32 * sy).round() as i32).clamp(0, frame.height as i32)
+                    as usize;
                 for (i, &c) in colors.iter().enumerate() {
                     let y0 = hr * i / colors.len();
                     let y1 = hr * (i + 1) / colors.len();
-                    frame.color[y0 * W..y1 * W].fill(c);
+                    frame.color[y0 * frame.width..y1 * frame.width].fill(c);
                 }
-                frame.color[hr * W..].fill(colors[colors.len() - 1]);
+                frame.color[hr * frame.width..].fill(colors[colors.len() - 1]);
             }
 
             Item::ChunkMesh { mesh, .. } | Item::StampMesh { mesh, .. } => {
@@ -490,21 +565,46 @@ pub fn render(list: &DrawList, pak: &Pak, cache: &AtlasCache) -> Frame {
                 });
             }
 
-            Item::Ghost { verts, pull, abgr } => {
-                let rgba = abgr_to_rgba_f(*abgr);
+            Item::Ghost {
+                verts,
+                page,
+                uv,
+                mirror,
+                pull,
+                abgr,
+            } => {
+                let Some(cp) = cache.pages.get(*page as usize) else {
+                    continue;
+                };
+                let tex = TexCtx {
+                    texels: &cp.frames[0],
+                    w: cp.w,
+                    h: cp.h,
+                    pal: &tinted[pal_index(*page, cp.kind, COLOR_PAL_NONE)],
+                    solid: Some(*abgr),
+                };
+                let (u0, u1) = if *mirror {
+                    (uv[2], uv[0])
+                } else {
+                    (uv[0], uv[2])
+                };
+                let (v0, v1) = (uv[1], uv[3]);
+                let uvs = [(u0, v1), (u1, v1), (u1, v0), (u0, v0)];
+                let white = [255.0f32; 4];
                 let quad: [PV; 4] = core::array::from_fn(|i| {
-                    to_clip(
+                    to_clip_opts(
                         vp,
                         eye,
                         vec3(verts[i][0], verts[i][1], verts[i][2]),
                         *pull,
-                        0.0,
-                        0.0,
-                        rgba,
+                        uvs[i].0,
+                        uvs[i].1,
+                        white,
+                        true,
                     )
                 });
                 quad_tris(quad, |t| {
-                    draw_clip_tri(&mut frame, t, None, DepthMode::GreaterNoWrite, true)
+                    draw_clip_tri(&mut frame, t, Some(&tex), DepthMode::GreaterNoWrite, true)
                 });
             }
 
@@ -526,6 +626,7 @@ pub fn render(list: &DrawList, pak: &Pak, cache: &AtlasCache) -> Frame {
                     // CLUT and a battle pic's species CLUT are properties of
                     // the PAGE, so resolve_pal reads them from VCOL itself.
                     pal: &tinted[pal_index(*page, cp.kind, COLOR_PAL_NONE)],
+                    solid: None,
                 };
                 let (u0, u1) = if *mirror {
                     (uv[2], uv[0])
@@ -568,37 +669,49 @@ pub fn render(list: &DrawList, pak: &Pak, cache: &AtlasCache) -> Frame {
                 let cols = (cp.w / TILE_PX as usize).max(1);
                 let tx0 = (*tile as usize % cols) * TILE_PX as usize;
                 let ty0 = (*tile as usize / cols) * TILE_PX as usize;
+                let x = x * sx;
+                let y = y * sy;
+                let w = w * sx;
+                let h = h * sy;
                 let px0 = x.floor().max(0.0) as usize;
-                let px1 = ((x + w).ceil() as usize).min(W);
+                let px1 = ((x + w).ceil() as usize).min(frame.width);
                 let py0 = y.floor().max(0.0) as usize;
-                let py1 = ((y + h).ceil() as usize).min(H);
+                let py1 = ((y + h).ceil() as usize).min(frame.height);
                 for py in py0..py1 {
                     let cyf = py as f32 + 0.5;
-                    if cyf < *y || cyf >= y + h {
+                    if cyf < y || cyf >= y + h {
                         continue;
                     }
-                    let sy = ((cyf - y) / h * TILE_PX as f32) as usize;
-                    let sy = ty0 + sy.min(TILE_PX as usize - 1);
-                    if sy >= cp.h {
+                    let tex_y = ((cyf - y) / h * TILE_PX as f32) as usize;
+                    let tex_y = ty0 + tex_y.min(TILE_PX as usize - 1);
+                    if tex_y >= cp.h {
                         continue;
                     }
                     for px in px0..px1 {
                         let cxf = px as f32 + 0.5;
-                        if cxf < *x || cxf >= x + w {
+                        if cxf < x || cxf >= x + w {
                             continue;
                         }
-                        let sx = ((cxf - x) / w * TILE_PX as f32) as usize;
-                        let sx = tx0 + sx.min(TILE_PX as usize - 1);
-                        if sx >= cp.w {
+                        let tex_x = ((cxf - x) / w * TILE_PX as f32) as usize;
+                        let tex_x = tx0 + tex_x.min(TILE_PX as usize - 1);
+                        if tex_x >= cp.w {
                             continue;
                         }
-                        let c = pal[cp.frames[0][sy * cp.w + sx] as usize];
+                        let c = pal[cp.frames[0][tex_y * cp.w + tex_x] as usize];
                         if (c >> 24) & 0xff < 0x80 {
                             continue;
                         }
-                        frame.color[py * W + px] = 0xff00_0000 | (c & 0x00ff_ffff);
+                        frame.color[py * frame.width + px] = 0xff00_0000 | (c & 0x00ff_ffff);
                     }
                 }
+            }
+            Item::VideoQuad { x, y, w, h } => {
+                let (x, y, w, h) = scale_rect(*x, *y, *w, *h);
+                draw_video_placeholder(&mut frame, x, y, w, h);
+            }
+            Item::OverlayRect { x, y, w, h, abgr } => {
+                let (x, y, w, h) = scale_rect(*x, *y, *w, *h);
+                draw_overlay_rect(&mut frame, x, y, w, h, *abgr);
             }
         }
     }
@@ -646,6 +759,17 @@ mod tests {
     }
 
     #[test]
+    fn physical_size_projects_without_a_logical_intermediate_frame() {
+        let mut f = Frame::with_size(300, 170);
+        let q = ndc_quad(-0.5, -0.5, 0.5, 0.5, 0.0, [255.0, 0.0, 0.0, 255.0]);
+        draw_quad(&mut f, q, None, DepthMode::LessWrite, false);
+        // The half-height edges land on pixel centres at y=42.5/127.5, and
+        // this double-sided raster convention includes both boundary rows.
+        assert_eq!(count_not_background(&f), 150 * 86);
+        assert_eq!(f.color[85 * 300 + 150], 0xff00_00ff);
+    }
+
+    #[test]
     fn depth_resolves_two_overlapping_tris() {
         let center = 136 * W + 240;
         for order in [false, true] {
@@ -674,6 +798,7 @@ mod tests {
             w: 2,
             h: 1,
             pal: &pal,
+            solid: None,
         };
         let q = ndc_quad(-0.5, -0.5, 0.5, 0.5, 0.0, [255.0; 4]);
         draw_quad(&mut f, q, Some(&tex), DepthMode::LessWrite, false);
@@ -701,6 +826,44 @@ mod tests {
     }
 
     #[test]
+    fn ghost_texture_is_a_flat_silhouette_mask() {
+        let mut f = Frame::new();
+        let grey = [64.0, 64.0, 64.0, 255.0];
+        let occ = ndc_quad(-1.0, -1.0, 1.0, 1.0, 0.0, grey);
+        draw_quad(&mut f, occ, None, DepthMode::LessWrite, false);
+
+        let mut pal = [0xff00_ff00u32; 256];
+        pal[0] = 0x0000_0000;
+        pal[1] = 0xff00_00ff;
+        pal[2] = 0xffff_0000;
+        let texels = [0u8, 1, 2];
+        let ghost_abgr = 0x8048_4242;
+        let tex = TexCtx {
+            texels: &texels,
+            w: 3,
+            h: 1,
+            pal: &pal,
+            solid: Some(ghost_abgr),
+        };
+        let ghost = ndc_quad(-0.75, -0.5, 0.75, 0.5, 0.5, [255.0; 4]);
+        draw_quad(&mut f, ghost, Some(&tex), DepthMode::GreaterNoWrite, true);
+
+        let left = f.color[136 * W + 150];
+        let middle = f.color[136 * W + 240];
+        let right = f.color[136 * W + 330];
+        assert_eq!(left, 0xff40_4040, "transparent card texels stay invisible");
+        assert_eq!(
+            middle, right,
+            "source sprite colors flatten to one silhouette"
+        );
+        assert_ne!(middle, 0xff40_4040, "opaque sprite texels reveal the ghost");
+        assert!(
+            f.depth[136 * W + 240] < 0.5,
+            "ghost never replaces occluder depth"
+        );
+    }
+
+    #[test]
     fn sky_bands_fill_rows() {
         let list_colors = [0xff111111u32, 0xff222222, 0xff333333, 0xff444444];
         let mut frame = Frame::new();
@@ -716,5 +879,31 @@ mod tests {
         assert_eq!(frame.color[0], 0xff111111);
         assert_eq!(frame.color[63 * W], 0xff444444);
         assert_eq!(frame.color[200 * W], 0xff444444);
+    }
+
+    #[test]
+    fn overlay_rects_clip_and_alpha_composite_in_order() {
+        let mut frame = Frame::new();
+        draw_overlay_rect(&mut frame, -2, 1, 4, 2, 0xff00_00ff);
+        assert_eq!(
+            frame.color.iter().filter(|&&c| c == 0xff00_00ff).count(),
+            4,
+            "two clipped columns by two rows"
+        );
+        draw_overlay_rect(&mut frame, 0, 1, 1, 1, 0x8000_ff00);
+        assert_eq!(frame.color[W], 0xff00_807f, "green blends over red");
+    }
+    #[test]
+    fn video_placeholder_is_clipped_and_checkered() {
+        let mut frame = Frame::new();
+        draw_video_placeholder(&mut frame, -4, 2, 20, 18);
+        let changed = frame
+            .color
+            .iter()
+            .filter(|&&c| c == 0xff20_1810 || c == 0xff30_2818)
+            .count();
+        assert_eq!(changed, 16 * 18);
+        assert_eq!(frame.color[2 * W], 0xff20_1810);
+        assert_eq!(frame.color[2 * W + 8], 0xff30_2818);
     }
 }

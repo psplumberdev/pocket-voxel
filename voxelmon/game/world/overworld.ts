@@ -30,6 +30,10 @@ import {
   type WarpCarpets,
 } from "./warp.ts";
 import type { MapWarp } from "../data.ts";
+import {
+  placeDirectNeighbour,
+  type ConnectionDirection,
+} from "../../shared/connections.ts";
 
 // OverworldController.lua:37
 const COMPASS: Record<Dir, "north" | "south" | "east" | "west"> = {
@@ -71,6 +75,8 @@ export interface OverworldShell {
   startMapMusic(mapId: string): void;
   showText(text: string, onDone?: () => void): void;
   showChoice(text: string, choice: (yes: boolean) => void): void;
+  /** Bedroom OpenRedsPC hidden event, owned by the game-state stack. */
+  openBedroomComputer(): void;
   pushWarpFade(frames: number, midpoint: () => void, onDone?: () => void): void;
   pushStubBattle(species: string, level: number): void;
 }
@@ -115,23 +121,14 @@ export function computeNeighbors(
       const destDef = maps[conn.map];
       if (!destDef || placed.has(conn.map)) continue;
       placed.add(conn.map);
-      let ox: number;
-      let oy: number;
-      if (dir === "north") {
-        ox = conn.offset * 32;
-        oy = -destDef.height * 32;
-      } else if (dir === "south") {
-        ox = conn.offset * 32;
-        oy = cur.def.height * 32;
-      } else if (dir === "west") {
-        ox = -destDef.width * 32;
-        oy = conn.offset * 32;
-      } else {
-        ox = cur.def.width * 32;
-        oy = conn.offset * 32;
-      }
-      ox += cur.ox;
-      oy += cur.oy;
+      const direct = placeDirectNeighbour(
+        dir as ConnectionDirection,
+        conn,
+        cur.def,
+        destDef,
+      );
+      const ox = direct.ox + cur.ox;
+      const oy = direct.oy + cur.oy;
       if (cur.hops + 1 <= hops) {
         out.push({ id: conn.map, ox, oy });
         if (cur.hops + 1 < hops) {
@@ -580,8 +577,9 @@ export class Overworld implements ScriptWorld {
   }
 
   // OverworldController.lua:1729 interact — the A press: NPC (with the
-  // counter-tile reach-across), then sign. Card-key doors, hidden objects
-  // and bookshelves are outside the slice.
+  // counter-tile reach-across), sign, then the bedroom OpenRedsPC event.
+  // Card-key doors and the other hidden-object families remain outside the
+  // slice; the PC stays data-driven through field.hiddenExtras.pcTiles.
   interact(): void {
     const p = this.player;
     const [fx, fy] = p.facingCell();
@@ -602,6 +600,25 @@ export class Overworld implements ScriptWorld {
       this.showMapText(sign.text);
       return;
     }
+    if (this.isBedroomComputer(fx, fy)) {
+      this.shell.openBedroomComputer();
+    }
+  }
+
+  private isBedroomComputer(fx: number, fy: number): boolean {
+    if (this.map.id !== "REDS_HOUSE_2F") return false;
+    const field = this.shell.data.field as
+      | {
+          hiddenExtras?: {
+            pcTiles?: Record<string, { x: number; y: number; facing?: Dir }[]>;
+          };
+        }
+      | undefined;
+    const tiles = field?.hiddenExtras?.pcTiles?.[this.map.id] ?? [];
+    return tiles.some(
+      (tile) =>
+        tile.x === fx && tile.y === fy && (!tile.facing || tile.facing === this.player.facing),
+    );
   }
 
   // OverworldController.lua:2520 talkTo — freeze, then dispatch the object's

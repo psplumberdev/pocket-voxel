@@ -43,6 +43,7 @@ extern crate alloc;
 
 pub mod pool;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
@@ -96,7 +97,7 @@ const WORLD_VTYPE: VertexType = VertexType::from_bits_truncate(
         | VertexType::TRANSFORM_3D.bits(),
 );
 
-/// CPU-built untextured f32 vertex (shadow decals, the ghost).
+/// CPU-built untextured f32 vertex for shadow decals.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlatVert {
@@ -152,6 +153,22 @@ const UI_VTYPE: VertexType = VertexType::from_bits_truncate(
         | VertexType::VERTEX_16BIT.bits()
         | VertexType::TRANSFORM_2D.bits(),
 );
+
+/// Persistent, 16-byte-aligned CLUT backing. `sceGuClutLoad` reads it after
+/// the display list has been kicked, so it cannot live in the frame pool.
+#[repr(C, align(16))]
+struct RemotePalette([u32; 256]);
+
+/// The Mac desktop plane. Geometry is stable for a session; `update` only
+/// overwrites these persistent bytes inside the frame loop's GE-idle window.
+struct RemoteTexture {
+    w: i32,
+    h: i32,
+    palette: Box<RemotePalette>,
+    /// u128 gives the index plane the same 16-byte alignment as pak texels.
+    pixels: Vec<u128>,
+    pixel_bytes: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Matrices
@@ -238,6 +255,10 @@ pub struct Renderer {
     tint: u32,
     /// The frame's SGB palette selection (DrawList.palette; -1 = GB ramp).
     palette: i32,
+    /// Device-owned video plane, absent until the companion yields a complete
+    /// frame. It is intentionally outside the pak atlas cache: frames replace
+    /// one texture in place rather than minting atlas identities at 12 fps.
+    remote_video: Option<RemoteTexture>,
 }
 
 impl Renderer {
@@ -249,7 +270,68 @@ impl Renderer {
             raw_clut: Vec::new(),
             tint: 0xffff_ffff,
             palette: -1,
+            remote_video: None,
         }
+    }
+
+    /// Replace the remote plane's palette + indices while the GE is idle.
+    /// Dimensions are the `.pkst` contract: power-of-two, at most 512 each.
+    /// The renderer owns aligned persistent storage so the reader's staging
+    /// buffer may immediately chase the next ring slot.
+    pub unsafe fn update_remote_video(
+        &mut self,
+        w: u32,
+        h: u32,
+        palette: &[u8],
+        pixels: &[u8],
+    ) -> bool {
+        let valid_dim = |v: u32| v > 0 && v <= 512 && v.is_power_of_two();
+        let Some(pixel_bytes) = (w as usize).checked_mul(h as usize) else {
+            return false;
+        };
+        if !valid_dim(w) || !valid_dim(h) || palette.len() != 1024 || pixels.len() != pixel_bytes {
+            return false;
+        }
+
+        let geometry_changed = self
+            .remote_video
+            .as_ref()
+            .is_none_or(|texture| texture.w != w as i32 || texture.h != h as i32);
+        if geometry_changed {
+            self.remote_video = Some(RemoteTexture {
+                w: w as i32,
+                h: h as i32,
+                palette: Box::new(RemotePalette([0; 256])),
+                pixels: alloc::vec![0u128; pixel_bytes.div_ceil(16)],
+                pixel_bytes,
+            });
+        }
+        let texture = self.remote_video.as_mut().expect("allocated above");
+        core::ptr::copy_nonoverlapping(
+            palette.as_ptr(),
+            texture.palette.0.as_mut_ptr().cast::<u8>(),
+            palette.len(),
+        );
+        core::ptr::copy_nonoverlapping(
+            pixels.as_ptr(),
+            texture.pixels.as_mut_ptr().cast::<u8>(),
+            pixels.len(),
+        );
+        sys::sceKernelDcacheWritebackRange(
+            texture.palette.0.as_ptr() as *const c_void,
+            palette.len() as u32,
+        );
+        sys::sceKernelDcacheWritebackRange(
+            texture.pixels.as_ptr() as *const c_void,
+            texture.pixel_bytes as u32,
+        );
+        true
+    }
+
+    /// Release the persistent plane. The PSP frame loop calls this only
+    /// after `sceGuSync`; dropping it during a guest turn would race the GE.
+    pub fn clear_remote_video(&mut self) {
+        self.remote_video = None;
     }
 
     /// Rewind the per-frame pool. ONLY after the frame loop's `sceGuSync`.
@@ -319,10 +401,26 @@ impl Renderer {
                     self.mesh(pak, mesh, list.cam.eye, &list.cam.vp);
                 }
                 Item::ShadowDecal { corners, abgr } => {
-                    self.flat_quad(*corners, *abgr, list.cam.eye, 0.0, false);
+                    self.flat_quad(*corners, *abgr, list.cam.eye, 0.0);
                 }
-                Item::Ghost { verts, pull, abgr } => {
-                    self.flat_quad(*verts, *abgr, list.cam.eye, *pull, true);
+                Item::Ghost {
+                    verts,
+                    page,
+                    uv,
+                    mirror,
+                    pull,
+                    abgr,
+                } => {
+                    self.ghost(
+                        pak,
+                        *verts,
+                        *page,
+                        *uv,
+                        *mirror,
+                        *pull,
+                        *abgr,
+                        list.cam.eye,
+                    );
                 }
                 Item::Card {
                     verts,
@@ -341,10 +439,20 @@ impl Renderer {
                     // on real hardware (each upload carries a dcache
                     // writeback and a GE command flush).
                 }
+                Item::VideoQuad { .. } => {
+                    // One persistent dynamic texture, drawn between the GB
+                    // batch and the overlay chrome below.
+                }
+                Item::OverlayRect { .. } => {
+                    // Batched after ui_batch so the retained overlay always
+                    // composites over the complete GB layer.
+                }
             }
         }
 
         self.ui_batch(list, pak);
+        self.remote_video_quad(list);
+        self.overlay_batch(list);
 
         // Hand back a 2D-clean state (the pocket3d-gu end_3d discipline).
         sys::sceGuDisable(GuState::DepthTest);
@@ -433,6 +541,46 @@ impl Renderer {
         sys::sceGuTexScale(w as f32 / pw as f32, h as f32 / ph as f32);
         sys::sceGuTexOffset(0.0, 0.0);
         self.bound = Some((page_idx, frame, tinted, index));
+    }
+
+    /// Bind a sprite page through a one-draw CLUT that keeps only the source
+    /// alpha mask and replaces every visible texel with `abgr`. The player
+    /// ghost must be a silhouette, not the sprite card's transparent box.
+    unsafe fn bind_ghost(&mut self, pak: &Pak, page_idx: u16, abgr: u32) -> bool {
+        let Some(page) = pak.atlases.get(page_idx as usize) else {
+            return false;
+        };
+        let pal_index = resolve_pal(pak, page_idx, page.kind, COLOR_PAL_NONE, self.palette);
+        let Some(source) = pak.palettes.get(pal_index) else {
+            return false;
+        };
+        let mut clut = [0u32; 256];
+        for (out, &color) in clut.iter_mut().zip(source.iter()) {
+            if (color >> 24) & 0xff >= 0x80 {
+                *out = abgr;
+            }
+        }
+        let clut = self.pool.upload(as_bytes(&clut));
+        sys::sceGuClutMode(ClutPixelFormat::Psm8888, 0, 0xff, 0);
+        sys::sceGuClutLoad(32, clut as *const c_void);
+
+        let (w, h) = (page.w as i32, page.h as i32);
+        let (pw, ph) = (po2(w), po2(h));
+        sys::sceGuTexMode(TexturePixelFormat::PsmT8, 0, 0, 1);
+        sys::sceGuTexImage(
+            MipmapLevel::None,
+            pw,
+            ph,
+            swizzle_stride(w as usize) as i32,
+            page.frame(0).as_ptr() as *const c_void,
+        );
+        sys::sceGuTexFlush();
+        sys::sceGuTexScale(w as f32 / pw as f32, h as f32 / ph as f32);
+        sys::sceGuTexOffset(0.0, 0.0);
+        // This custom CLUT is deliberately outside the ordinary bind cache;
+        // force the immediately following solid player card to restore it.
+        self.bound = None;
+        true
     }
 
     // -- item passes --------------------------------------------------------
@@ -607,22 +755,18 @@ impl Renderer {
         }
     }
 
-    /// Flat-color blended quad: shadow decals (normal depth test, no write)
-    /// and the player ghost (`ghost = true`: inverted test — Less in the
-    /// inverted range = draws only where occluded — no write, pulled).
+    /// Flat-color blended quad for a shadow decal (normal depth test, no
+    /// write). The player ghost is textured separately so its transparent
+    /// card pixels cannot become a visible rectangle.
     unsafe fn flat_quad(
         &mut self,
         corners: [[f32; 3]; 4],
         abgr: u32,
         eye: Vec3,
         pull: f32,
-        ghost: bool,
     ) {
         sys::sceGuEnable(GuState::DepthTest);
         sys::sceGuDepthMask(1); // no depth writes
-        if ghost {
-            sys::sceGuDepthFunc(DepthFunc::Less);
-        }
         sys::sceGuEnable(GuState::Blend);
         sys::sceGuDisable(GuState::Texture2D);
         sys::sceGuDisable(GuState::AlphaTest);
@@ -655,15 +799,13 @@ impl Renderer {
 
         sys::sceGuDepthMask(0);
         sys::sceGuDisable(GuState::Blend);
-        if ghost {
-            sys::sceGuDepthFunc(DepthFunc::GreaterOrEqual);
-        }
     }
 
-    /// A billboard card: textured, alpha-tested (Greater 0x7f — sprite
-    /// cutouts via `sceGuAlphaFunc`, docs/VOXEL.md §6), depth-written,
-    /// pulled along each vertex's eye ray.
-    unsafe fn card(
+    /// The occluded player hint: the current sprite's alpha-tested outline
+    /// in one flat translucent color, drawn only where terrain already won
+    /// depth. It writes no depth, matching the reference ghost pass.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn ghost(
         &mut self,
         pak: &Pak,
         verts: [[f32; 3]; 4],
@@ -671,29 +813,39 @@ impl Renderer {
         uv: [f32; 4],
         mirror: bool,
         pull: f32,
+        abgr: u32,
         eye: Vec3,
     ) {
-        if pak.atlases.get(page as usize).is_none() {
+        if !self.bind_ghost(pak, page, abgr) {
             return;
         }
         sys::sceGuEnable(GuState::DepthTest);
-        sys::sceGuDepthMask(0);
+        sys::sceGuDepthMask(1); // no depth writes
+        sys::sceGuDepthFunc(DepthFunc::Less); // inverted GE range: occluded only
         sys::sceGuEnable(GuState::Texture2D);
         sys::sceGuEnable(GuState::AlphaTest);
-        sys::sceGuDisable(GuState::Blend);
-        // A card carries no per-item palette: its OBJ/pic CLUT is a
-        // property of the PAGE, which `bind` resolves through VCOL.
-        self.bind(pak, page, 0, true, COLOR_PAL_NONE);
+        sys::sceGuEnable(GuState::Blend);
 
+        self.card_quad(verts, uv, mirror, pull, eye);
+
+        sys::sceGuDepthFunc(DepthFunc::GreaterOrEqual);
+        sys::sceGuDepthMask(0);
+        sys::sceGuDisable(GuState::Blend);
+    }
+
+    /// Upload and draw the shared four-vertex billboard geometry. Render
+    /// state and texture binding belong to `card` / `ghost` respectively.
+    unsafe fn card_quad(
+        &mut self,
+        verts: [[f32; 3]; 4],
+        uv: [f32; 4],
+        mirror: bool,
+        pull: f32,
+        eye: Vec3,
+    ) {
         let (u0, u1) = if mirror { (uv[2], uv[0]) } else { (uv[0], uv[2]) };
         let (v0, v1) = (uv[1], uv[3]);
-        // Verts arrive bl, br, tr, tl; v0 is the texture top (raster.rs).
         let uvs = [(u0, v1), (u1, v1), (u1, v0), (u0, v0)];
-        // Two real-GE gotchas bisected on device + PPSSPPHeadless (see the
-        // crate docs): textured 3D vertices must be the i16+indexed
-        // WORLD_VTYPE (textured VERTEX_32BITF draws sample garbage), and
-        // atlas pages must be >= 64 px wide (the cooker pads sprite sheets;
-        // 16-px-wide pages missample into vertical-strip noise).
         let mut out = [PakVert {
             u: 0,
             v: 0,
@@ -728,6 +880,39 @@ impl Renderer {
             data as *const c_void,
         );
         sys::sceGuSetMatrix(sys::MatrixMode::Model, &to_psp_matrix(&Mat4::IDENTITY));
+    }
+
+    /// A billboard card: textured, alpha-tested (Greater 0x7f — sprite
+    /// cutouts via `sceGuAlphaFunc`, docs/VOXEL.md §6), depth-written,
+    /// pulled along each vertex's eye ray.
+    unsafe fn card(
+        &mut self,
+        pak: &Pak,
+        verts: [[f32; 3]; 4],
+        page: u16,
+        uv: [f32; 4],
+        mirror: bool,
+        pull: f32,
+        eye: Vec3,
+    ) {
+        if pak.atlases.get(page as usize).is_none() {
+            return;
+        }
+        sys::sceGuEnable(GuState::DepthTest);
+        sys::sceGuDepthMask(0);
+        sys::sceGuEnable(GuState::Texture2D);
+        sys::sceGuEnable(GuState::AlphaTest);
+        sys::sceGuDisable(GuState::Blend);
+        // A card carries no per-item palette: its OBJ/pic CLUT is a
+        // property of the PAGE, which `bind` resolves through VCOL.
+        self.bind(pak, page, 0, true, COLOR_PAL_NONE);
+
+        // Two real-GE gotchas bisected on device + PPSSPPHeadless (see the
+        // crate docs): textured 3D vertices must be the i16+indexed
+        // WORLD_VTYPE (textured VERTEX_32BITF draws sample garbage), and
+        // atlas pages must be >= 64 px wide (the cooker pads sprite sheets;
+        // 16-px-wide pages missample into vertical-strip noise).
+        self.card_quad(verts, uv, mirror, pull, eye);
     }
 
     /// One GB UI tile: screen-space sprite, no depth, UNTINTED palette
@@ -802,6 +987,125 @@ impl Renderer {
         );
     }
 
+    /// Draw the native host's latest desktop frame. The DrawList owns only
+    /// its destination geometry; the CLUT8 bytes are updated out-of-band in
+    /// [`Renderer::update_remote_video`] during the GE-idle window.
+    unsafe fn remote_video_quad(&mut self, list: &DrawList) {
+        let Some((x, y, w, h)) = list.items.iter().find_map(|item| match item {
+            Item::VideoQuad { x, y, w, h } => Some((*x, *y, *w, *h)),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(texture) = self.remote_video.as_ref() else {
+            return;
+        };
+
+        sys::sceGuDisable(GuState::DepthTest);
+        sys::sceGuEnable(GuState::Texture2D);
+        sys::sceGuDisable(GuState::AlphaTest);
+        sys::sceGuDisable(GuState::Blend);
+        sys::sceGuClutMode(ClutPixelFormat::Psm8888, 0, 0xff, 0);
+        sys::sceGuClutLoad(32, texture.palette.0.as_ptr() as *const c_void);
+        sys::sceGuTexMode(TexturePixelFormat::PsmT8, 0, 0, 0);
+        sys::sceGuTexImage(
+            MipmapLevel::None,
+            texture.w,
+            texture.h,
+            texture.w,
+            texture.pixels.as_ptr() as *const c_void,
+        );
+        // Same real-GE rule as pak textures: rebinding a same-sized dynamic
+        // plane does not invalidate the hardware cache on its own.
+        sys::sceGuTexFlush();
+        sys::sceGuTexFunc(TextureEffect::Replace, TextureColorComponent::Rgba);
+        sys::sceGuTexFilter(TextureFilter::Linear, TextureFilter::Linear);
+        sys::sceGuTexWrap(GuTexWrapMode::Clamp, GuTexWrapMode::Clamp);
+        sys::sceGuTexScale(1.0, 1.0);
+        sys::sceGuTexOffset(0.0, 0.0);
+
+        let dst = self.pool.alloc(2 * core::mem::size_of::<Vert2dTc>()) as *mut Vert2dTc;
+        dst.write(Vert2dTc {
+            u: 0,
+            v: 0,
+            abgr: 0xffff_ffff,
+            x: x as i16,
+            y: y as i16,
+            z: 0,
+            pad: 0,
+        });
+        dst.add(1).write(Vert2dTc {
+            u: texture.w as i16,
+            v: texture.h as i16,
+            abgr: 0xffff_ffff,
+            x: x.saturating_add(w) as i16,
+            y: y.saturating_add(h) as i16,
+            z: 0,
+            pad: 0,
+        });
+        sys::sceKernelDcacheWritebackRange(
+            dst as *const c_void,
+            (2 * core::mem::size_of::<Vert2dTc>()) as u32,
+        );
+        sys::sceGuDrawArray(
+            GuPrimitive::Sprites,
+            UI_VTYPE,
+            2,
+            core::ptr::null(),
+            dst as *const c_void,
+        );
+    }
+
+    /// The full native-pixel overlay in one texture-free sprite draw. This
+    /// intentionally follows `ui_batch`; keeping it separate preserves the
+    /// GB layer's existing one-upload/one-draw fast path.
+    unsafe fn overlay_batch(&mut self, list: &DrawList) {
+        let n = list
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::OverlayRect { .. }))
+            .count();
+        if n == 0 {
+            return;
+        }
+
+        sys::sceGuDisable(GuState::DepthTest);
+        sys::sceGuDisable(GuState::Texture2D);
+        sys::sceGuDisable(GuState::AlphaTest);
+        sys::sceGuEnable(GuState::Blend);
+
+        let bytes = n * 2 * core::mem::size_of::<Vert2dC>();
+        let dst = self.pool.alloc(bytes) as *mut Vert2dC;
+        let mut at = 0usize;
+        for item in &list.items {
+            let Item::OverlayRect { x, y, w, h, abgr } = item else {
+                continue;
+            };
+            dst.add(at).write(Vert2dC {
+                abgr: *abgr,
+                x: *x as i16,
+                y: *y as i16,
+                z: 0,
+                pad: 0,
+            });
+            dst.add(at + 1).write(Vert2dC {
+                abgr: *abgr,
+                x: x.saturating_add(*w) as i16,
+                y: y.saturating_add(*h) as i16,
+                z: 0,
+                pad: 0,
+            });
+            at += 2;
+        }
+        sys::sceKernelDcacheWritebackRange(dst as *const c_void, bytes as u32);
+        sys::sceGuDrawArray(
+            GuPrimitive::Sprites,
+            SKY_VTYPE,
+            (n * 2) as i32,
+            core::ptr::null(),
+            dst as *const c_void,
+        );
+    }
 }
 
 impl Default for Renderer {
