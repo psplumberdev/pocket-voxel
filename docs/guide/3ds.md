@@ -24,7 +24,7 @@ bun run 3ds --cia    # also dist/3ds/voxelmon.cia
 
 The Rust compiler is `nightly-2026-07-02` with `rust-src`; C, libctru, citro3d, shader assembly, and packaging use the digest-pinned devkitPro image matching PocketJS. `makerom` is pinned to the same upstream revision. Docker must be running.
 
-Copy `voxelmon.3dsx` to `/3ds/pocket-voxel/voxelmon.3dsx` on the console SD card, then launch it from HBL. Alternatively install the generated CIA with the console's package installer. Both artifacts contain the game bundle, cooked VXPK, native-size 24/48-pixel Voxel icons, and bottom plate. They do not require a desktop companion. Other Pocket apps and their per-app runtime slots are untouched.
+Copy `voxelmon.3dsx` to `/3ds/pocket-voxel/pocket-voxel.3dsx` on the console SD card, then launch Pocket Voxel from HBL. Alternatively install the generated CIA with the console's package installer. Both artifacts contain the game bundle, cooked VXPK, native-size 24/48-pixel Voxel icons, and bottom plate. They do not require a desktop companion. Other Pocket apps and their per-app runtime slots are untouched.
 
 Build receipts beside each artifact contain its build ID and SHA-256. Runtime receipts use the app-specific `/pocketvoxel-3ds/` SD directory: `status.txt`, `memory.txt`, and `error.txt`. `status.txt` records the build, tick/present counts, input actions, and audio state. The full package is roughly 30 MiB and contains local ROM-derived data; do not publish it with the source.
 

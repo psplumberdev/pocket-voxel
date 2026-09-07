@@ -262,7 +262,7 @@ bun run 3ds --cia    # also dist/3ds/voxelmon.cia
 ```
 
 Use the same imported and cooked content as the other native targets. Copy the
-`.3dsx` to `/3ds/pocket-voxel/` on the SD card, or install the CIA. Each package
+`.3dsx` to `/3ds/pocket-voxel/pocket-voxel.3dsx` on the SD card, or install the CIA. Each package
 embeds its game, VXPK, and icons. Build/runtime receipts keep the artifact,
 rendering, input, and NDSP audio evidence separate. The host uses the pinned
 PocketJS 3DS toolchain, 60 Hz game logic, and 11.025 kHz stereo output.
