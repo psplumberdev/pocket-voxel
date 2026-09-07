@@ -109,13 +109,11 @@ so the 6 MiB bank has room over the worst frame this content can produce.
 
 ## Audio
 
-The 3DS build **renders no PCM**: no audio module is mounted, and nothing calls
-`Scene::render_audio`. The audio ops still reach the Scene — the chip synth's
-state advances with the tick clock — exactly as it does in a PSP capture build,
-so gameplay that waits on an audio op behaves the same. Adding sound later needs
-two things this crate does not do yet: `Scene::audio.set_rate` before the first
-audio op (the default is 44100 and every event's span is measured in samples, so
-changing it later drops what is playing), and a per-tick pump on the C side.
+The scene selects 11.025 kHz before the guest emits audio ops. The C ABI
+`pv3ds_audio_render` fills bounded interleaved stereo buffers on the host
+thread; `hosts/3ds/src/handheld.c` queues them through NDSP and owns the
+APT pause/resume lifecycle. Synthetic-song tests check nonzero PCM, stopping,
+and output bounds. See the host guide for DSP firmware and hardware acceptance.
 
 ## Building
 

@@ -296,7 +296,7 @@ static void apply_depth(uint8_t depth) {
  */
 static void apply_alpha(uint8_t flags) {
   if (flags & PV_PICA_F_ALPHA_TEST) {
-    C3D_AlphaTest(true, GPU_GREATER, 0x7f);
+    C3D_AlphaTest(true, GPU_GREATER, (flags & PV_PICA_F_MASK) ? 0 : 0x7f);
   } else {
     C3D_AlphaTest(false, GPU_ALWAYS, 0x00);
   }
@@ -334,10 +334,15 @@ static void apply_blend(uint8_t flags) {
  *
  * Untextured: both channels replace from the vertex colour.
  */
-static void apply_tev(bool textured) {
+static void apply_tev(int mode) {
   C3D_TexEnv *env = C3D_GetTexEnv(0);
   C3D_TexEnvInit(env);
-  if (textured) {
+  if (mode == 2) {
+    C3D_TexEnvSrc(env, C3D_RGB, GPU_PRIMARY_COLOR, 0, 0);
+    C3D_TexEnvFunc(env, C3D_RGB, GPU_REPLACE);
+    C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+    C3D_TexEnvFunc(env, C3D_Alpha, GPU_MODULATE);
+  } else if (mode == 1) {
     C3D_TexEnvSrc(env, C3D_RGB, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
     C3D_TexEnvFunc(env, C3D_RGB, GPU_MODULATE);
     C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, 0, 0);
@@ -514,7 +519,7 @@ void voxel_gfx_render(void) {
       apply_depth(c->depth);
       last_depth = c->depth;
     }
-    int alpha = (c->flags & PV_PICA_F_ALPHA_TEST) != 0;
+    int alpha = c->flags & (PV_PICA_F_ALPHA_TEST | PV_PICA_F_MASK);
     if (alpha != last_alpha) {
       apply_alpha(c->flags);
       last_alpha = alpha;
@@ -524,9 +529,10 @@ void voxel_gfx_render(void) {
       apply_blend(c->flags);
       last_blend = blend;
     }
-    if ((int)textured != last_tev) {
-      apply_tev(textured);
-      last_tev = (int)textured;
+    int tev = (c->flags & PV_PICA_F_MASK) ? 2 : (int)textured;
+    if (tev != last_tev) {
+      apply_tev(tev);
+      last_tev = tev;
     }
 
     if ((int)c->vfmt != last_vfmt) {

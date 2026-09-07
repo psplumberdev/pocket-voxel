@@ -317,8 +317,9 @@ impl Renderer {
                     self.flat_quad(*corners, *abgr, list.cam.eye, 0.0, depth::TEST, &base_vp);
                     i += 1;
                 }
-                Item::Ghost { verts, pull, abgr } => {
-                    self.flat_quad(*verts, *abgr, list.cam.eye, *pull, depth::INVERTED, &base_vp);
+                Item::Ghost { verts, page, uv, mirror, pull, abgr } => {
+                    self.card(pak, *verts, *page, *uv, *mirror, *pull, list.cam.eye, &base_vp,
+                        depth::INVERTED, *abgr, true);
                     i += 1;
                 }
                 Item::Card {
@@ -328,7 +329,8 @@ impl Renderer {
                     mirror,
                     pull,
                 } => {
-                    self.card(pak, *verts, *page, *uv, *mirror, *pull, list.cam.eye, &base_vp);
+                    self.card(pak, *verts, *page, *uv, *mirror, *pull, list.cam.eye, &base_vp,
+                        depth::TEST_WRITE, 0xffff_ffff, false);
                     i += 1;
                 }
                 Item::UiQuad { .. } => {
@@ -339,6 +341,15 @@ impl Renderer {
                     // the list's order even if `append_ui` ever stops being
                     // last.
                     i += self.ui_batch(pak, &list.items[i..]).max(1);
+                }
+                Item::OverlayRect { x, y, w, h, abgr } => {
+                    self.screen_rect(*x, *y, *w, *h, *abgr);
+                    i += 1;
+                }
+                Item::VideoQuad { x, y, w, h } => {
+                    // The guest reports remote transport unavailable on this host.
+                    self.screen_rect(*x, *y, *w, *h, 0xff00_0000);
+                    i += 1;
                 }
             }
         }
@@ -626,7 +637,17 @@ impl Renderer {
         });
     }
 
-    /// A billboard card: textured, alpha-tested, depth-written, pulled along
+    fn screen_rect(&mut self, x: i32, y: i32, w: i32, h: i32, abgr: u32) {
+        if w <= 0 || h <= 0 { return; }
+        self.flat_quad([
+            [x as f32, y as f32, 0.0],
+            [(x as f32 + w as f32), y as f32, 0.0],
+            [(x as f32 + w as f32), (y as f32 + h as f32), 0.0],
+            [x as f32, (y as f32 + h as f32), 0.0],
+        ], abgr, vec3(0.0, 0.0, 0.0), 0.0, depth::NONE, &cmd::screen_clip());
+    }
+
+    /// A billboard card: textured, alpha-tested, pulled along
     /// each vertex's eye ray and truncated to i16 (a card is textured, so it
     /// takes the same truncation the rasterizer models for this backend).
     #[allow(clippy::too_many_arguments)]
@@ -640,6 +661,9 @@ impl Renderer {
         pull: f32,
         eye: Vec3,
         base_vp: &Mat4,
+        depth_mode: u8,
+        color: u32,
+        mask: bool,
     ) {
         // A card carries no per-item palette: its OBJ / pic CLUT is a property
         // of the PAGE, which `resolve_pal` reads out of VCOL itself.
@@ -658,7 +682,7 @@ impl Renderer {
         let mut out = [WorldVert {
             u: 0,
             v: 0,
-            abgr: 0xffff_ffff,
+            abgr: color,
             x: 0,
             y: 0,
             z: 0,
@@ -685,8 +709,9 @@ impl Renderer {
         let mtx = self.push_mtx(base_vp);
         self.push_draw(Cmd {
             vfmt: vfmt::WORLD,
-            depth: depth::TEST_WRITE,
-            flags: flag::TEXTURED | flag::ALPHA_TEST | flag::TINTED,
+            depth: depth_mode,
+            flags: flag::TEXTURED | flag::ALPHA_TEST | flag::TINTED
+                | if mask { flag::MASK | flag::BLEND } else { 0 },
             page: key.page,
             frame: key.frame,
             pal: key.pal,

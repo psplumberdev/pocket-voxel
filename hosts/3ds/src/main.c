@@ -44,6 +44,7 @@
 #include <sys/stat.h>
 
 #include "input.h"
+#include "handheld.h"
 #include "pocketvoxel_3ds.h"
 #include "pocketvoxel_pica.h"
 #include "qjs.h"
@@ -482,6 +483,7 @@ static void fail(const char *message) {
   mkdir(OUT_DIR, 0777);
   FILE *file = fopen(ERROR_PATH, "wb");
 #ifndef PV3DS_CAPTURE
+  consoleInit(GFX_BOTTOM, NULL);
   printf("\x1b[31mFAILED\x1b[0m\n%s\n", text);
 #endif
   if (file != NULL) {
@@ -1129,7 +1131,13 @@ int main(void) {
   if (mark_count == 0) fail("the capture build was given no marks");
 #endif
 
+  if (!handheld_init()) fail("lower-screen or audio buffer initialization failed");
+  handheld_bottom();
   uint32_t tick = 0;
+#ifndef PV3DS_CAPTURE
+  const u64 step_ticks = SYSCLOCK_ARM11 / 60u;
+  u64 next_step = svcGetSystemTick();
+#endif
   stage_enter(STAGE_APT);
   while (aptMainLoop()) {
     voxel_host_tick = tick;
@@ -1139,27 +1147,49 @@ int main(void) {
 #ifdef PV3DS_CAPTURE
     int32_t buttons = scripted_buttons(tick);
 #else
+    if ((hidKeysHeld() & (KEY_L | KEY_R | KEY_START)) == (KEY_L | KEY_R | KEY_START)) break;
     int32_t buttons = input_buttons();
+    handheld_audio_pump();
 #endif
 
-    /* One guest turn per host tick: frame(buttons), exactly once. */
-    stage_enter(STAGE_GUEST_FRAME);
-    if (!voxel_qjs_frame(buttons)) fail(voxel_qjs_last_error());
-    /*
-     * Read the warp-landing flag EVERY tick, never conditionally: a stale one
-     * from a cheap early map show must not license a collection later, when
-     * the world is not frozen and the stall would be a visible hitch.
-     */
-    bool landed = pv3ds_take_map_swapped() != 0;
-    /* The tick clock is the only clock in the runtime — tile animation,
-     * cursors, camera tweens — so it advances at a fixed 60 Hz whatever the
-     * present cadence is. */
-    stage_enter(STAGE_TICK);
-    pv3ds_tick();
-    if (landed) {
-      stage_enter(STAGE_COLLECT);
-      voxel_qjs_collect();
+    unsigned steps = 1;
+#ifndef PV3DS_CAPTURE
+    u64 now = svcGetSystemTick();
+    while (now < next_step) {
+      svcSleepThread((s64)((next_step - now) * 1000000000ull / SYSCLOCK_ARM11));
+      now = svcGetSystemTick();
     }
+    // Keep game logic at 60 Hz when a draw spans several ticks. Bound resume
+    // catch-up so closing the lid cannot enqueue minutes of old input.
+    if (now - next_step > step_ticks * 6u) next_step = now - step_ticks * 5u;
+    steps = (unsigned)((now - next_step) / step_ticks) + 1u;
+    next_step += steps * step_ticks;
+#endif
+    for (unsigned step = 0; step < steps; step++) {
+      /* One guest turn per host tick: frame(buttons), exactly once. */
+      stage_enter(STAGE_GUEST_FRAME);
+      if (!voxel_qjs_frame(buttons)) fail(voxel_qjs_last_error());
+      /*
+       * Read the warp-landing flag EVERY tick, never conditionally: a stale one
+       * from a cheap early map show must not license a collection later, when
+       * the world is not frozen and the stall would be a visible hitch.
+       */
+      bool landed = pv3ds_take_map_swapped() != 0;
+      /* The tick clock is the only clock in the runtime — tile animation,
+       * cursors, camera tweens — so it advances at a fixed 60 Hz whatever the
+       * present cadence is. */
+      stage_enter(STAGE_TICK);
+      pv3ds_tick();
+      if (landed) {
+        stage_enter(STAGE_COLLECT);
+        voxel_qjs_collect();
+      }
+
+#ifndef PV3DS_CAPTURE
+      tick++;
+#endif
+    }
+    handheld_audio_pump();
 
 #ifdef PV3DS_CAPTURE
     /*
@@ -1177,18 +1207,15 @@ int main(void) {
     }
 #endif
 
-    stage_enter(STAGE_RECORD);
-    if (pv3ds_present() != 0) fail(pv3ds_last_error());
-    stage_enter(STAGE_PREPARE);
-    voxel_gfx_prepare();
-
-    /* The two halves of what C3D_FRAME_SYNCDRAW used to do in one call, each
-     * with its own deadline and its own name, so a run that stops in one of
-     * them says which. */
     stage_enter(STAGE_FRAME_SYNC);
     if (!vblank_settle(1)) wedge("no vblank arrived");
     stage_enter(STAGE_FRAME_BEGIN);
     if (!frame_begin_bounded()) wedge("the GPU never finished the previous frame");
+    stage_enter(STAGE_RECORD);
+    if (pv3ds_present() != 0) fail(pv3ds_last_error());
+    stage_enter(STAGE_PREPARE);
+    voxel_gfx_prepare();
+    handheld_bottom();
 
     stage_enter(STAGE_CLEAR);
     /* The clear the sky pass owns. It covers the whole framebuffer, so the
@@ -1221,6 +1248,7 @@ int main(void) {
        * expanded and the guest's state is built: the number a console has to
        * have, rather than the number libctru happened to hand out. */
       report_memory("end", arena_bytes);
+      handheld_capture_bottom();
       capture_done();
       /* Park: Azahar does not stop when the app returns from main, and a
        * still process is what the driver kills. Blocking on the vblank event
@@ -1229,19 +1257,11 @@ int main(void) {
       for (;;) gspWaitForVBlank();
     }
 #else
-    if ((tick % 30) == 0) {
-      PvVox3dsStats scene;
-      pv3ds_stats(&scene);
-      printf(
-        "\x1b[6;1Htick %-6lu items %-5lu rung %lu\n%s          \n",
-        (unsigned long)scene.scene_tick,
-        (unsigned long)scene.draw_items,
-        (unsigned long)scene.quality_tier,
-        voxel_gfx_stats_line()
-      );
-    }
+    handheld_status(tick, (uint32_t)buttons, "running");
 #endif
+#ifdef PV3DS_CAPTURE
     tick += 1;
+#endif
 #if PV3DS_HOST_HEARTBEAT
     /* Past the first frame, every stage change writes. The wedge this was
      * built for happened inside the first 30 ticks, where the tick cadence
@@ -1251,6 +1271,8 @@ int main(void) {
     stage_enter(STAGE_APT);
   }
 
+  handheld_status(tick, 0, "exited");
+  handheld_shutdown();
   voxel_qjs_shutdown();
   voxel_gfx_shutdown();
   C3D_Fini();

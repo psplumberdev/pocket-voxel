@@ -226,6 +226,13 @@ pub unsafe extern "C" fn pv3ds_audio_wanted() -> u8 {
     u8::from(host().audio_wanted())
 }
 
+/// Output must hold `frames * 2` stereo samples. Host thread only.
+#[no_mangle]
+pub unsafe extern "C" fn pv3ds_audio_render(output: *mut i16, frames: u32) -> u32 {
+    if output.is_null() || frames > 16_384 { return 0; }
+    host().render_audio(core::slice::from_raw_parts_mut(output, frames as usize * 2)) as u32
+}
+
 // ---------------------------------------------------------------------------
 // The frame
 // ---------------------------------------------------------------------------

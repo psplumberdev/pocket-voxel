@@ -104,6 +104,7 @@ fn demo_pak(with_audio: bool) -> std::vec::Vec<u8> {
     b.map(
         7,
         &[ChunkDef {
+            flags: 0,
             cx: 0,
             cy: 0,
             aabb_min: [0, 0, 0],
@@ -238,6 +239,11 @@ const PSP_SURFACE: &[(&str, u32, u8, u8, u8)] = &[
     ("cry", 22, 5, 5, op_kind::NUMERIC),
     ("audioWaves", 23, 3, 3, op_kind::NUMERIC),
     ("audioDrum", 24, 4, 4, op_kind::NUMERIC),
+    ("sky", 75, 1, 1, op_kind::NUMERIC),
+    ("uiRect", 55, 5, 5, op_kind::NUMERIC),
+    ("uiLabel", 56, 4, 5, op_kind::TEXT),
+    ("uiOverlayClear", 57, 0, 0, op_kind::NUMERIC),
+    ("remotePlane", 58, 4, 4, op_kind::NUMERIC),
 ];
 
 /// The ops the PSP host wraps in `audio_op_fn!` — the ones that mean "this run
@@ -1022,5 +1028,35 @@ fn null_out_pointers_are_tolerated() {
         assert_eq!(cabi::pv3ds_gamedata(core::ptr::null_mut(), core::ptr::null_mut()), 0);
         assert_eq!(cabi::pv3ds_op_stats(core::ptr::null_mut()), 0);
         assert_eq!(cabi::pv3ds_op(op::CAM, core::ptr::null(), 0), 0);
+    }
+}
+
+#[test]
+fn native_audio_renders_a_synthetic_song_and_stops_without_overwriting_guards() {
+    let _guard = serialized();
+    let mut programs = std::vec![0u8; spec::AUDIO_BANK_SIZE * 2];
+    programs[..3].copy_from_slice(&[0x00, 0x00, 0x41]);
+    programs[0x100..0x105].copy_from_slice(&[0xd4, 0xf0, 0xe4, 0x0f, 0xff]);
+    let mut builder = PakBuilder::new();
+    builder.audio(br#"{"songs":[]}"#, &programs);
+    builder.game(br#"{"maps":[]}"#);
+    let blob = Box::leak(Box::new(AlignedBlob::from_bytes(&builder.finish())));
+    let (arena, bytes) = arena();
+    unsafe {
+        assert_eq!(cabi::pv3ds_init(arena, bytes, 2), 0);
+        assert_eq!(cabi::pv3ds_load_pak(blob.bytes().as_ptr().cast(), blob.bytes().len() as u32), 0);
+    }
+    assert_eq!(cabi::host().scene().audio.rate(), 11_025);
+    op(op::MUSIC, &[0, 0x4000, 1, spec::music_flag::LOOP as i32]);
+    let mut pcm = [12345i16; 1472];
+    unsafe { assert_eq!(cabi::pv3ds_audio_render(pcm.as_mut_ptr().add(1), 735), 735); }
+    assert_eq!((pcm[0], pcm[1471]), (12345, 12345));
+    assert!(pcm[1..1471].iter().any(|&v| v != 0));
+    op(op::MUSIC_STOP, &[]);
+    unsafe { cabi::pv3ds_audio_render(pcm.as_mut_ptr().add(1), 735); }
+    assert!(pcm[1..1471].iter().all(|&v| v == 0));
+    unsafe {
+        assert_eq!(cabi::pv3ds_audio_render(core::ptr::null_mut(), 735), 0);
+        assert_eq!(cabi::pv3ds_audio_render(pcm.as_mut_ptr(), u32::MAX), 0);
     }
 }

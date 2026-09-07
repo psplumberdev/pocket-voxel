@@ -52,6 +52,7 @@
 // PSP EBOOT, so both consoles replay one recorded run.
 
 import { $ } from "bun";
+import { build3dsArtwork } from "./3ds-artwork.ts";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
@@ -75,7 +76,7 @@ const appCrateDirectory = `${repository}crates/pocketvoxel-3ds/`;
 const RUST_TARGET = "armv6k-nintendo-3ds";
 /** Produced by the `pocketvoxel-3ds` staticlib crate. */
 const APP_STATIC_LIBRARY = "libpocketvoxel_3ds.a";
-const CONTAINER_IMAGE = "devkitpro/devkitarm:latest";
+const CONTAINER_IMAGE = "devkitpro/devkitarm@sha256:116afba8df8453961de2936ffab20dd441edf4d682856c1ec8b0e53d7ed0bbf5";
 const CONTAINER_REPOSITORY = "/repo";
 
 // makerom is what turns the ELF into an installable title, and it ships in
@@ -308,7 +309,7 @@ export function parseVoxelThreeDsArguments(
     heartbeat: numberFlag(
       argv,
       "heartbeat",
-      Number(process.env.PV3DS_HOST_HEARTBEAT ?? (capture ? 0 : 1)),
+      Number(process.env.PV3DS_HOST_HEARTBEAT ?? 0),
     ),
     heartbeatTicks: numberFlag(
       argv,
@@ -613,7 +614,16 @@ export async function ensureMakerom(
     }
   }
 
-  const head = await capture("git", ["rev-parse", "HEAD"], checkout);
+  // Match the current PocketJS 3DS toolchain instead of moving with makerom HEAD.
+  const revision = "e8f5f529c54ff9b22a2491a480ffa69206bf7b19";
+  let head = await capture("git", ["rev-parse", "HEAD"], checkout);
+  if (head.stdout.trim() !== revision) {
+    const fetch = await capture("git", ["fetch", "--depth", "1", "origin", revision], checkout);
+    if (fetch.exitCode !== 0) throw new Error(fetch.stderr);
+    const pin = await capture("git", ["checkout", "--detach", revision], checkout);
+    if (pin.exitCode !== 0) throw new Error(pin.stderr);
+    head = await capture("git", ["rev-parse", "HEAD"], checkout);
+  }
   const stamp = `${imageId} ${head.exitCode === 0 ? head.stdout.trim() : "unknown"}`;
   if (
     existsSync(binary) &&
@@ -885,6 +895,8 @@ export async function buildVoxel3ds(argv: readonly string[]): Promise<string> {
 
   // 3-4. everything that needs devkitARM
   const distributionRoot = `${repository}dist/3ds`;
+  const artworkDirectory = join(distributionRoot, "artwork");
+  await build3dsArtwork(repository, artworkDirectory);
   const quickJsDirectory = join(distributionRoot, "quickjs");
   const buildDirectory = join(distributionRoot, args.capture ? "build-capture" : "build");
   mkdirSync(buildDirectory, { recursive: true });
@@ -905,7 +917,25 @@ export async function buildVoxel3ds(argv: readonly string[]): Promise<string> {
   // HOME Menu reads the SMDH, so an installed capture title says what it is
   // rather than sitting next to the playable one under the same name.
   const smdhTitle = args.capture ? "Pocket Voxel (capture)" : "Pocket Voxel";
+  const identity = createHash("sha256");
+  const sourceFiles = (directory: string) => readdirSync(directory).sort().map(name => join(directory, name));
+  for (const path of [guestBundle, pak, appLibrary, join(quickJsDirectory, "libquickjs.a"),
+    import.meta.path, join(hostDirectory, "Makefile"), join(hostDirectory, "app.rsf"),
+    ...sourceFiles(join(hostDirectory, "src")),
+    ...sourceFiles(join(appCrateDirectory, "include")), ...sourceFiles(picaIncludeDirectory),
+    ...sourceFiles(artworkDirectory)]) {
+    const bytes = readFileSync(path);
+    const label = path.startsWith(repository) ? path.slice(repository.length) : path;
+    identity.update(`${label.length}:${label}:${bytes.length}:`);
+    identity.update(bytes);
+  }
+  identity.update(JSON.stringify({ args, imageId, toolchain, tape }));
+  const buildId = identity.digest("hex").slice(0, 32);
   const makeEnvironment: Record<string, string> = {
+    PV3DS_BUILD_ID: buildId,
+    PV3DS_BOTTOM: containerPathFor(join(artworkDirectory, "bottom.bgr"), mounts),
+    ICON: containerPathFor(join(artworkDirectory, "icon-48.png"), mounts),
+    SMALL_ICON: containerPathFor(join(artworkDirectory, "icon-24.png"), mounts),
     PV3DS_APP_LIB: containerPathFor(appLibrary, mounts),
     PV3DS_APP_INCLUDE: containerPathFor(`${appCrateDirectory}include`, mounts),
     PV3DS_PICA_INCLUDE: containerPathFor(picaIncludeDirectory, mounts),
@@ -964,6 +994,17 @@ export async function buildVoxel3ds(argv: readonly string[]): Promise<string> {
   if (!existsSync(output)) {
     throw new Error(`voxel 3ds: the container build did not produce ${output}`);
   }
+  const files: Record<string, string> = {};
+  for (const path of [output, ...(args.cia ? [ciaOutput] : [])]) {
+    files[path.split("/").at(-1)!] = createHash("sha256").update(readFileSync(path)).digest("hex");
+  }
+  writeFileSync(join(args.packageDir, `${base}-build-receipt.json`), JSON.stringify({
+    schema: 1, buildId, target: "3ds", capture: args.capture, appId,
+    primary: { width: 400, height: 240, viewport: [0, 7, 400, 226] },
+    auxiliary: { width: 320, height: 240, mode: "placeholder" },
+    container: CONTAINER_IMAGE, toolchain, files,
+  }, null, 2) + "\n");
+  console.log(`voxel 3ds: build_id=${buildId}`);
   console.log(`output: ${output} (${(statSync(output).size / 1024 / 1024).toFixed(1)} MiB)`);
   if (args.sdPak) {
     // The one thing a --sd-pak build cannot do for itself. Printed with the

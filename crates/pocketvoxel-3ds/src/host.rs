@@ -177,6 +177,7 @@ impl Host {
         // one; the GAME and AUDI sections borrow the leaked blob, so the
         // 'static they carry is honest.
         self.scene = Scene::new();
+        let _ = self.scene.audio.set_rate(11_025);
         self.pak = Some(pak);
         self.game = pak.game;
         self.audio = pak.audio;
@@ -283,6 +284,14 @@ impl Host {
     /// True once the guest has emitted any audio op.
     pub fn audio_wanted(&self) -> bool {
         self.audio_wanted
+    }
+
+    /// Render on the host thread; NDSP owns only the queued output buffers.
+    pub fn render_audio(&mut self, output: &mut [i16]) -> usize {
+        let Some(pak) = self.pak else { return 0 };
+        let frames = output.len() / 2;
+        self.scene.render_audio(pak, frames, output);
+        frames
     }
 
     // -- the frame ----------------------------------------------------------

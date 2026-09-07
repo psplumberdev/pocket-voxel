@@ -117,6 +117,11 @@ pub const OPS: &[OpDef] = &[
     a("cry", op::CRY, 5),
     a("audioWaves", op::AUDIO_WAVES, 3),
     a("audioDrum", op::AUDIO_DRUM, 4),
+    n("sky", op::SKY, 1),
+    n("uiRect", op::UI_RECT, 5),
+    OpDef { name: "uiLabel", code: op::UI_LABEL, argc: 4, js_len: 5, kind: op_kind::TEXT, audio: false },
+    n("uiOverlayClear", op::UI_OVERLAY_CLEAR, 0),
+    n("remotePlane", op::REMOTE_PLANE, 4),
 ];
 
 // The table is walked by index from C and copied into a fixed-size name

@@ -1,5 +1,9 @@
 # PICA200 parity checklist
 
+> Historical renderer bring-up record. The current host lifecycle, sprite-masked
+> ghost pass, native audio, screen layout, and validation are documented in
+> [the 3DS host guide](./guide/3ds.md).
+
 The Nintendo 3DS backend (`crates/pocketvoxel-pica`) is the **third**
 implementation of one `DrawList`. The other two already exist and already had
 to agree with each other:

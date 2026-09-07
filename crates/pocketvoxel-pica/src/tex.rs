@@ -1125,6 +1125,7 @@ mod tests {
         let mut meshes = [MeshRange::default(); spec::MESH_KINDS];
         meshes[0] = terrain;
         b.map(7, &[ChunkDef {
+            flags: 0,
             cx: 0,
             cy: 0,
             aabb_min: [0, 0, 0],

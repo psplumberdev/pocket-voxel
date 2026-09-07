@@ -113,6 +113,7 @@ ARCH := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 # recorded command stream.
 CFLAGS := -Wall -Wextra -O2 -g -std=gnu11 -mword-relocations -ffunction-sections -fdata-sections \
   $(ARCH) -D__3DS__ -DJS_NO_NAN_BOXING \
+  -DPV3DS_BUILD_ID='"$(PV3DS_BUILD_ID)"' \
   -DPV3DS_HOST_ARENA_MIB=$(PV3DS_HOST_ARENA_MIB) \
   -DPV3DS_HOST_ARENA_BANKS=$(PV3DS_HOST_ARENA_BANKS) \
   -DPV3DS_HOST_TEXTURE_MIB=$(PV3DS_HOST_TEXTURE_MIB) \
@@ -139,7 +140,7 @@ LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections -Wl,-Map,$(BUILD)/pocketv
 LIBPATHS := -L$(DEVKITPRO)/libctru/lib
 LIBS := -lcitro3d -lctru -lm
 
-OBJECTS := $(BUILD)/main.o $(BUILD)/voxel_gfx.o $(BUILD)/qjs.o $(BUILD)/input.o \
+OBJECTS := $(BUILD)/main.o $(BUILD)/handheld.o $(BUILD)/voxel_gfx.o $(BUILD)/qjs.o $(BUILD)/input.o \
   $(BUILD)/vshader_shbin.o
 ELF := $(BUILD)/pocketvoxel-3ds.elf
 SMDH := $(BUILD)/pocketvoxel-3ds.smdh
@@ -158,7 +159,7 @@ $(BUILD) $(ROMFS):
 $(BUILD)/vshader.shbin: $(SOURCE)/vshader.v.pica | $(BUILD)
 	$(PICASSO) -o $@ $<
 
-$(BUILD)/vshader_shbin.s $(BUILD)/vshader_shbin.h: $(BUILD)/vshader.shbin
+$(BUILD)/vshader_shbin.s $(BUILD)/vshader_shbin.h &: $(BUILD)/vshader.shbin
 	cd $(BUILD) && $(BIN2S) -a 4 -H vshader_shbin.h vshader.shbin > vshader_shbin.s
 
 $(BUILD)/vshader_shbin.o: $(BUILD)/vshader_shbin.s
@@ -178,10 +179,10 @@ $(FLAGS_STAMP).probe: | $(BUILD)
 	@rm -f $(FLAGS_STAMP).new
 $(FLAGS_STAMP): $(FLAGS_STAMP).probe ;
 
-$(BUILD)/%.o: $(SOURCE)/%.c $(BUILD)/vshader_shbin.h $(FLAGS_STAMP) | $(BUILD)
+$(BUILD)/%.o: $(SOURCE)/%.c $(BUILD)/vshader_shbin.h $(FLAGS_STAMP) $(wildcard $(SOURCE)/*.h) $(wildcard $(PV3DS_APP_INCLUDE)/*.h) $(wildcard $(PV3DS_PICA_INCLUDE)/*.h) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(ELF): $(OBJECTS) $(PV3DS_APP_LIB)
+$(ELF): $(OBJECTS) $(PV3DS_APP_LIB) $(PV3DS_QUICKJS_DIR)/libquickjs.a
 	$(CC) $(LDFLAGS) $(OBJECTS) $(PV3DS_APP_LIB) $(PV3DS_QUICKJS_DIR)/libquickjs.a \
 	  $(LIBPATHS) $(LIBS) -o $@
 
@@ -198,7 +199,10 @@ $(ROMFS)/voxelmon.vxpak: $(PV3DS_PAK) | $(ROMFS)
 # 3dsxtool and makerom build the image from whatever is in it — a leftover from
 # a RomFS build would silently make a 31.9 MiB package again and, worse, feed
 # the run a pak the SD path was meant to replace.
-ROMFS_FILES := $(ROMFS)/game.js
+$(ROMFS)/bottom.bgr: $(PV3DS_BOTTOM) | $(ROMFS)
+	cp $< $@
+
+ROMFS_FILES := $(ROMFS)/game.js $(ROMFS)/bottom.bgr
 ifeq ($(PV3DS_HOST_PAK_SD),1)
 ROMFS_PRUNE := rm -f $(ROMFS)/voxelmon.vxpak
 else
@@ -208,9 +212,9 @@ endif
 
 # 3dsxtool refuses to embed a RomFS without SMDH metadata, so one is always
 # built.
-$(SMDH): $(ICON) | $(BUILD)
+$(SMDH): $(ICON) $(SMALL_ICON) $(FLAGS_STAMP) | $(BUILD)
 	$(SMDHTOOL) --create "$(PV3DS_SMDH_TITLE)" "$(PV3DS_SMDH_DESC)" \
-	  "$(PV3DS_SMDH_AUTHOR)" $(ICON) $@
+	  "$(PV3DS_SMDH_AUTHOR)" $(ICON) $@ $(SMALL_ICON)
 
 $(OUT): $(ELF) $(SMDH) $(ROMFS_FILES)
 	mkdir -p $(dir $(OUT))

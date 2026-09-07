@@ -103,11 +103,14 @@
 
 import { existsSync, cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { resolve } from "node:path";
 
 import { tapeFromTrace } from "../../tools/voxel-3ds.ts";
 
 const root = new URL("../..", import.meta.url).pathname;
-const outDir = `${root}dist/e2e-voxel-3ds`;
+const tape = process.env.E2E_3DS_TAPE ?? "story";
+if (!["story", "battle", "computer"].includes(tape)) throw new Error(`Unknown tape: ${tape}`);
+const outDir = `${root}dist/e2e-voxel-3ds-${tape}`;
 const oracleDir = `${outDir}/oracle`;
 const consoleLog = `${outDir}/azahar-console.log`;
 
@@ -129,14 +132,13 @@ const sourceConfig =
   `${homedir()}/Library/Application Support/Azahar/config/qt-config.ini`;
 const sourceUserDir = sourceConfig.replace(/\/config\/[^/]+$/, "");
 
-const tape = process.env.E2E_3DS_TAPE ?? "story";
 const pak = `${root}dist/voxelmon/voxelmon.vxpak`;
 const trace = `${root}dist/voxelmon/trace/${tape}.vtrace`;
 /** The sim's own committed hashes, asserted so a gate failure means the 3DS moved. */
 const oracleGolden = `${root}tests/goldens/voxel/${tape}.hashes`;
 const golden = `${root}tests/goldens/voxel/${tape}-3ds.hashes`;
 /** Set to run a .3dsx that is already built (the container build is skipped). */
-const prebuilt = process.env.E2E_3DS_3DSX;
+const prebuilt = process.env.E2E_3DS_3DSX ? resolve(process.env.E2E_3DS_3DSX) : undefined;
 const capture3dsx = `${root}dist/3ds/voxelmon-capture.3dsx`;
 
 const update = process.env.UPDATE_3DS === "1";
@@ -189,18 +191,32 @@ async function run(
   return { code, out: out + err };
 }
 
+const ownedPidPath = `${outDir}/azahar.pid`;
+let ownedPid: number | undefined;
+let preexistingPids = new Set<number>();
+function fixtureProcesses(): number[] {
+  const result = Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe", stderr: "pipe" });
+  const artifact = prebuilt ?? capture3dsx;
+  return result.stdout.toString().split("\n").filter(line => line.trim().replace(/^\d+\s+/, "").startsWith(azaharBinary + " ") && line.includes(artifact))
+    .map(line => Number(line.trim().split(/\s+/)[0]));
+}
 function emulatorRunning(): boolean {
-  return (
-    Bun.spawnSync(["pgrep", "-f", azaharBinary], { stdout: "ignore", stderr: "ignore" }).exitCode === 0
-  );
+  const candidates = fixtureProcesses().filter(pid => !preexistingPids.has(pid));
+  if (ownedPid === undefined && candidates.length === 1) {
+    ownedPid = candidates[0];
+    writeFileSync(ownedPidPath, String(ownedPid));
+  }
+  return ownedPid !== undefined && candidates.includes(ownedPid);
 }
 
-/** Azahar ignores SIGTERM, outlives its guest and does not stop when the app
- *  returns from main(), so the driver owns its lifetime on every path — before
- *  the fixture is rebuilt, around the run, and after the verdict. Two
- *  instances share one user directory and corrupt each other's capture. */
+/** Reap only this fixture's recorded PID, after checking its executable and ROM. */
 function killEmulator(): void {
-  Bun.spawnSync(["pkill", "-9", "-f", azaharBinary], { stdout: "ignore", stderr: "ignore" });
+  const pid = ownedPid ?? (existsSync(ownedPidPath) ? Number(readFileSync(ownedPidPath, "utf8")) : undefined);
+  if (pid !== undefined && fixtureProcesses().includes(pid)) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+  ownedPid = undefined;
+  rmSync(ownedPidPath, { force: true });
 }
 
 // ---- skips ----------------------------------------------------------------
@@ -212,7 +228,7 @@ if (!existsSync(azaharBinary)) skip(`Azahar not found at ${azaharApp} (set AZAHA
 if (!existsSync(sourceConfig)) {
   skip(`no Azahar config at ${sourceConfig} (launch Azahar once, or set AZAHAR_CONFIG)`);
 }
-for (const tool of ["open", "pgrep", "pkill"]) {
+for (const tool of ["open", "ps"]) {
   if (!Bun.which(tool)) skip(`${tool} not found (needed to launch and to reap the emulator)`);
 }
 if (!Bun.which("magick")) skip("ImageMagick `magick` not found (brew install imagemagick)");
@@ -349,6 +365,7 @@ async function runAzahar(): Promise<void> {
   rmSync(capDir, { recursive: true, force: true });
   mkdirSync(capDir, { recursive: true });
   killEmulator();
+  preexistingPids = new Set(fixtureProcesses());
 
   // LaunchServices, not a direct exec: launching the binary does not advance
   // the guest — Azahar only runs when it is launched into the user's GUI
@@ -547,6 +564,11 @@ if (!update) {
     recorded.set(name, hash);
   }
 }
+
+const bottomCapture = readFileSync(`${capDir}/bottom.bgr`);
+const bottomArtwork = readFileSync(`${root}dist/3ds/artwork/bottom.bgr`);
+if (!bottomCapture.equals(bottomArtwork)) throw new Error("The auxiliary framebuffer does not match the 320x240 placeholder");
+console.log("auxiliary: native 320x240 framebuffer matches the placeholder");
 
 let failed = false;
 const fresh: string[] = [];

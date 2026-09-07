@@ -90,7 +90,7 @@ _Static_assert(sizeof(PvPicaFrame) == 28, "PvPicaFrame is 28 bytes on ARM32");
 
 /* -- every declared entry point resolves ---------------------------------- */
 
-static const void *const entry_points[] = {
+static const void *volatile entry_points[] = {
     (const void *)&pv3ds_init,
     (const void *)&pv3ds_load_pak,
     (const void *)&pv3ds_last_error,
@@ -103,6 +103,7 @@ static const void *const entry_points[] = {
     (const void *)&pv3ds_op_stats,
     (const void *)&pv3ds_take_map_swapped,
     (const void *)&pv3ds_audio_wanted,
+    (const void *)&pv3ds_audio_render,
     (const void *)&pv3ds_tick,
     (const void *)&pv3ds_present,
     (const void *)&pv3ds_stats,

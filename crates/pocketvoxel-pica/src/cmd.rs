@@ -103,6 +103,8 @@ pub mod flag {
     /// the texture cache key: one page draws tinted in the diorama and raw in
     /// the GB UI layer within one frame.
     pub const TINTED: u8 = 8;
+    /// Texture alpha masks a flat vertex color (the occluded player).
+    pub const MASK: u8 = 16;
 }
 
 /// One recorded draw (or the frame clear). 40 bytes, 4-aligned.

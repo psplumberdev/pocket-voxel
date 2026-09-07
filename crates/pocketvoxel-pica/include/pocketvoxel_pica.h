@@ -56,6 +56,7 @@ extern "C" {
 #define PV_PICA_F_TEXTURED   1 /* bind (page, frame, pal, tinted) */
 #define PV_PICA_F_ALPHA_TEST 2 /* GPU_GREATER against 0x7f */
 #define PV_PICA_F_BLEND      4 /* src_alpha, 1 - src_alpha */
+#define PV_PICA_F_MASK 16u
 #define PV_PICA_F_TINTED     8 /* the palette carries the day tint */
 
 /*

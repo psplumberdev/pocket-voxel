@@ -176,7 +176,7 @@ expression from its source and asserts this crate agrees with it exactly.
 
 Covered: the pull displacement bit for bit (including the pinned
 scale-by-`1/len`-then-by-`pull` order, which is a different f32 from the fused
-form); the i16 truncation of textured pulled vertices and the f32 the ghost
+form); the i16 truncation of textured pulled vertices and the f32 the ground shadow
 keeps; the sky band row slicing and the clear it owns; `biased_vp` and the depth
 remap's direction; palette resolution through `draw::resolve_pal` and the tint
 as a `modulate_rgb` palette modulation that never reaches the GB UI; the

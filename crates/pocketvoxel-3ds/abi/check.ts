@@ -19,7 +19,7 @@
 import { $ } from "bun";
 import { dirname, resolve } from "node:path";
 
-const IMAGE = "devkitpro/devkitarm:latest";
+const IMAGE = "devkitpro/devkitarm@sha256:116afba8df8453961de2936ffab20dd441edf4d682856c1ec8b0e53d7ed0bbf5";
 const crate = resolve(dirname(import.meta.dir));
 const crates = dirname(crate);
 

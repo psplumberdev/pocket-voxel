@@ -378,6 +378,9 @@ uint32_t pv3ds_axis_buttons(int32_t dx, int32_t dy, int32_t deadzone);
  * `arg_i32` defaulting.
  */
 
+/* Host-thread stereo PCM at 11025 Hz; output holds frames * 2 samples. */
+uint32_t pv3ds_audio_render(int16_t *output, uint32_t frames);
+
 #ifdef __cplusplus
 }
 #endif

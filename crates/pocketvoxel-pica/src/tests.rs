@@ -100,6 +100,7 @@ fn demo_pak() -> Vec<u8> {
     b.map(
         7,
         &[ChunkDef {
+            flags: 0,
             cx: 0,
             cy: 0,
             aabb_min: [0, 0, 0],
@@ -399,49 +400,44 @@ fn textured_pulled_vertices_truncate_to_i16() {
     assert_eq!(h.r.stats().pull_verts, pulled_mesh.vert_count as u32);
 }
 
-/// Untextured pulled geometry — the ghost — stays f32. Truncating it here
-/// would be a divergence the rasterizer does not model.
+/// The occluded player uses the sprite cutout, not its transparent bounding box.
 #[test]
-fn the_ghost_keeps_f32_positions() {
-    let bytes = demo_pak();
-    let blob = AlignedBlob::from_bytes(&bytes);
+fn the_ghost_keeps_sprite_mask_and_inverted_depth() {
+    let blob = AlignedBlob::from_bytes(&demo_pak());
     let pak = pak::read(blob.bytes()).unwrap();
     let list = built(&pak, &demo_scene());
-    let (verts, pull, abgr) = list
-        .items
-        .iter()
-        .find_map(|i| match i {
-            Item::Ghost { verts, pull, abgr } => Some((*verts, *pull, *abgr)),
-            _ => None,
-        })
-        .expect("the ghost-flagged entity emits one");
-    assert_ne!(pull, 0.0);
-
+    let (page, abgr) = list.items.iter().find_map(|item| match item {
+        Item::Ghost { page, abgr, .. } => Some((*page, *abgr)),
+        _ => None,
+    }).unwrap();
     let mut h = Harness::new();
     h.r.record(&list, &pak);
-    let cmd = *h
-        .r
-        .commands()
-        .iter()
-        .find(|c| c.depth == depth::INVERTED)
-        .expect("the ghost's inverted-depth draw");
+    let cmd = h.r.commands().iter().find(|c| c.depth == depth::INVERTED).unwrap();
+    assert_eq!(cmd.vfmt, vfmt::WORLD);
+    assert_eq!(cmd.page, page);
+    assert_eq!(cmd.flags, flag::TEXTURED | flag::ALPHA_TEST | flag::TINTED | flag::MASK | flag::BLEND);
+    let vertices = world_verts(&h.r, cmd);
+    assert!(vertices.iter().all(|v| v.abgr == abgr));
+    assert!(vertices.iter().any(|v| v.u != vertices[0].u));
+    assert!(vertices.iter().any(|v| v.v != vertices[0].v));
+}
+
+#[test]
+fn menu_overlays_follow_world_geometry_without_depth_writes() {
+    let blob = AlignedBlob::from_bytes(&demo_pak());
+    let pak = pak::read(blob.bytes()).unwrap();
+    let mut list = built(&pak, &demo_scene());
+    list.items.push(Item::OverlayRect { x: 20, y: 30, w: 80, h: 40, abgr: 0xc0123456 });
+    let mut h = Harness::new();
+    h.r.record(&list, &pak);
+    let cmd = h.r.commands().last().unwrap();
+    assert_eq!(cmd.depth, depth::NONE);
     assert_eq!(cmd.vfmt, vfmt::FLAT);
-    assert_eq!(cmd.flags, flag::BLEND, "blended, untextured, no alpha test");
-    let staged = flat_verts(&h.r, &cmd);
-    let mut any_fractional = false;
-    for (got, corner) in staged.iter().zip(verts.iter()) {
-        let want = raster_pull(list.cam.eye, vec3(corner[0], corner[1], corner[2]), pull, false);
-        assert_eq!(
-            (got.x.to_bits(), got.y.to_bits(), got.z.to_bits()),
-            (want.x.to_bits(), want.y.to_bits(), want.z.to_bits())
-        );
-        assert_eq!(got.abgr, abgr);
-        any_fractional |= got.x.fract() != 0.0 || got.y.fract() != 0.0 || got.z.fract() != 0.0;
-    }
-    assert!(
-        any_fractional,
-        "if every ghost coordinate were integral this test could not tell f32 from i16"
-    );
+    assert_eq!(cmd.flags, flag::BLEND);
+    let vertices = flat_verts(&h.r, cmd);
+    assert_eq!((vertices[0].x, vertices[0].y), (20.0, 30.0));
+    assert_eq!((vertices[2].x, vertices[2].y), (100.0, 70.0));
+    assert!(vertices.iter().all(|v| v.abgr == 0xc0123456));
 }
 
 // ---------------------------------------------------------------------------
@@ -850,7 +846,8 @@ fn commands_follow_the_list_order() {
                 kinds.push("decal");
             }
             Item::Ghost { .. } => {
-                assert_eq!((c.depth, c.flags), (depth::INVERTED, flag::BLEND));
+                assert_eq!(c.depth, depth::INVERTED);
+                assert_ne!(c.flags & flag::MASK, 0);
                 kinds.push("ghost");
             }
             Item::Card { page, .. } => {
@@ -863,6 +860,10 @@ fn commands_follow_the_list_order() {
                 assert_eq!(c.depth, depth::NONE);
                 assert_eq!(c.page, *page);
                 kinds.push("ui");
+            }
+            Item::OverlayRect { .. } | Item::VideoQuad { .. } => {
+                assert_eq!(c.depth, depth::NONE);
+                kinds.push("overlay");
             }
         }
     }
@@ -1329,6 +1330,7 @@ fn a_full_scale_uv_clamps_and_is_counted() {
     b.map(
         7,
         &[ChunkDef {
+            flags: 0,
             cx: 0,
             cy: 0,
             aabb_min: [0, 0, 0],
