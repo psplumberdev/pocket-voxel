@@ -17,6 +17,7 @@ import { GameMap, type GenData, type MapDef, type Profile, type TilesetDef } fro
 export interface AtlasIndex {
   /** sprite sheet name ("red", "oak", ...) -> atlas page. */
   sprites: Record<string, number>;
+  partyIcons?: Record<string, number>;
   /** species id -> front-pic atlas page (the guest accessor contract). */
   picFront: Record<string, number>;
   /** species id (+ "redb") -> back-pic atlas page. */
@@ -198,6 +199,19 @@ export function buildGamedata(
   const moon = encounters.MT_MOON_B2F?.grass?.slots;
   if (moon?.[6]) moon[6] = { species: "ONIX", level: 10 };
 
+  if (atlas.partyIcons && Object.keys(atlas.partyIcons).length > 0) {
+    for (const [map, def] of Object.entries(encounters)) {
+      for (const group of [def.grass, def.water]) {
+        for (const slot of group?.slots ?? []) {
+          const icon = gen.pokemon[slot.species]?.partyIcon;
+          if (typeof icon !== "string" || atlas.partyIcons[icon] === undefined) {
+            throw new Error(`${map}: missing original party icon for ${slot.species}; re-import the ROM`);
+          }
+        }
+      }
+    }
+  }
+
   const game = {
     constants: gen.constants,
     // The maps whose geometry this pak actually carries. gamedata keeps
@@ -218,6 +232,7 @@ export function buildGamedata(
     trainer_headers: gen.trainerHeaders,
     field: gen.field,
     atlas,
+    ...(atlas.partyIcons && Object.keys(atlas.partyIcons).length > 0 ? { partyIcons: atlas.partyIcons } : {}),
     mapPalette: buildMapPalette(gen),
   };
   return new TextEncoder().encode(JSON.stringify(game));

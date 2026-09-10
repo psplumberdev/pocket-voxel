@@ -48,6 +48,8 @@ export interface SpeciesDef {
   id: string;
   index: number;
   dex: number;
+  /** Original shared Gen 1 party-menu icon name. */
+  partyIcon?: string;
   name: string;
   types: string[];
   baseStats: StatBlock;
@@ -252,6 +254,8 @@ export interface VoxelmonData {
   /** Maps whose geometry the pak carries; absent (old gamedata) = all.
    * Anything else is a locked content boundary (world/overworld.ts). */
   cookedMaps?: string[];
+  /** Original menu icon name -> streamed atlas page; enables visible wilds. */
+  partyIcons?: Record<string, number>;
   pokemon: Record<string, SpeciesDef>;
   moves: Record<string, MoveDef>;
   type_chart: TypeChartData;

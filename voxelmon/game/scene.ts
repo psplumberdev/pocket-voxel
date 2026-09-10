@@ -420,6 +420,19 @@ export class Scene {
         flags,
       );
     }
+    // Original menu icons are separate two-frame cards. No terrain, camera,
+    // NPC placement or background state changes are needed to draw them.
+    for (let i = 0; i < ow.wild.slots.length; i++) {
+      const wild = ow.wild.slots[i];
+      const slot = npcs.length + 1 + i;
+      if (slot >= ENTS_MAX) break;
+      if (!wild.active) continue;
+      const page = view.data.partyIcons?.[wild.icon];
+      if (page === undefined) continue;
+      const bob = wild.icon === "BALL" || wild.icon === "HELIX" ? wild.frame : 0;
+      this.emitSlot(slot, page, wild.frame, wild.px * Q4, wild.py * Q4,
+        ow.map.groundAt(wild.cellX, wild.cellY) + bob, ENT_FLAG.walker);
+    }
     for (let slot = 0; slot < ENTS_MAX; slot++) {
       if (this.entSeen[slot] === 0 && this.entShown[slot] !== 0) {
         this.host.entHide(slot);

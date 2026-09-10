@@ -93,8 +93,9 @@ function supportFixture(groundHeights?: number[]): { map: GameMap; def: MapDef }
   return { map: new GameMap(def, tileset), def };
 }
 
-function makeGame(seed = 1): VoxelmonGame {
-  const game = new VoxelmonGame(romData!, new RecorderHost(), seed);
+function makeGame(seed = 1, legacyEncounters = false): VoxelmonGame {
+  const data = legacyEncounters ? { ...romData!, partyIcons: undefined } : romData!;
+  const game = new VoxelmonGame(data, new RecorderHost(), seed);
   game.newGame();
   game.chooseStarter("SQUIRTLE");
   game.save.flags.EVENT_FOLLOWED_OAK_INTO_LAB = true;
@@ -386,7 +387,7 @@ describe("entity terrain support (VoxelScene.groundAt)", () => {
         sprites: { SPRITE_RED: { id: "SPRITE_RED", frames: 6 } },
         atlas: { sprites: { red: 2, poke_ball: 3 } },
       },
-      overworld: { map, player, npcs: [npc], emote: undefined },
+      overworld: { map, player, npcs: [npc], wild: { slots: [] }, emote: undefined },
       uiBox: () => null,
       uiChoice: () => null,
       pcDesktop: () => null,
@@ -1206,6 +1207,55 @@ describe("Vermilion, S.S. Anne, and Diglett's Cave", () => {
     expect(romData!.encounters.DIGLETTS_CAVE).toBeDefined();
   });
 
+  test.skipIf(!hasGen)("Diglett connecting houses and gate floors are included and return correctly", () => {
+    for (const id of ["ROUTE_2_TRADE_HOUSE", "ROUTE_2_GATE", "ROUTE_11_GATE_1F", "ROUTE_11_GATE_2F"]) {
+      expect(DEFAULT_MAPS).toContain(id);
+    }
+    for (const [route, interior] of [
+      ["ROUTE_2", "ROUTE_2_TRADE_HOUSE"],
+      ["ROUTE_2", "ROUTE_2_GATE"],
+      ["ROUTE_11", "ROUTE_11_GATE_1F"],
+    ]) {
+      const game = makeGame();
+      game.overworld.setMap(route, 0, 0, "down");
+      const door = game.overworld.map.def.warps.find(w => w.destMap === interior)!;
+      game.overworld.takeWarp(door);
+      idle(game, 80);
+      expect(game.overworld.map.id).toBe(interior);
+      expect(game.overworld.npcs.length).toBeGreaterThan(0);
+      if (interior === "ROUTE_11_GATE_1F") {
+        game.overworld.takeWarp(game.overworld.map.def.warps.find(w => w.destMap === "ROUTE_11_GATE_2F")!);
+        idle(game, 80);
+        expect(game.overworld.map.id).toBe("ROUTE_11_GATE_2F");
+        game.overworld.takeWarp(game.overworld.map.def.warps[0]);
+        idle(game, 80);
+        expect(game.overworld.map.id).toBe(interior);
+      }
+      game.overworld.takeWarp(game.overworld.map.def.warps.find(w => w.destMap === "LAST_MAP")!);
+      idle(game, 80);
+      expect(game.overworld.map.id).toBe(route);
+    }
+  });
+
+  test.skipIf(!hasGen)("Diglett's Cave can be traversed between both routes", () => {
+    for (const [source, target] of [["ROUTE_2", "ROUTE_11"], ["ROUTE_11", "ROUTE_2"]]) {
+      const game = makeGame();
+      game.overworld.setMap(source, 0, 0, "down");
+      const enter = (destination: string) => {
+        const warp = game.overworld.map.def.warps.find(w => w.destMap === destination)!;
+        expect(warp).toBeDefined();
+        game.overworld.takeWarp(warp);
+        idle(game, 80);
+      };
+      enter(`DIGLETTS_CAVE_${source}`);
+      enter("DIGLETTS_CAVE");
+      expect(game.overworld.map.id).toBe("DIGLETTS_CAVE");
+      enter(`DIGLETTS_CAVE_${target}`);
+      enter("LAST_MAP");
+      expect(game.overworld.map.id).toBe(target);
+    }
+  });
+
   test.skipIf(!hasGen)("each Diglett foyer exits onto its own physical route", () => {
     for (const [foyer, route] of [
       ["DIGLETTS_CAVE_ROUTE_2", "ROUTE_2"],
@@ -1276,7 +1326,7 @@ describe("Vermilion, S.S. Anne, and Diglett's Cave", () => {
 
 describe("encounters", () => {
   const grassStep = (rate: number, pick: number) => {
-    const game = makeGame();
+    const game = makeGame(1, true);
     const ow = game.overworld;
     ow.setMap("ROUTE_1", 11, 6, "down");
     ow.refreshStandingOnWarp();
@@ -1318,7 +1368,7 @@ describe("encounters", () => {
   });
 
   test.skipIf(!hasGen)("no roll on plain ground; rolls only on completed grass steps", () => {
-    const game = makeGame();
+    const game = makeGame(1, true);
     const ow = game.overworld;
     ow.setMap("ROUTE_1", 9, 16, "down");
     ow.refreshStandingOnWarp();
@@ -1341,7 +1391,7 @@ describe("encounters", () => {
   });
 
   test.skipIf(!hasGen)("cave encounters roll only after a completed walkable step", () => {
-    const game = makeGame();
+    const game = makeGame(1, true);
     const ow = game.overworld;
     ow.setMap("MT_MOON_1F", 5, 5, "down");
     game.rng = seqRng(0, 0);
@@ -1407,7 +1457,7 @@ const STORY_SEED = 17;
 
 async function runStoryInProcess(): Promise<RecorderHost> {
   const host = new RecorderHost();
-  const game = new VoxelmonGame(romData!, host, STORY_SEED);
+  const game = new VoxelmonGame({ ...romData!, partyIcons: undefined }, host, STORY_SEED);
   // sim/cli.ts installs the audio banks before newGame; the `audiodata` op it
   // emits is part of the trace, so this run has to do the same to compare.
   game.setAudio(await loadAudioBanks(genDir));
@@ -1484,6 +1534,7 @@ describe("story tape", () => {
         [
           "bun",
           "voxelmon/game/sim/cli.ts",
+          "--legacy-encounters",
           "--tape",
           "voxelmon/tapes/story.tape",
           "--out",

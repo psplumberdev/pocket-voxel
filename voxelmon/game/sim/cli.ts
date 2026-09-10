@@ -27,7 +27,7 @@ const genDir = arg("gen") ?? "dist/voxelmon/gen";
 
 if (!tapePath || !outPath) {
   console.error(
-    "usage: bun voxelmon/game/sim/cli.ts --tape <file.tape> --out <file.vtrace> [--seed N]",
+    "usage: bun voxelmon/game/sim/cli.ts --tape <file.tape> --out <file.vtrace> [--seed N] [--legacy-encounters]",
   );
   process.exit(2);
 }
@@ -35,6 +35,9 @@ if (!tapePath || !outPath) {
 const tapeText = await Bun.file(tapePath).text();
 const commands = parseTape(tapeText);
 const data = await loadRuntimeData(genDir);
+// Archived story/battle tapes pin the original step-encounter RNG stream.
+// Production builds and visible-wild tests never set this compatibility flag.
+if (process.argv.includes("--legacy-encounters")) delete data.partyIcons;
 
 const host = new RecorderHost();
 const game = new VoxelmonGame(data, host, seed);

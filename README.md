@@ -269,3 +269,16 @@ engine commit — a mainline commit, moved forward deliberately.
 ## License
 
 MIT. The ROM, and everything derived from it, stays yours and stays local.
+
+### PSP saves and updates
+
+Update only `PSP/GAME/VOXELMON/EBOOT.PBP` and `voxelmon.vxpak`.
+Player progress is stored separately in `PSP/SAVEDATA/VOXELMON/save.json`,
+with the previous save in `save.bak`. Back up that directory to keep a copy
+of your progress. These are game-managed files, not a PSP system save dialog.
+
+Upgrading from an older build: keep the old game folder's `save.json` and
+`save.bak` in place for the first launch. Load your game and use the in-game
+Save command once to write it to the new location. After that, replacing
+the game folder does not replace your progress. Update packages must never
+include player save files or overwrite `PSP/SAVEDATA`.

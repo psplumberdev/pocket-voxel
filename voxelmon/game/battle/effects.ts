@@ -1,12 +1,5 @@
-// The move-effect execution surface. Ports gen1recomp
-// src/battle/EffectRegistry.lua (makeCtx :37, runDamaging :99) and the
-// subset of src/battle/MoveEffects.lua reachable from the v1 slice's wild
-// movesets (Route 1 / Route 22 / Route 2 species at L2-8 plus a starter's
-// early kit — see EFFECTS below). Every other effect id degrades exactly
-// the way the reference degrades an UNREGISTERED effect: a damaging move
-// falls through to plain damage with a one-shot warning
-// (MoveEffects.warnUnknown, MoveEffects.lua:788-793) and a status move
-// prints "But, it failed!" (BattleState.lua performMove :3535-3540).
+// Move effects ported from gen1recomp src/battle/MoveEffects.lua.
+// Unsupported effects retain the warning/failure fallback below.
 
 import type { MoveDef, VoxelmonData } from "../data.ts";
 import { randRange, type Rng } from "../rng.ts";
@@ -176,34 +169,6 @@ export function inflictStatus(
 }
 
 // ---------------------------------------------------------------------------
-// The ported handler subset. The census is over the COOKED map set
-// (cook/cli.ts DEFAULT_MAPS): gen/encounters.json puts PIDGEY, RATTATA and
-// WEEDLE at L2-5 in the ROUTE_1 and ROUTE_2 grass, and the player's own line
-// reaches L20-ish by grinding there (evolutions included, since a level
-// evolution now lands — rules/evolution.ts).
-//   GUST/TACKLE/QUICK_ATTACK/HORN_ATTACK/SCRATCH/PECK -> NO_ADDITIONAL_EFFECT
-//   GROWL  -> ATTACK_DOWN1_EFFECT      TAIL_WHIP/LEER -> DEFENSE_DOWN1_EFFECT
-//   SAND_ATTACK -> ACCURACY_DOWN1_EFFECT
-//   STRING_SHOT (WEEDLE L1)  -> SPEED_DOWN1_EFFECT
-//   POISON_STING (WEEDLE L1) -> POISON_SIDE_EFFECT1
-//   HARDEN (KAKUNA/METAPOD L1) -> DEFENSE_UP1_EFFECT
-//   HYPER_FANG (RATTATA L14) -> FLINCH_SIDE_EFFECT1
-//   FURY_ATTACK (SPEAROW L?, BEEDRILL L?) -> TWO_TO_FIVE_ATTACKS_EFFECT
-//   FOCUS_ENERGY (BEEDRILL L16) -> FOCUS_ENERGY_EFFECT
-//   LEECH_SEED (BULBASAUR L7) -> LEECH_SEED_EFFECT
-//   BUBBLE (SQUIRTLE L8) -> SPEED_DOWN_SIDE_EFFECT
-//   EMBER (CHARMANDER L9, one level past the window but one level-up away)
-//          -> BURN_SIDE_EFFECT1
-//   STRUGGLE (the no-PP fallback) -> RECOIL_EFFECT
-// Reachable but still NOT registered, both needing plumbing this slice does
-// not have: TWINEEDLE_EFFECT (BEEDRILL L20 — MoveEffects.lua registers it in
-// both `full` and `secondary`, and the second hit's poison reroute wants the
-// per-hit seam) and SWITCH_AND_TELEPORT_EFFECT (PIDGEY L19 WHIRLWIND —
-// effects.asm:810 ends the wild battle, which is a battle-exit path).
-// Everything else: NOT REGISTERED — degrades via the reference's own
-// unknown-effect fallbacks (see module header).
-// ---------------------------------------------------------------------------
-
 function statUp(stat: StageStat, delta: number): EffectRecord["run"] {
   // MoveEffects.lua:74-78 statUp — the USER's stage, and no MIST guard
   return (ctx) => ctx.changeStage(ctx.user, stat, delta, false);
@@ -249,6 +214,17 @@ function statusSide(status: string, chance: number): EffectRecord["run"] {
       source: ctx.move.id,
     }) as EffectMsgs;
   };
+}
+
+/** Gen 1 drain reads raw wDamage, including overkill, and updates wDamage. */
+function drainHalf(ctx: EffectCtx): void {
+  const heal = Math.max(1, Math.floor((ctx.rawDamage ?? 0) / 2));
+  ctx.battle.lastDamage = heal;
+  ctx.user.mon.hp = Math.min(ctx.user.mon.stats.hp, ctx.user.mon.hp + heal);
+  ctx.battle.drainNext();
+  ctx.say(ctx.move.effect === "DREAM_EATER_EFFECT"
+    ? `${displayName(ctx.target)}'s\ndream was eaten!`
+    : `Sucked health from\n${displayName(ctx.target)}!`);
 }
 
 export const EFFECTS: Record<string, EffectRecord> = {
@@ -297,6 +273,36 @@ export const EFFECTS: Record<string, EffectRecord> = {
   POISON_SIDE_EFFECT1: { kind: "secondary", run: statusSide("PSN", 52) },
   FLINCH_SIDE_EFFECT1: { kind: "secondary", run: flinchSide(26) },
 
+  BURN_SIDE_EFFECT2: { kind: "secondary", run: statusSide("BRN", 77) },
+  FREEZE_SIDE_EFFECT1: { kind: "secondary", run: statusSide("FRZ", 26) },
+  PARALYZE_SIDE_EFFECT1: { kind: "secondary", run: statusSide("PAR", 26) },
+  PARALYZE_SIDE_EFFECT2: { kind: "secondary", run: statusSide("PAR", 77) },
+  POISON_SIDE_EFFECT2: { kind: "secondary", run: statusSide("PSN", 103) },
+  FLINCH_SIDE_EFFECT2: { kind: "secondary", run: flinchSide(77) },
+  ATTACK_DOWN_SIDE_EFFECT: { kind: "secondary", run: statDownSide("attack") },
+  DEFENSE_DOWN_SIDE_EFFECT: { kind: "secondary", run: statDownSide("defense") },
+  SPECIAL_DOWN_SIDE_EFFECT: { kind: "secondary", run: statDownSide("special") },
+  CONFUSION_SIDE_EFFECT: {
+    kind: "secondary",
+    run: (ctx) => {
+      if (ctx.target.confusedTurns || ctx.rng.byte() >= 25) return [];
+      ctx.target.confusedTurns = randRange(ctx.rng, 2, 5);
+      return [`${displayName(ctx.target)}\nbecame confused!`];
+    },
+  },
+  ATTACK_TWICE_EFFECT: { kind: "full", hitCount: () => 2 },
+  TWINEEDLE_EFFECT: {
+    kind: "full",
+    hitCount: () => 2,
+    run: statusSide("PSN", 52),
+  },
+  DRAIN_HP_EFFECT: { kind: "full", afterDamage: drainHalf },
+  DREAM_EATER_EFFECT: {
+    kind: "full",
+    gate: (ctx) => ctx.target.mon.status === "SLP" ? [true] : [false, "But, it failed!"],
+    afterDamage: drainHalf,
+  },
+
   // MoveEffects.lua:482-486 — hitsFrom(:438) draws rand(0..len-1) over the
   // 2/2/2/3/3/3/4/5 table when the move carries no multiHit of its own
   TWO_TO_FIVE_ATTACKS_EFFECT: {
@@ -324,13 +330,6 @@ export const EFFECTS: Record<string, EffectRecord> = {
     },
   },
 };
-
-// The rest of MoveEffects.lua (primary :165-358, secondary :364-392,
-// full :479-731 — sleep/poison/confusion/multi-hit/charge/trapping/thrash/
-// bide/OHKO/drain/explode/hyper-beam/pay-day/swift/rage/teleport/metronome/
-// mirror-move/mimic/transform/substitute/haze/screens/rest/...) is
-// UNPORTED in v1: none of it is reachable from the slice's movesets, and an
-// unregistered id takes the reference's own unknown-effect path.
 
 const warned = new Set<string>();
 

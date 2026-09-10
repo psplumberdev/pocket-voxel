@@ -18,6 +18,7 @@ import { WARP_FADE_OUT } from "../rules/timing.ts";
 import { canMove, occupied, target, type Dir, type Mover, type TilePairs } from "./collision.ts";
 import { defPassable, GameMap, isOutside } from "./map.ts";
 import { NPC } from "./npc.ts";
+import { WildPopulation } from "./wild.ts";
 import { Player } from "./player.ts";
 import { talkScript } from "./mapscripts.ts";
 import { ScriptRunner, type ScriptWorld } from "./script.ts";
@@ -44,6 +45,7 @@ const COMPASS: Record<Dir, "north" | "south" | "east" | "west"> = {
 };
 
 export interface SaveSlice {
+  party?: { hp: number }[];
   flags: Record<string, boolean>;
   inventory: Record<string, number>;
   bagOrder?: string[];
@@ -167,6 +169,7 @@ export class Overworld implements ScriptWorld {
   map!: GameMap;
   player!: Player;
   npcs: NPC[] = [];
+  readonly wild = new WildPopulation();
   entities: Mover[] = [];
   runner: ScriptRunner;
   scriptMoves: ScriptMove[] = [];
@@ -239,6 +242,7 @@ export class Overworld implements ScriptWorld {
     const tileset = this.shell.data.tilesets?.[def.tileset];
     if (!tileset) throw new Error(`unknown tileset ${def.tileset} for ${mapId}`);
     this.map = new GameMap(def, tileset);
+    this.wild.clear();
     // NPC instances persist across connection crossings in the pool (keyed
     // by NPC.id) so nothing snaps back to its spawn point at a seam; warps
     // rebuild from scratch, like the original's per-entry sprite init
@@ -319,6 +323,9 @@ export class Overworld implements ScriptWorld {
     const scripted =
       this.runner.isRunning() || this.scriptMoves.length > 0 || this.emote !== undefined;
     if (!scripted && !this.transitioning) {
+      if (this.shell.save.party?.some(mon => mon.hp > 0)) {
+        this.wild.update(this.shell.data, this.map, this.player, this.entities, this.tilePairs);
+      }
       this.handleInput();
     }
     const stepped = this.player.update();
@@ -400,6 +407,7 @@ export class Overworld implements ScriptWorld {
       if (!this.player.moving && this.player.facing === dir) {
         if (this.checkEdgeExit(dir)) return;
         if (this.checkLedgeHop(dir)) return;
+        if (this.touchWild(dir)) return;
         // boulder pushes: outside the slice
       }
       // Content boundary, standing case: a warp TILE whose destination map
@@ -639,6 +647,7 @@ export class Overworld implements ScriptWorld {
   // Card-key doors and the other hidden-object families remain outside the
   // slice; the PC stays data-driven through field.hiddenExtras.pcTiles.
   interact(): void {
+    if (this.touchWild(this.player.facing)) return;
     const p = this.player;
     const [fx, fy] = p.facingCell();
     let npc = this.npcAtCell(fx, fy);
@@ -987,6 +996,18 @@ export class Overworld implements ScriptWorld {
     );
   }
 
+  private touchWild(dir: Dir): boolean {
+    if (!this.shell.data.partyIcons || !this.shell.save.party?.some(mon => mon.hp > 0)) return false;
+    const [x, y] = target(this.player.cellX, this.player.cellY, dir);
+    const wild = this.wild.atCell(x, y);
+    if (!wild || !canMove(this.map, this.entities, this.player, dir, this.tilePairs).ok) return false;
+    const enc = this.wild.consume(wild);
+    this.encounterCount++;
+    this.lastEncounter = enc;
+    this.shell.pushStubBattle(enc.species, enc.level);
+    return true;
+  }
+
   // OverworldController.lua:3361 onStepComplete — the completed-step
   // land-triggers, in the original's order: warp-entry staleness, the
   // standing-on-warp refresh, arrival/held-collision warps, then the wild
@@ -1024,6 +1045,9 @@ export class Overworld implements ScriptWorld {
         return;
       }
     }
+    // Cooked icon-enabled builds use contact encounters. Legacy/raw packs
+    // without icon assets retain step encounters instead of invisible wilds.
+    if (this.shell.data.partyIcons) return;
     // wild encounters in grass, on water while surfing, or — on indoor maps
     // whose tileset is not FOREST — on EVERY tile (wild_encounters.asm)
     const encDef = this.shell.data.encounters[this.map.id] as EncounterDef | undefined;

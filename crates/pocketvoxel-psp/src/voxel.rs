@@ -18,9 +18,13 @@ use pocketvoxel_core::scene::Scene;
 use pocketvoxel_core::spec::op;
 use psp::sys::{self, IoOpenFlags, IoWhence};
 
-const SAVE_PATH: &[u8] = b"ms0:/PSP/GAME/VOXELMON/save.json\0";
-const SAVE_TMP_PATH: &[u8] = b"ms0:/PSP/GAME/VOXELMON/save.tmp\0";
-const SAVE_BAK_PATH: &[u8] = b"ms0:/PSP/GAME/VOXELMON/save.bak\0";
+// Keep player progress outside the replaceable game installation.
+const SAVE_DIR: &[u8] = b"ms0:/PSP/SAVEDATA/VOXELMON\0";
+const SAVE_PATH: &[u8] = b"ms0:/PSP/SAVEDATA/VOXELMON/save.json\0";
+const SAVE_TMP_PATH: &[u8] = b"ms0:/PSP/SAVEDATA/VOXELMON/save.tmp\0";
+const SAVE_BAK_PATH: &[u8] = b"ms0:/PSP/SAVEDATA/VOXELMON/save.bak\0";
+const LEGACY_SAVE_PATH: &[u8] = b"ms0:/PSP/GAME/VOXELMON/save.json\0";
+const LEGACY_SAVE_BAK_PATH: &[u8] = b"ms0:/PSP/GAME/VOXELMON/save.bak\0";
 const SAVE_MAX: usize = 128 * 1024;
 
 // Symbols the vendored libquickjs-sys omits (provided by the linked QuickJS
@@ -303,7 +307,13 @@ unsafe extern "C" fn js_save_load(
         sys::sceIoClose(fd);
         if got == len as i32 { Some(bytes) } else { None }
     }
-    let Some(bytes) = read(SAVE_PATH).or_else(|| read(SAVE_BAK_PATH)) else { return JS_UNDEFINED; };
+    // Prefer the new location. Preserve old files; the next successful in-game
+    // save migrates progress without risking deletion during an upgrade.
+    let Some(bytes) = read(SAVE_PATH)
+        .or_else(|| read(SAVE_BAK_PATH))
+        .or_else(|| read(LEGACY_SAVE_PATH))
+        .or_else(|| read(LEGACY_SAVE_BAK_PATH))
+    else { return JS_UNDEFINED; };
     JS_NewStringLen(ctx, bytes.as_ptr(), bytes.len())
 }
 
@@ -322,6 +332,10 @@ unsafe extern "C" fn js_save_write(
         if !s.is_null() { JS_FreeCString(ctx, s); }
         return JS_NewBool(ctx, false);
     }
+    // Existing-directory errors are harmless; opening the temporary file
+    // below reports an actual inaccessible/missing destination as a failure.
+    sys::sceIoMkdir(b"ms0:/PSP/SAVEDATA\0".as_ptr(), 0o777);
+    sys::sceIoMkdir(SAVE_DIR.as_ptr(), 0o777);
     let fd = sys::sceIoOpen(
         SAVE_TMP_PATH.as_ptr(),
         IoOpenFlags::CREAT | IoOpenFlags::WR_ONLY | IoOpenFlags::TRUNC,

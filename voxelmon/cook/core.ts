@@ -57,6 +57,7 @@ export const DEFAULT_MAPS: readonly string[] = [
   // PSP-1000, so adding these maps costs storage rather than resident RAM.
   "ROUTE_2",
   "ROUTE_2_GATE",
+  "ROUTE_2_TRADE_HOUSE",
   "VIRIDIAN_FOREST_SOUTH_GATE",
   "VIRIDIAN_FOREST",
   "VIRIDIAN_FOREST_NORTH_GATE",
@@ -97,10 +98,11 @@ export const DEFAULT_MAPS: readonly string[] = [
   "VERMILION_OLD_ROD_HOUSE",
   "VERMILION_PIDGEY_HOUSE",
   "VERMILION_TRADE_HOUSE",
-  // East Vermilion and both mouths of Diglett's Cave. Route 11's east gate
-  // remains the chapter boundary; the full tunnel loop back to Route 2 is
-  // playable and carries its native cave encounters.
+  // East Vermilion, both floors of its gate, and the complete Diglett's
+  // Cave loop back to Route 2. Route 12 remains outside this chapter.
   "ROUTE_11",
+  "ROUTE_11_GATE_1F",
+  "ROUTE_11_GATE_2F",
   "DIGLETTS_CAVE_ROUTE_11",
   "DIGLETTS_CAVE",
   "DIGLETTS_CAVE_ROUTE_2",
@@ -457,6 +459,15 @@ export function cookVoxelPak(
     geometry = null;
   }
 
+  // Append menu icons after every existing page. Terrain page indices,
+  // geometry, textures and palettes remain unchanged by visible wilds.
+  const partyIcons: Record<string, number> = {};
+  for (const key of Object.keys(gen.gfx).filter(key => key.startsWith("icons/party_")).sort()) {
+    partyIcons[key.slice("icons/party_".length)] = pages.length;
+    pages.push(buildSpritePage(gen, key));
+    pageOwners.push({ kind: ATLAS_KIND.sprites });
+  }
+
   if (colour) {
     while (colour.pagePal.length < pages.length) colour.pagePal.push(COLOR_PAL_NONE);
   }
@@ -464,6 +475,7 @@ export function cookVoxelPak(
   // --- GAME + CMAP + pack ------------------------------------------------
   const atlas: AtlasIndex = {
     sprites: spriteIndex,
+    partyIcons,
     picFront: frontIndex,
     picBack: backIndex,
     emotePage,

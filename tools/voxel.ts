@@ -101,7 +101,9 @@ async function run(
 
 /** import (only when gen/ is absent) + cook + a headless run per tape. */
 async function preparePakAndTrace(): Promise<number> {
-  if (!(await Bun.file(`${ROOT}dist/voxelmon/gen/maps.json`).exists())) {
+  const gfxFile = Bun.file(`${ROOT}dist/voxelmon/gen/gfx.json`);
+  const hasIcons = await gfxFile.exists() && (await gfxFile.json())["icons/party_MON"];
+  if (!(await Bun.file(`${ROOT}dist/voxelmon/gen/maps.json`).exists()) || !hasIcons) {
     const rc = await run(["bun", "tools/voxel.ts", "import"]);
     if (rc !== 0) return rc;
   }
@@ -113,6 +115,7 @@ async function preparePakAndTrace(): Promise<number> {
     const rc = await run([
       "bun",
       "voxelmon/game/sim/cli.ts",
+      "--legacy-encounters",
       "--tape",
       `voxelmon/tapes/${tape}.tape`,
       "--out",
