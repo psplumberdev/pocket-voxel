@@ -161,7 +161,9 @@ submodule update. The publication branch pins it explicitly.
 The source includes trainer parties and payouts, expanded early-game story
 handlers and encounters, inventory/economy handling, save-state serialization,
 and a PSP file bridge for saves. PSP saves use a bounded 128 KiB JSON payload
-with temporary and backup files in `ms0:/PSP/GAME/VOXELMON/`. Gameplay schema
+with temporary and backup files in `ms0:/PSP/SAVEDATA/VOXELMON/`.
+Legacy saves in the game folder are read for migration; saving writes to the
+separate SAVEDATA directory. Gameplay schema
 validation remains in the guest. These mechanisms do not by themselves prove
 that every story path or storage-failure case is complete.
 

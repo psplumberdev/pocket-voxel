@@ -1,5 +1,53 @@
 <h1><img src="./web/favicon.svg" width="40" height="40" alt="" align="absmiddle" /> Pocket Voxel</h1>
 
+## September 12, 2026: Pokémon Voxel progress
+
+<p align="center">
+  <img src="docs/shots/psp1000voxelproof.jpeg" width="820" alt="User-provided photo of Pokémon Voxel running on a PSP, showing a cave scene with the player and visible Pokémon." />
+</p>
+
+<p align="center"><em>PSP-1000 gameplay photo supplied by psplumberdev for this progress update. It shows the game running on the handheld; the exact build revision and frame rate were not recorded with the photo.</em></p>
+
+**Campaign: development checkpoint through Erika, the fourth gym leader.**
+The expanded local package contains 116 maps. Work covers Cerulean, Vermilion
+and Lt. Surge, Cut, Routes 9/10, Rock Tunnel, Lavender, Routes 8/7 and the
+Underground Path into Celadon. Surge and Erika use ROM parties and award badges
+and TMs. Center/blackout exits, Underground Path exits and trainer detection
+have been corrected. This is implemented progression, not a completed full-game
+hardware playthrough.
+
+**Battles:** wild and trainer battles, catching, fainting/experience, party
+selection, trainer parties and payouts are present. Recent work expands status
+moves and TM/HM teaching and preserves the selected active party member between
+trainer opponents. Wild Pokémon are visible in the overworld, and the party
+follower has directional sprites. Battle coverage is still incomplete: unhandled
+move effects currently warn and fall back to plain damage.
+
+**PSP-1000 changes:** geometry and textures stream from storage, QuickJS bytecode
+is compiled on the PC, terrain pages are prepared during cooking, and Select
+shows live memory diagnostics. Start and map transitions refresh visible assets.
+Saves now live separately in `PSP/SAVEDATA/VOXELMON/`; see
+[save/update instructions](#psp-saves-and-updates).
+
+**What remains:**
+
+- Extend and verify the campaign beyond Erika, including the remaining gyms and
+  endgame; Saffron is outside the current documented chapter.
+- Finish unsupported move effects and broaden battle checks across status,
+  items, catching, party changes and trainer sequences.
+- Play through the current chapter on PSP-1000, including battles, dense maps,
+  transitions and save/reload; measure sustained frame rate and memory headroom.
+- Revalidate rendering/parity captures and other platform builds. Resolve the
+  external-profile fixture mismatch and generated web/trace prerequisites before
+  claiming a clean full-suite result.
+
+The September 12 publication checks recorded **165 Bun tests passing, 2 skipped,
+and 56 Rust core tests passing**. These are the prior checkpoint's results, not
+new tests run for this documentation update. See
+[engineering findings](docs/PSP1000-FINDINGS.md) for scope and known limitations.
+
+### Earlier PSP-2000 captures
+
 <p align="center">
   <img src="docs/shots/psp-pallet-town.png" width="720" alt="Pallet Town as a voxel diorama on a real PSP — carved trees, gabled roofs, an NPC and the player between the houses." />
 </p>
