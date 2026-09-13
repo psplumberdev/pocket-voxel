@@ -368,6 +368,18 @@ impl Renderer {
         }
     }
 
+    /// Free transient geometry and palette storage during a forced reload.
+    ///
+    /// # Safety
+    /// The GE must be idle; the preceding display list borrows this pool.
+    pub unsafe fn release_transients(&mut self) {
+        self.pool = FramePool::new();
+        self.tinted_clut.clear();
+        self.raw_clut.clear();
+        self.bound = None;
+        self.reset_pool();
+    }
+
     /// Record one DrawList into the open display list. Draw order is the
     /// list's order — the core already ordered it (docs/VOXEL.md §3).
     ///
@@ -1123,6 +1135,20 @@ impl Renderer {
             .iter()
             .filter(|item| matches!(item, Item::OverlayRect { .. }))
             .count();
+        self.overlay_rects(n, list.items.iter().filter_map(|item| match item {
+            Item::OverlayRect { x, y, w, h, abgr } => Some((*x, *y, *w, *h, *abgr)),
+            _ => None,
+        }));
+    }
+
+    /// Native diagnostics use compact rectangles instead of expanding the
+    /// game's large 3D Item enum for thousands of font runs every frame.
+    pub unsafe fn render_debug_overlay(&mut self, rects: &[pocketvoxel_core::scene::UiOverlayRect]) {
+        self.overlay_rects(rects.len(), rects.iter().map(|r| (r.x, r.y, r.w, r.h, r.abgr)));
+        sys::sceGuDisable(GuState::Blend);
+    }
+
+    unsafe fn overlay_rects(&mut self, n: usize, rects: impl Iterator<Item = (i32, i32, i32, i32, u32)>) {
         if n == 0 {
             return;
         }
@@ -1135,21 +1161,18 @@ impl Renderer {
         let bytes = n * 2 * core::mem::size_of::<Vert2dC>();
         let dst = self.pool.alloc(bytes) as *mut Vert2dC;
         let mut at = 0usize;
-        for item in &list.items {
-            let Item::OverlayRect { x, y, w, h, abgr } = item else {
-                continue;
-            };
+        for (x, y, w, h, abgr) in rects {
             dst.add(at).write(Vert2dC {
-                abgr: *abgr,
-                x: *x as i16,
-                y: *y as i16,
+                abgr,
+                x: x as i16,
+                y: y as i16,
                 z: 0,
                 pad: 0,
             });
             dst.add(at + 1).write(Vert2dC {
-                abgr: *abgr,
-                x: x.saturating_add(*w) as i16,
-                y: y.saturating_add(*h) as i16,
+                abgr,
+                x: x.saturating_add(w) as i16,
+                y: y.saturating_add(h) as i16,
                 z: 0,
                 pad: 0,
             });

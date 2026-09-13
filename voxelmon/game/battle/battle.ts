@@ -140,6 +140,14 @@ export class WildBattle implements EffectBattle {
   menuIndex = 1;
   moveIndex = 1;
   moveSwapIndex: number | null = null;
+  private mimicChoice?: { moves: MoveSlot[]; choose: (index: number) => void };
+  get selectionMoves(): MoveSlot[] { return this.mimicChoice?.moves ?? this.player.curMoves; }
+  chooseMimic(moves: MoveSlot[], choose: (index: number) => void): void {
+    this.actNext(() => {
+      this.mimicChoice = { moves: moves.map(m => ({ ...m })), choose };
+      this.moveIndex = 1; this.moveSwapIndex = null; this.phase = "moveSelect";
+    });
+  }
   frame = 0;
   turnCount = 0;
   runAttempts = 0;
@@ -614,6 +622,20 @@ export class WildBattle implements EffectBattle {
     this.afterQueue = "menu";
   }
 
+  /** A trainer replacement is the same fight: keep the active battler,
+   * including stages and volatile effects, without another player send-out. */
+  enterNextOpponent(previous: WildBattle): void {
+    this.player = previous.player;
+    this.leveledUp = previous.leveledUp;
+    this.introBalls = false;
+    this.showPlayerBack = false;
+    this.act(() => this.audioCues.push(`cry:${this.enemy.mon.species}`));
+    this.say(`${this.opponentName} sent\nout ${this.enemy.name}!`);
+    if (this.player.mon.hp > 0) this.markParticipant();
+    this.phase = "messages";
+    this.afterQueue = "menu";
+  }
+
   /** :1353-1363 sendOutText — the shout scales with enemy HP remaining. */
   sendOutText(name: string): string {
     const e = this.enemy.mon;
@@ -671,6 +693,10 @@ export class WildBattle implements EffectBattle {
       this.clearTurnFlinches();
       // recharge/Rage/thrash/charge would skip DisplayBattleMenu
       // (:1867-1873); none is reachable from the v1 effect set
+      if (this.player.bideTurns !== undefined) {
+        this.resolveTurn({ id: "BIDE", pp: 1 });
+        return;
+      }
       const col0 = (this.menuIndex - 1) % 2;
       const row0 = Math.floor((this.menuIndex - 1) / 2);
       let col = col0;
@@ -706,7 +732,16 @@ export class WildBattle implements EffectBattle {
     }
 
     if (this.phase === "moveSelect") {
-      const moves = this.player.curMoves;
+      const moves = this.selectionMoves;
+      if (this.mimicChoice) {
+        if (input.wasPressed("up")) this.moveIndex = this.moveIndex > 1 ? this.moveIndex - 1 : moves.length;
+        else if (input.wasPressed("down")) this.moveIndex = this.moveIndex < moves.length ? this.moveIndex + 1 : 1;
+        else if (input.wasPressed("a")) {
+          const choice = this.mimicChoice; this.mimicChoice = undefined;
+          this.phase = "messages"; this.nextInsert = 0; choice.choose(this.moveIndex - 1);
+        }
+        return;
+      }
       if (input.wasPressed("up")) {
         this.moveIndex = this.moveIndex > 1 ? this.moveIndex - 1 : moves.length;
       } else if (input.wasPressed("down")) {
@@ -913,7 +948,19 @@ export class WildBattle implements EffectBattle {
       target.trappingTurns !== undefined ? Math.max(1, target.trappingTurns) : undefined;
 
     if (!this.statusInterrupt(user, target)) {
-      this.performMove(user, target, action, false);
+      if (user.bideTurns !== undefined) {
+        user.bideTurns -= 1;
+        if (user.bideTurns > 0) this.sayNext(`${displayName(user)}\nis storing energy!`);
+        else {
+          const damage = (user.bideDamage ?? 0) * 2;
+          user.bideTurns = user.bideDamage = undefined;
+          this.sayNext(`${displayName(user)}\nunleashed energy!`);
+          if (damage > 0) {
+            this.applyDamage(target, damage);
+            if (target.mon.hp <= 0) this.onFaint(target);
+          } else this.sayNext("But, it failed!");
+        }
+      } else this.performMove(user, target, action, false);
     }
     this.actNext(() => this.syncShownStatus());
     if (this.residualAfterMove()) {
@@ -1101,6 +1148,7 @@ export class WildBattle implements EffectBattle {
     }
     const dealt = Math.min(dmg, target.mon.hp);
     target.mon.hp -= dealt;
+    if (target.bideTurns !== undefined) target.bideDamage = (target.bideDamage ?? 0) + dealt;
     if (dealt > 0) this.drainNext(target, target.mon.hp);
     return dealt;
   }

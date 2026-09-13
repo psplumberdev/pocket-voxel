@@ -36,11 +36,15 @@ export interface EffectRecord {
 /** What the pipeline needs from the battle (BattleState methods). */
 export interface EffectBattle {
   data: VoxelmonData;
+  kind?: "wild" | "trainer";
+  result?: "win" | "lose" | "run" | "caught" | null;
+  afterQueue?: "menu" | "finish";
   rng: Rng;
   ruleset: Ruleset;
   chart: TypeChart;
   /** wDamage — shared by both sides, read by Counter (EffectRegistry.lua:203). */
   lastDamage: number;
+  chooseMimic?: (moves: { id: string; pp: number }[], choose: (index: number) => void) => void;
   moveAnimRow: AnimRowRef | null;
   sayNext(text: string): void;
   waitNext(frames: number): void;
@@ -330,6 +334,127 @@ export const EFFECTS: Record<string, EffectRecord> = {
     },
   },
 };
+
+// The full ROM move table includes status moves outside the original demo.
+for (const [name, stat, delta] of [
+  ["ATTACK_UP1", "attack", 1], ["ATTACK_UP2", "attack", 2],
+  ["DEFENSE_UP2", "defense", 2], ["SPEED_UP2", "speed", 2],
+  ["SPECIAL_UP1", "special", 1], ["SPECIAL_UP2", "special", 2],
+  ["EVASION_UP1", "evasion", 1],
+] as const) EFFECTS[`${name}_EFFECT`] = { kind: "primary", run: statUp(stat, delta) };
+EFFECTS.DEFENSE_DOWN2_EFFECT = { kind: "primary", accuracyChecked: true, run: statDown("defense", 2) };
+for (const [effect, status] of [["SLEEP", "SLP"], ["POISON", "PSN"], ["PARALYZE", "PAR"]]) {
+  EFFECTS[`${effect}_EFFECT`] = { kind: "primary", accuracyChecked: true, run: ctx => {
+    const msgs = inflictStatus(ctx.battle, ctx.target, status, {
+      toxic: ctx.move.id === "TOXIC", moveType: ctx.move.type, source: ctx.move.id,
+    });
+    return msgs.length ? msgs : ["But, it failed!"];
+  } };
+}
+EFFECTS.CONFUSION_EFFECT = { kind: "primary", accuracyChecked: true, run: ctx => {
+  if (ctx.target.confusedTurns || ctx.target.substituteHP !== undefined) return ["But, it failed!"];
+  ctx.target.confusedTurns = randRange(ctx.rng, 2, 5);
+  return [`${displayName(ctx.target)}\nbecame confused!`];
+} };
+EFFECTS.HEAL_EFFECT = { kind: "primary", run: ctx => {
+  const b = ctx.user, mon = b.mon;
+  if (mon.hp === mon.stats.hp) return ["But, it failed!"];
+  if (ctx.move.id === "REST") {
+    mon.hp = mon.stats.hp; mon.status = "SLP"; b.sleepTurns = 2; b.toxicCounter = undefined;
+    return [`${displayName(b)}\nstarted sleeping!`];
+  }
+  mon.hp = Math.min(mon.stats.hp, mon.hp + Math.floor(mon.stats.hp / 2));
+  return [`${displayName(b)}\nregained health!`];
+} };
+for (const [effect, field, message] of [
+  ["REFLECT", "reflect", "gained armor!"],
+  ["LIGHT_SCREEN", "lightScreen", "is protected from\nspecial attacks!"],
+  ["MIST", "mist", "is shrouded in mist!"],
+] as const) EFFECTS[`${effect}_EFFECT`] = { kind: "primary", run: ctx => {
+  if (ctx.user[field]) return ["But, it failed!"];
+  ctx.user[field] = true; return [`${displayName(ctx.user)}\n${message}`];
+} };
+EFFECTS.HAZE_EFFECT = { kind: "primary", run: ctx => {
+  for (const b of [ctx.user, ctx.target]) {
+    b.stages = {}; b.confusedTurns = b.toxicCounter = b.disabledSlot = b.disabledTurns = undefined;
+    b.leechSeeded = b.reflect = b.lightScreen = b.mist = b.focusEnergy = b.xAccuracy = undefined;
+    b.hazeStatReset = true;
+  }
+  if (ctx.target.mon.status === "SLP" || ctx.target.mon.status === "FRZ") ctx.target.skipMove = true;
+  ctx.target.mon.status = null;
+  return ["All STATUS changes\nare eliminated!"];
+} };
+EFFECTS.SUBSTITUTE_EFFECT = { kind: "primary", run: ctx => {
+  const b = ctx.user, cost = Math.floor(b.mon.stats.hp / 4);
+  if (b.substituteHP !== undefined || b.mon.hp < cost) return Object.assign(["But, it failed!"], { failed: true });
+  b.mon.hp -= cost; b.substituteHP = cost + 1;
+  return ["It created a\nSUBSTITUTE!"];
+} };
+EFFECTS.CONVERSION_EFFECT = { kind: "primary", run: ctx => {
+  if (ctx.target.invulnerable) return ["But, it failed!"];
+  ctx.user.curTypes = [...ctx.target.curTypes];
+  return [`Converted type to\n${ctx.target.name}'s!`];
+} };
+EFFECTS.TRANSFORM_EFFECT = { kind: "primary", run: ctx => {
+  const u = ctx.user, t = ctx.target;
+  u.curStats = { ...t.curStats, hp: u.mon.stats.hp };
+  u.curTypes = [...t.curTypes]; u.stages = { ...t.stages };
+  u.curMoves = t.curMoves.map(m => ({ id: m.id, pp: 5 }));
+  u.transformedSpecies = t.transformedSpecies ?? t.mon.species;
+  return [`${displayName(u)}\ntransformed into\n${t.name}!`];
+} };
+EFFECTS.DISABLE_EFFECT = { kind: "primary", accuracyChecked: true, run: ctx => {
+  const t = ctx.target;
+  const usable = t.curMoves.map((m, i) => m.pp > 0 ? i + 1 : 0).filter(Boolean);
+  if (t.disabledSlot !== undefined || !usable.length) return ["But, it failed!"];
+  t.disabledSlot = usable[randRange(ctx.rng, 0, usable.length - 1)];
+  t.disabledTurns = randRange(ctx.rng, 1, 8);
+  return [`${ctx.data.moves[t.curMoves[t.disabledSlot! - 1].id].name} was\ndisabled!`];
+} };
+EFFECTS.SPLASH_EFFECT = { kind: "primary", run: () => ["No effect!"] };
+EFFECTS.MIMIC_EFFECT = { kind: "primary", accuracyChecked: true, run: ctx => {
+  const choices = ctx.target.curMoves;
+  const slot = ctx.user.curMoves.findIndex(m => m.id === "MIMIC");
+  if (!choices.length || slot < 0) return ["But, it failed!"];
+  const copy = (index: number) => {
+    const id = choices[index].id;
+    ctx.user.curMoves = ctx.user.curMoves.map((m, i) => i === slot ? { id, pp: m.pp } : m);
+    ctx.say(`${displayName(ctx.user)}\nlearned ${ctx.data.moves[id].name}!`);
+  };
+  if (ctx.user.isPlayer && ctx.battle.chooseMimic) ctx.battle.chooseMimic(choices, copy);
+  else copy(randRange(ctx.rng, 0, choices.length - 1));
+  return [];
+} };
+EFFECTS.METRONOME_EFFECT = { kind: "full", callsMove: ctx => {
+  const ids = Object.keys(ctx.data.moves).filter(id => id !== "METRONOME" && id !== "STRUGGLE" && id !== "MIRROR_MOVE");
+  return ids[randRange(ctx.rng, 0, ids.length - 1)] ?? null;
+} };
+EFFECTS.MIRROR_MOVE_EFFECT = { kind: "full", callsMove: ctx => {
+  const id = ctx.target.lastMove;
+  if (!id || id === "MIRROR_MOVE") { ctx.say("But, it failed!"); return null; }
+  return id;
+} };
+
+EFFECTS.BIDE_EFFECT = { kind: "full", perform: ctx => {
+  ctx.user.bideTurns = randRange(ctx.rng, 2, 3); ctx.user.bideDamage = 0;
+  ctx.battle.cancelMoveAnim(); ctx.say(`${displayName(ctx.user)}\nis storing energy!`);
+} };
+EFFECTS.SWITCH_AND_TELEPORT_EFFECT = { kind: "full", perform: ctx => {
+  const u = ctx.user, t = ctx.target;
+  if (ctx.battle.kind !== "trainer" && (u.mon.level >= t.mon.level ||
+      randRange(ctx.rng, 0, u.mon.level + t.mon.level) >= Math.floor(t.mon.level / 4))) {
+    ctx.say(ctx.move.id === "TELEPORT" ? `${displayName(u)}\nran from battle!` : `${displayName(t)}\nwas driven away!`);
+    ctx.battle.result = "run"; ctx.battle.afterQueue = "finish";
+  } else {
+    ctx.battle.cancelMoveAnim(); ctx.say("But, it failed!");
+  }
+} };
+EFFECTS.SPECIAL_DAMAGE_EFFECT = { kind: "full", chooseDamage: ctx => {
+  const id = ctx.move.id;
+  const damage = id === "SONICBOOM" ? 20 : id === "DRAGON_RAGE" ? 40 :
+    id === "PSYWAVE" ? randRange(ctx.rng, 1, Math.max(1, Math.floor(ctx.user.mon.level * 1.5) - 1)) : ctx.user.mon.level;
+  return [damage, { crit: false, typeMult: 10 }];
+} };
 
 const warned = new Set<string>();
 

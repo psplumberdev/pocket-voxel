@@ -14,6 +14,7 @@ import {
   buildPalettes,
   buildPicPage,
   buildSpritePage,
+  buildFollowerPage,
   buildTerrainPage,
   buildUiPage,
   paletteBase,
@@ -117,6 +118,59 @@ export const DEFAULT_MAPS: readonly string[] = [
   "SS_ANNE_BOW",
   "SS_ANNE_KITCHEN",
   "SS_ANNE_CAPTAINS_ROOM",
+  // Streamed campaign through Rock Tunnel, Lavender, and Erika.
+  "VERMILION_GYM",
+  "POKEMON_FAN_CLUB",
+  "VIRIDIAN_NICKNAME_HOUSE",
+  "VIRIDIAN_SCHOOL_HOUSE",
+  "MUSEUM_1F",
+  "MUSEUM_2F",
+  "PEWTER_NIDORAN_HOUSE",
+  "PEWTER_SPEECH_HOUSE",
+  "CERULEAN_TRADE_HOUSE",
+  "CERULEAN_BADGE_HOUSE",
+  "BIKE_SHOP",
+  "DAYCARE",
+  "ROUTE_9",
+  "ROUTE_10",
+  "ROCK_TUNNEL_1F",
+  "ROCK_TUNNEL_B1F",
+  "ROCK_TUNNEL_POKECENTER",
+  "LAVENDER_TOWN",
+  "LAVENDER_POKECENTER",
+  "LAVENDER_MART",
+  "LAVENDER_CUBONE_HOUSE",
+  "MR_FUJIS_HOUSE",
+  "NAME_RATERS_HOUSE",
+  "POKEMON_TOWER_1F",
+  "ROUTE_8",
+  "ROUTE_8_GATE",
+  "UNDERGROUND_PATH_ROUTE_8",
+  "UNDERGROUND_PATH_WEST_EAST",
+  "UNDERGROUND_PATH_ROUTE_7",
+  "ROUTE_7",
+  "ROUTE_7_GATE",
+  "CELADON_CITY",
+  "CELADON_POKECENTER",
+  "CELADON_GYM",
+  "CELADON_CHIEF_HOUSE",
+  "CELADON_DINER",
+  "CELADON_HOTEL",
+  "CELADON_MANSION_1F",
+  "CELADON_MANSION_2F",
+  "CELADON_MANSION_3F",
+  "CELADON_MANSION_ROOF",
+  "CELADON_MANSION_ROOF_HOUSE",
+  "CELADON_MART_1F",
+  "CELADON_MART_2F",
+  "CELADON_MART_3F",
+  "CELADON_MART_4F",
+  "CELADON_MART_5F",
+  "CELADON_MART_ROOF",
+  "CELADON_MART_ELEVATOR",
+  "GAME_CORNER",
+  "GAME_CORNER_PRIZE_ROOM",
+
 ];
 
 export interface CookOptions {
@@ -180,19 +234,9 @@ export function cookVoxelPak(
   });
   const cookedMaps = new Set(mapNames);
 
-  if (redpp) {
-    const needExceptions = Redpp.mapExceptions([...mapNames]);
-    if (needExceptions.length > 0) {
-      throw new Error(
-        `RED++ color: ${needExceptions.join(", ")} need per-map tile-id ` +
-          `exceptions, which one shared terrain page cannot carry`,
-      );
-    }
-  }
-
   // --- atlases -----------------------------------------------------------
   const terrainPage = 0;
-  const terrain = buildTerrainPage(gen, maps.map((m) => m.tileset), redpp);
+  const terrain = buildTerrainPage(gen, maps.slice(0, 1).map((m) => m.tileset), redpp);
   const pages: PageDef[] = [terrain.page];
   const pageOwners: PageOwner[] = [{ kind: terrain.page.kind }];
   const uiPage = pages.length;
@@ -261,6 +305,21 @@ export function cookVoxelPak(
   }
   onProgress?.({ phase: "atlas", completed: 1, total: 1, label: "atlases" });
 
+  // Each tileset (or map-specific color variant) gets a small PC-baked page.
+  const exceptions = new Set(Redpp.mapExceptions([...mapNames]));
+  const terrainKey = (map: GameMap) => exceptions.has(map.id) ? map.id : map.tileset.id;
+  const localTerrain = new Map<string, { layout: ReturnType<typeof buildTerrainPage>; page: number }>();
+  for (const map of maps) {
+    const key = terrainKey(map);
+    if (localTerrain.has(key)) continue;
+    const layout = buildTerrainPage(gen, [map.tileset], redpp, exceptions.has(map.id) ? map.id : null);
+    layout.page.name = `terrain/${key}`;
+    localTerrain.set(key, { layout, page: pages.length });
+    pages.push(layout.page);
+    pageOwners.push({ kind: ATLAS_KIND.terrain });
+    for (const sheet of layout.bakedSheets) terrain.bakedSheets.add(sheet);
+  }
+
   // Colour planning depends on atlas ownership and map metadata, not geometry.
   // Doing it before the map loop lets each MapGeometry be ground-baked and
   // released immediately instead of retaining all maps at once.
@@ -286,6 +345,10 @@ export function cookVoxelPak(
   const mapStats: CookArtifacts["mapStats"] = [];
   const packedMaps: PakInput["maps"] = [];
   let bakedChunks = 0;
+  // PC-built, ready-to-stream terrain pages. Maps sharing a tileset also
+  // share its small page, so connection seams never duplicate that RAM.
+  // Keep page 0 as the legacy fallback; storage size is not a RAM budget.
+  const mapTerrainPages = new Map<number, number>();
 
   for (let mi = 0; mi < maps.length; mi++) {
     const map = maps[mi];
@@ -328,13 +391,16 @@ export function cookVoxelPak(
     // Drop the large grids before ground baking this map.
     analysis = null;
 
+    const local = localTerrain.get(terrainKey(map))!;
+    const mapTerrain = local.layout;
+    mapTerrainPages.set(map.def.index, local.page);
     const uvt: UvTransform = {
-      baseX: terrain.baseX.get(`${sheetKey(map)}#${map.tileset.id}`) ??
-        terrain.baseX.get(sheetKey(map)) ?? 0,
-      baseY: terrain.baseY.get(`${sheetKey(map)}#${map.tileset.id}`) ??
-        terrain.baseY.get(sheetKey(map)) ?? 0,
-      pageW: terrain.page.w,
-      pageH: terrain.page.h,
+      baseX: mapTerrain.baseX.get(`${sheetKey(map)}#${map.tileset.id}`) ??
+        mapTerrain.baseX.get(sheetKey(map)) ?? 0,
+      baseY: mapTerrain.baseY.get(`${sheetKey(map)}#${map.tileset.id}`) ??
+        mapTerrain.baseY.get(sheetKey(map)) ?? 0,
+      pageW: mapTerrain.page.w,
+      pageH: mapTerrain.page.h,
     };
     const packed = packMap(geometry, uvt);
     const verts = packed.chunks.reduce(
@@ -364,7 +430,7 @@ export function cookVoxelPak(
     const canvases = bakeGround(
       packed.chunks,
       geometry,
-      terrain.page,
+      mapTerrain.page,
       uvt,
       transparentIdx,
       clearIndex,
@@ -388,9 +454,9 @@ export function cookVoxelPak(
       const folded = foldFacades(
         keep.verts,
         fullCanvas,
-        terrain.page.frames[0],
-        terrain.page.w,
-        terrain.page.h,
+        mapTerrain.page.frames[0],
+        mapTerrain.page.w,
+        mapTerrain.page.h,
         transparentIdx,
       );
       const keptVerts = folded.keep;
@@ -468,6 +534,19 @@ export function cookVoxelPak(
     pageOwners.push({ kind: ATLAS_KIND.sprites });
   }
 
+  const followerSprites: Record<string, number> = {};
+  const followerPages: Record<string, number> = {};
+  for (const [id, def] of Object.entries(gen.pokemon)) {
+    const icon = def.partyIcon as string | undefined;
+    if (!icon || partyIcons[icon] === undefined) continue;
+    if (followerPages[icon] === undefined) {
+      followerPages[icon] = pages.length;
+      pages.push(buildFollowerPage(gen, icon));
+      pageOwners.push({ kind: ATLAS_KIND.sprites });
+    }
+    followerSprites[id] = followerPages[icon];
+  }
+
   if (colour) {
     while (colour.pagePal.length < pages.length) colour.pagePal.push(COLOR_PAL_NONE);
   }
@@ -476,6 +555,7 @@ export function cookVoxelPak(
   const atlas: AtlasIndex = {
     sprites: spriteIndex,
     partyIcons,
+    followerSprites,
     picFront: frontIndex,
     picBack: backIndex,
     emotePage,
@@ -505,9 +585,15 @@ export function cookVoxelPak(
       (treeLod ? VXPK_META_FLAG_TREE_LOD : 0) |
       (treeCoarse ? VXPK_META_FLAG_TREE_COARSE : 0) |
       (bakedChunks > 0 ? VXPK_META_FLAG_GROUND_BAKE : 0),
-    colour: colour
-      ? { maps: colour.maps, pagePal: colour.pagePal, flags: colour.flags }
-      : undefined,
+    colour: {
+      maps: maps.map((map) => ({
+        mapId: map.def.index,
+        worldPal: colour?.maps.find((entry) => entry.mapId === map.def.index)?.worldPal ?? COLOR_PAL_NONE,
+        terrainPage: mapTerrainPages.get(map.def.index)!,
+      })),
+      pagePal: colour?.pagePal ?? pages.map(() => COLOR_PAL_NONE),
+      flags: colour?.flags ?? 0,
+    },
   });
   onProgress?.({ phase: "pack", completed: 1, total: 1, label: "vxpk" });
 

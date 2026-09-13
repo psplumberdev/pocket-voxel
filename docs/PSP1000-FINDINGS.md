@@ -1,6 +1,30 @@
 # Pocket Voxel on PSP-1000: source and engineering findings
 
-Publication checkpoint: September 6, 2026.
+Publication checkpoint: September 12, 2026.
+
+## September 12 progress checkpoint
+
+This source checkpoint adds a party follower with directional sprites, visible
+wild encounters, expanded status-move handling and TM/HM teaching. Trainer
+battles preserve the selected active party member between opponents. Campaign
+work includes Cerulean fixes and routes through Lt. Surge and Erika, Cut,
+trainer detection, gym rewards, and corrected Center/Underground Path exits.
+PSP work adds live memory diagnostics and explicit asset reloads, alongside
+PC-prepared terrain pages and streaming cache updates described below.
+
+Fresh publication checks: **165 Bun tests passed, 2 skipped, 0 failed** across
+the Cerulean, Erika, follower, PSP frame, status moves, streaming, rules and
+wild encounter suites; **56 Rust core tests passed**. The skipped tests need
+LuaJIT. Gameplay checks used locally generated data, which is not published.
+These checks do not establish a full campaign playthrough or physical PSP
+acceptance. Older build and validation results below retain their original scope.
+
+The submodule URL points to the publication fork so recursive checkouts can
+retrieve the pending PocketJS allocator diagnostics dependency. Upstream
+PocketJS remains credited below. ROMs, cooked packages, backups and local saves
+are excluded. The checked-in follower sprite data is produced from a generated
+reference atlas; the optional conversion tool expects that local atlas at
+`output/imagegen/party-directions.png` and is not needed for normal builds.
 
 Pocket Voxel runs TypeScript gameplay in QuickJS and renders a retained voxel
 scene through Rust and the PSP Graphics Engine. This checkpoint changes how
@@ -11,6 +35,91 @@ build machine. It also includes the accumulated gameplay and cooker fixes.
 This report describes mechanisms present in the source. It does not establish
 a new measured frame rate, a complete playthrough, or hardware certification.
 The README's existing PSP-2000 pictures belong to an earlier revision.
+
+## September 10 campaign expansion through Erika
+
+The package now contains 116 maps (206,252,768 bytes), including Vermilion Gym,
+Route 9/10, both Rock Tunnel floors, Lavender, Route 8/7 and their Underground
+Path, Celadon Gym, department store floors, mansion and town interiors.
+Geometry and textures still stream through the same current-map caches; new
+maps add disk payloads and catalog entries rather than loading every map at once.
+
+Blackouts validate the saved Center checkpoint and restore its physical outdoor
+exit. LAST_MAP exits use matching outdoor backlinks, fixing wrong-side exits
+from both Underground Paths and the stale Diglett exit after a blackout.
+Trainer sight now reads the ROM's per-map trainer headers, including Route 6.
+Zero-range trainers remain talk-only. Canonical and older save defeat flags
+both suppress repeat battles, while defeated trainers remain visible.
+
+Teach HM01 CUT through the Bag, earn Misty's Cascadebadge, then press A facing
+a small tree. Cut swaps collision blocks and hides cooked STMP geometry; trees
+regrow on map re-entry. Surge and Erika use their ROM parties and award their
+badges and TMs once. The route to Celadon uses Rock Tunnel, Lavender and the
+Route 8–7 Underground Path while Saffron remains outside this chapter.
+
+Validation covers a flood of actual walk cells, directional ledges, doors,
+stairs and map seams from Vermilion to all three gym leaders; this topology
+check ignores temporary NPC occupancy and assumes Cut access. Separate tests
+exercise blackout plus Center exit, both Underground Paths, trainer detection,
+Cut geometry commands/regrowth, leader rewards and Celadon color variants.
+The release PSP build and file-backed package validation pass. The broader
+world suite has an unrelated external-profile fixture mismatch: Mom's expected
+support height is 5, while the installed profile produces 0. No PSP hardware
+playthrough was performed.
+
+## September 10 update: Select diagnostics and PC-prepared terrain
+
+Press Select to toggle a live diagnostics panel. It shows the PSP model
+reported by KUBridge (unknown if unavailable), kernel free RAM and largest
+block, reusable game-heap RAM and largest block, current map, active overworld
+Pokémon, shown sprites, cached atlas pages, cached battle art, music state,
+and free RAM before/after the latest map cleanup or garbage collection.
+The panel updates once per second while gameplay continues. Select is reserved
+for this panel in normal PSP builds; capture/autopilot input remains scripted.
+
+Kernel free memory excludes the arena already reserved for the game. Heap free
+memory includes free-list blocks plus the uncarved tail. Their sum is not one
+contiguous allocation. Cleanup readings surround cache clearing and GC;
+ordinary cache eviction retains capacity, but forced Start/map-entry reloads
+release geometry, atlas and renderer transient buffers to the game allocator. A battle
+art page can remain cached after a battle, so loaded art and active battle are
+reported separately.
+
+Every Start press, including closing a menu, forces an unload, garbage
+collection and reload of the current visible assets. Holding Start fires
+once per press. Doors, route crossings, warps, Fly and save-load entries use
+the same path; the PSP guest observes GameMap object replacement so same-map
+teleports also reload. The host waits for the GE before freeing buffers, then
+re-reads all required geometry/texture frames before drawing. Gameplay state,
+party and music state survive the refresh. Kernel-reserved arena memory stays
+reserved; freed asset blocks become available inside the game heap. Select
+shows the latest cleanup reason and the forced-reload count. These synchronous
+reloads can produce a short pause.
+
+The PC cooker now writes independent terrain pages per tileset and stores each
+map's page binding in VCOL. Tilesets sharing bitmap art but using different
+color groups keep separate pages; maps using the same tileset share a page.
+All terrain animation frames, normalized UVs, ground/facade bakes and swizzled
+pixels are prepared on the PC. A small first-tileset page remains as the unused
+compatibility fallback on disk. Map-specific Celadon color exceptions receive
+their own PC-baked terrain variants. PSP reads only the exact `(page, frame)` pairs
+needed by its draw list, replacing obsolete animation frames in place after
+the GE finishes. It performs no runtime terrain composition or swizzling.
+
+For the installed 65-map asset set, the previous shared terrain allocation was
+753,664 bytes (736 KiB). The new 16 tileset pages need 2,048–6,144 bytes per
+active frame. Multiple visible tilesets and ground-bake pages add their own
+payloads; these figures are not total game RAM or measured frame rates. The
+package grows from 143,415,696 to 143,801,008 bytes. Package size is deliberately
+secondary to resident RAM. Streaming animation adds small Memory Stick reads.
+
+Validation: core tests include distinct animation-frame working sets; cooker
+tests compare every terrain animation texel against the original combined
+layout in plain and RED++ modes, verify swizzled bytes in the final pak, and
+check that shared tilesets reuse pages. Release builds and pak validation are
+also checked. The full TypeScript check additionally requires the generated
+web WASM modules; the PSP/source check excludes those two web smoke scripts.
+This update has not been tested on physical PSP hardware.
 
 ## What changed and why
 

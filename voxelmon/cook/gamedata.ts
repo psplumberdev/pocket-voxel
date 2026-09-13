@@ -18,6 +18,7 @@ export interface AtlasIndex {
   /** sprite sheet name ("red", "oak", ...) -> atlas page. */
   sprites: Record<string, number>;
   partyIcons?: Record<string, number>;
+  followerSprites?: Record<string, number>;
   /** species id -> front-pic atlas page (the guest accessor contract). */
   picFront: Record<string, number>;
   /** species id (+ "redb") -> back-pic atlas page. */
@@ -232,6 +233,7 @@ export function buildGamedata(
     trainer_headers: gen.trainerHeaders,
     field: gen.field,
     atlas,
+    followerSprites: atlas.followerSprites,
     ...(atlas.partyIcons && Object.keys(atlas.partyIcons).length > 0 ? { partyIcons: atlas.partyIcons } : {}),
     mapPalette: buildMapPalette(gen),
   };

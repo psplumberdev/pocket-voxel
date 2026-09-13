@@ -1,3 +1,6 @@
+import { PartyFollower } from "./follower.ts";
+import { trainerHeader } from "./trainers.ts";
+import { physicalExit } from "./warp.ts";
 // The overworld controller SLICE. Ports the world-facing core of gen1recomp
 // src/world/OverworldController.lua: map entry and connections, grid
 // movement, ledges, warps (arrival / collision / edge), NPC wander,
@@ -45,7 +48,7 @@ const COMPASS: Record<Dir, "north" | "south" | "east" | "west"> = {
 };
 
 export interface SaveSlice {
-  party?: { hp: number }[];
+  party?: { hp: number; species?: string; nickname?: string; moves?: { id: string }[] }[];
   flags: Record<string, boolean>;
   inventory: Record<string, number>;
   bagOrder?: string[];
@@ -170,6 +173,7 @@ export class Overworld implements ScriptWorld {
   player!: Player;
   npcs: NPC[] = [];
   readonly wild = new WildPopulation();
+  readonly follower = new PartyFollower();
   entities: Mover[] = [];
   runner: ScriptRunner;
   scriptMoves: ScriptMove[] = [];
@@ -250,6 +254,10 @@ export class Overworld implements ScriptWorld {
     if (!(opts?.seamless && this.npcPool.size > 0)) {
       this.npcPool = new Map();
     }
+    // Repair saves stranded on the front doorstep behind the old guard.
+    if (mapId === "CERULEAN_CITY" && x === 27 && y === 11) {
+      this.shell.save.flags.EVENT_CERULEAN_HOUSE_OPEN = true;
+    }
     this.npcs = [];
     for (const obj of def.objects ?? []) {
       if (this.objectVisible(obj)) {
@@ -271,6 +279,7 @@ export class Overworld implements ScriptWorld {
       this.player = new Player(x, y, facing);
     }
     this.entities = [this.player, ...this.npcs];
+    this.follower.reset(this.player);
   }
 
   // OverworldController.lua:110 objectVisible — the spawn filter. The slice
@@ -281,7 +290,14 @@ export class Overworld implements ScriptWorld {
     if (obj.name === "OAKSLAB_BULBASAUR_POKE_BALL" && (chosen.EVENT_CHOSE_BULBASAUR || chosen.EVENT_RIVAL_CHOSE_BULBASAUR)) return false;
     if (obj.name === "OAKSLAB_CHARMANDER_POKE_BALL" && (chosen.EVENT_CHOSE_CHARMANDER || chosen.EVENT_RIVAL_CHOSE_CHARMANDER)) return false;
     if (obj.name === "OAKSLAB_SQUIRTLE_POKE_BALL" && (chosen.EVENT_CHOSE_SQUIRTLE || chosen.EVENT_RIVAL_CHOSE_SQUIRTLE)) return false;
-    if (chosen[`EVENT_TAKEN_${obj.name}`] || chosen[`EVENT_BEAT_${obj.name}`]) return false;
+    if (chosen[`EVENT_TAKEN_${obj.name}`] || (!obj.trainerClass && chosen[`EVENT_BEAT_${obj.name}`])) return false;
+    if ((obj.name === "MTMOONB2F_DOME_FOSSIL" || obj.name === "MTMOONB2F_HELIX_FOSSIL") && chosen.EVENT_MT_MOON_FOSSIL_TAKEN) return false;
+    const houseOpen = !!(chosen.EVENT_CERULEAN_HOUSE_OPEN || chosen.EVENT_MET_BILL || chosen.EVENT_GOT_SS_TICKET ||
+      this.shell.save.inventory.SS_TICKET || chosen.EVENT_BEAT_CERULEAN_ROCKET_THIEF ||
+      chosen.EVENT_GOT_TM28 || chosen.EVENT_BEAT_CERULEANCITY_ROCKET);
+    if (obj.name === "CERULEANCITY_GUARD1") return houseOpen;
+    if (obj.name === "CERULEANCITY_GUARD2") return !houseOpen;
+    if (obj.name === "CERULEANCITY_ROCKET" && (chosen.EVENT_GOT_TM28 || chosen.EVENT_BEAT_CERULEAN_ROCKET_THIEF)) return false;
     if (obj.name === "SSANNE2F_RIVAL") return !chosen.EVENT_BEAT_SS_ANNE_RIVAL;
     return !(obj as MapObject & { hidden?: boolean }).hidden;
   }
@@ -324,11 +340,12 @@ export class Overworld implements ScriptWorld {
       this.runner.isRunning() || this.scriptMoves.length > 0 || this.emote !== undefined;
     if (!scripted && !this.transitioning) {
       if (this.shell.save.party?.some(mon => mon.hp > 0)) {
-        this.wild.update(this.shell.data, this.map, this.player, this.entities, this.tilePairs);
+        this.wild.update(this.shell.data, this.map, this.player, this.entities, this.tilePairs, this.shell.data.followerSprites ? 1 : 0);
       }
       this.handleInput();
     }
     const stepped = this.player.update();
+    this.follower.update(this.player, this.shell.save.party?.[0]);
     // the warp-arrival cell goes stale the instant the player's real cell
     // leaves it, scripted walk-outs included (OverworldController.lua:1071)
     const entry = this.warpEntryCell;
@@ -662,6 +679,7 @@ export class Overworld implements ScriptWorld {
       }
       return;
     }
+    if (this.tryCut(fx, fy)) return;
     const sign = this.map.signAtCell(fx, fy);
     if (sign) {
       this.showMapText(sign.text);
@@ -670,6 +688,29 @@ export class Overworld implements ScriptWorld {
     if (this.isBedroomComputer(fx, fy)) {
       this.shell.openBedroomComputer();
     }
+  }
+
+  private tryCut(x: number, y: number): boolean {
+    if (!this.map.inBounds(x, y)) return false;
+    const tile = this.map.cellTile(x, y);
+    if (!((this.map.def.tileset === "OVERWORLD" && tile === 0x3d) ||
+          (this.map.def.tileset === "GYM" && tile === 0x50))) return false;
+    const field = this.shell.data.field as { cutTreeSwaps?: { before: number; after: number }[] } | undefined;
+    const bx = Math.floor(x / 2), by = Math.floor(y / 2);
+    const swap = field?.cutTreeSwaps?.find(s => s.before === this.map.blockAt(bx, by));
+    if (!swap) return false;
+    const mon = this.shell.save.party?.find(mon => mon.moves?.some(move => move.id === "CUT"));
+    if (!this.shell.save.inventory.CASCADEBADGE || !mon) {
+      this.shell.showText("A small tree!\fTeach HM01 CUT to a\nPOKéMON and earn the\nCASCADEBADGE to cut it.");
+      return true;
+    }
+    const map = this.map;
+    this.shell.showText(`${mon.nickname || mon.species || "POKéMON"} used CUT!`, () => {
+      if (this.map !== map) return;
+      map.cutBlock(bx, by, swap.after);
+      this.shell.audio.playSfx("Cut");
+    });
+    return true;
   }
 
   private isBedroomComputer(fx: number, fy: number): boolean {
@@ -724,8 +765,41 @@ export class Overworld implements ScriptWorld {
       });
       return true;
     }
+    if (name === "CERULEANCITY_ROCKET") {
+      const flags = this.shell.save.flags;
+      const finish = () => {
+        if (!flags.EVENT_GOT_TM28) {
+          this.shell.save.inventory.TM_DIG = (this.shell.save.inventory.TM_DIG ?? 0) + 1;
+          flags.EVENT_GOT_TM28 = true;
+        }
+        flags.EVENT_BEAT_CERULEAN_ROCKET_THIEF = true;
+        this.shell.showText("You received TM28\n- DIG!", () => {
+          this.npcs = this.npcs.filter(n => n !== npc && this.objectVisible(n.def));
+          const guard = this.map.def.objects.find(o => o.name === "CERULEANCITY_GUARD1");
+          if (guard && !this.npcs.some(n => n.def === guard)) this.npcs.push(this.pooledNPC(this.map.id, guard));
+          this.entities = [this.player, ...this.npcs];
+        });
+      };
+      if (flags.EVENT_BEAT_CERULEAN_ROCKET_THIEF || flags.EVENT_BEAT_CERULEANCITY_ROCKET) finish();
+      else {
+        const party = this.shell.data.trainers?.OPP_ROCKET?.parties[4];
+        if (!party) return false;
+        this.shell.showText("Hey! Stay out!\nIt's not your yard!", () =>
+          this.shell.pushTrainerBattle("ROCKET", "OPP_ROCKET", party, finish));
+      }
+      return true;
+    }
+    if (name === "ROUTE24_COOLTRAINER_M1" && !this.shell.save.flags.EVENT_GOT_NUGGET) {
+      if (!this.bridgeComplete()) {
+        this.shell.showText("Beat our five contest\ntrainers for a prize!");
+        return true;
+      }
+      this.awardNugget(() => this.talkTo(npc));
+      return true;
+    }
     if (name === "BILLSHOUSE_BILL_POKEMON") {
       this.shell.save.flags.EVENT_MET_BILL = true;
+      this.shell.save.flags.EVENT_GOT_SS_TICKET = true;
       this.shell.save.inventory.SS_TICKET = 1;
       this.shell.showText("BILL is back to normal!\fBILL gave you the\nS.S.TICKET!");
       return true;
@@ -797,6 +871,27 @@ export class Overworld implements ScriptWorld {
       MTMOONB2F_TM_MEGA_PUNCH: "TM_MEGA_PUNCH",
       ROUTE4_TM_WHIRLWIND: "TM_WHIRLWIND",
     };
+    // Mt. Moon's two fossil sprites are a single story choice.  The ROM
+    // leaves both objects on the floor until the Super Nerd has been beaten;
+    // taking either one awards exactly one fossil and clears the blocking
+    // event so the player can leave the cave.
+    if (name === "MTMOONB2F_DOME_FOSSIL" || name === "MTMOONB2F_HELIX_FOSSIL") {
+      if (!this.shell.save.flags.EVENT_BEAT_MT_MOON_3_SUPER_NERD) {
+        this.shell.showText("The fossils are guarded by\na SUPER NERD.");
+        return true;
+      }
+      this.shell.showChoice("Take the DOME FOSSIL\nor the HELIX FOSSIL?", (dome) => {
+        const item = dome ? "DOME_FOSSIL" : "HELIX_FOSSIL";
+        this.shell.save.inventory[item] = (this.shell.save.inventory[item] ?? 0) + 1;
+        this.shell.save.flags[dome ? "EVENT_GOT_DOME_FOSSIL" : "EVENT_GOT_HELIX_FOSSIL"] = true;
+        this.shell.save.flags.EVENT_MT_MOON_FOSSIL_TAKEN = true;
+        this.npcs = this.npcs.filter((candidate) =>
+          candidate.def.name !== "MTMOONB2F_DOME_FOSSIL" && candidate.def.name !== "MTMOONB2F_HELIX_FOSSIL");
+        this.entities = [this.player, ...this.npcs];
+        this.shell.showText(`You got the ${item.replaceAll("_", " ")}!`);
+      });
+      return true;
+    }
     const item = itemBalls[name] ?? npc.def.item;
     if (item) {
       this.shell.save.inventory[item] = (this.shell.save.inventory[item] ?? 0) + 1;
@@ -835,13 +930,16 @@ export class Overworld implements ScriptWorld {
       ROUTE4_COOLTRAINER_F2: { trainerClass: "OPP_LASS", partyIndex: 4, range: 3, event: "EVENT_BEAT_ROUTE_4_TRAINER_0" },
       CERULEANGYM_COOLTRAINER_F: { trainerClass: "OPP_JR_TRAINER_F", partyIndex: 1, range: 3, event: "EVENT_BEAT_CERULEAN_GYM_TRAINER_0" },
       CERULEANGYM_SWIMMER: { trainerClass: "OPP_SWIMMER", partyIndex: 1, range: 3, event: "EVENT_BEAT_CERULEAN_GYM_TRAINER_1" },
+      VERMILIONGYM_LT_SURGE: { label: "LT. SURGE", trainerClass: "OPP_LT_SURGE", partyIndex: 1, event: "EVENT_BEAT_LT_SURGE" },
+      CELADONGYM_ERIKA: { label: "ERIKA", trainerClass: "OPP_ERIKA", partyIndex: 1, event: "EVENT_BEAT_ERIKA" },
       CERULEANGYM_MISTY: { label: "MISTY", trainerClass: "OPP_MISTY", partyIndex: 1, event: "EVENT_BEAT_MISTY" },
     };
+    const header = trainerHeader(this.shell.data, this.map.def, npc.def.index);
     const trainer = trainers[name] ?? (npc.def.trainerClass && npc.def.trainerParty
       ? {
           trainerClass: npc.def.trainerClass,
           partyIndex: npc.def.trainerParty,
-          event: `EVENT_BEAT_${name}`,
+          event: header?.event ?? `EVENT_BEAT_${name}`,
         }
       : undefined);
     if (!trainer) return false;
@@ -855,17 +953,20 @@ export class Overworld implements ScriptWorld {
       VIRIDIANFOREST_YOUNGSTER4: "EVENT_BEAT_VIRIDIAN_FOREST_TRAINER_2",
       PEWTERGYM_COOLTRAINER_M: "EVENT_BEAT_PEWTER_GYM_TRAINER_0",
     };
-    const beatFlag = trainer.event ?? (name === "PEWTERGYM_BROCK" ? "EVENT_BEAT_BROCK" : (forestFlag[name] ?? `EVENT_BEAT_${name}`));
-    if (this.shell.save.flags[beatFlag]) {
+    const beatFlag = header?.event ?? trainer.event ?? (name === "PEWTERGYM_BROCK" ? "EVENT_BEAT_BROCK" : (forestFlag[name] ?? `EVENT_BEAT_${name}`));
+    if (this.shell.save.flags[beatFlag] || this.shell.save.flags[`EVENT_BEAT_${name}`]) {
       if (name === "PEWTERGYM_BROCK") {
         this.shell.showText("Go to the GYM in\nCERULEAN and test\nyour abilities!");
         return true;
       }
-      return false;
+      const afterKey = header?.won ?? header?.after;
+      const after = afterKey && (this.shell.data.text as Record<string, string> | undefined)?.[afterKey];
+      this.shell.showText(after || `${label} was defeated!`);
+      return true;
     }
     npc.frozen = true;
     npc.facePlayer(this.player);
-    const pre = this.resolveText(npc.def.text) ?? `${label} wants\nto battle!`;
+    const pre = (header?.battle && (this.shell.data.text as Record<string, string> | undefined)?.[header.battle]) || this.resolveText(npc.def.text) || `${label} wants\nto battle!`;
     this.shell.showText(pre, () => this.shell.pushTrainerBattle(label, trainer.trainerClass, party, () => {
       this.shell.save.flags[beatFlag] = true;
       npc.frozen = false;
@@ -879,11 +980,37 @@ export class Overworld implements ScriptWorld {
         this.shell.save.inventory.TM_BUBBLEBEAM = (this.shell.save.inventory.TM_BUBBLEBEAM ?? 0) + 1;
         this.shell.save.flags.EVENT_GOT_TM11 = true;
         this.shell.showText("You received the\nCASCADEBADGE!\fMISTY gave you\nTM11 - BUBBLEBEAM!");
+      } else if (name === "VERMILIONGYM_LT_SURGE" || name === "CELADONGYM_ERIKA") {
+        const surge = name === "VERMILIONGYM_LT_SURGE";
+        this.shell.save.inventory[surge ? "THUNDERBADGE" : "RAINBOWBADGE"] = 1;
+        const tm = surge ? "TM_THUNDERBOLT" : "TM_MEGA_DRAIN";
+        this.shell.save.inventory[tm] = (this.shell.save.inventory[tm] ?? 0) + 1;
+        this.shell.save.flags[surge ? "EVENT_GOT_TM24" : "EVENT_GOT_TM21"] = true;
+        this.shell.showText(surge ? "You received the\nTHUNDERBADGE!\fTM24 - THUNDERBOLT!" : "You received the\nRAINBOWBADGE!\fTM21 - MEGA DRAIN!");
+      } else if (this.map.id === "ROUTE_24" && this.bridgeComplete() && !this.shell.save.flags.EVENT_GOT_NUGGET) {
+        this.awardNugget();
       } else {
         this.shell.showText(`${label} was\ndefeated!`);
       }
     }));
     return true;
+  }
+
+  private bridgeComplete(): boolean {
+    return [3, 4, 5, 6, 7].every(index => {
+      const obj = this.map.def.objects.find(o => o.index === index);
+      const header = trainerHeader(this.shell.data, this.map.def, index);
+      return !!(header && this.shell.save.flags[header.event] ||
+        obj && this.shell.save.flags[`EVENT_BEAT_${obj.name}`]);
+    });
+  }
+
+  private awardNugget(done?: () => void): void {
+    if (!this.shell.save.flags.EVENT_GOT_NUGGET) {
+      this.shell.save.inventory.NUGGET = (this.shell.save.inventory.NUGGET ?? 0) + 1;
+      this.shell.save.flags.EVENT_GOT_NUGGET = true;
+    }
+    this.shell.showText("You beat all five!\fYou received a NUGGET!", done);
   }
 
   private tryChooseStarter(npc: NPC): boolean {
@@ -1075,50 +1202,17 @@ export class Overworld implements ScriptWorld {
     }
   }
 
-  /** CheckTrainerBattle: only the first-chapter trainer headers are active
-   * in this build. A clear straight sight line freezes input, walks the
-   * trainer to the adjacent cell, then dispatches the same talk handler as A. */
+  /** All cooked trainers use their imported sight range and defeat flag. */
   private tryTrainerSight(): boolean {
-    const ranges: Record<string, number> = {
-      VIRIDIANFOREST_YOUNGSTER2: 4,
-      VIRIDIANFOREST_YOUNGSTER3: 4,
-      VIRIDIANFOREST_YOUNGSTER4: 1,
-      PEWTERGYM_COOLTRAINER_M: 5,
-      ROUTE3_YOUNGSTER1: 2, ROUTE3_YOUNGSTER2: 3, ROUTE3_COOLTRAINER_F1: 2,
-      ROUTE3_YOUNGSTER3: 1, ROUTE3_COOLTRAINER_F2: 4, ROUTE3_YOUNGSTER4: 3,
-      ROUTE3_YOUNGSTER5: 3, ROUTE3_COOLTRAINER_F3: 2,
-      MTMOON1F_HIKER: 2, MTMOON1F_YOUNGSTER1: 3, MTMOON1F_COOLTRAINER_F1: 3,
-      MTMOON1F_SUPER_NERD: 3, MTMOON1F_COOLTRAINER_F2: 3,
-      MTMOON1F_YOUNGSTER2: 3, MTMOON1F_YOUNGSTER3: 3,
-      MTMOONB2F_ROCKET1: 4, MTMOONB2F_ROCKET2: 4,
-      MTMOONB2F_ROCKET3: 4, MTMOONB2F_ROCKET4: 4,
-      ROUTE4_COOLTRAINER_F2: 3,
-      CERULEANGYM_COOLTRAINER_F: 3, CERULEANGYM_SWIMMER: 3,
-    };
-    const events: Record<string, string> = {
-      ROUTE3_YOUNGSTER1: "EVENT_BEAT_ROUTE_3_TRAINER_0", ROUTE3_YOUNGSTER2: "EVENT_BEAT_ROUTE_3_TRAINER_1",
-      ROUTE3_COOLTRAINER_F1: "EVENT_BEAT_ROUTE_3_TRAINER_2", ROUTE3_YOUNGSTER3: "EVENT_BEAT_ROUTE_3_TRAINER_3",
-      ROUTE3_COOLTRAINER_F2: "EVENT_BEAT_ROUTE_3_TRAINER_4", ROUTE3_YOUNGSTER4: "EVENT_BEAT_ROUTE_3_TRAINER_5",
-      ROUTE3_YOUNGSTER5: "EVENT_BEAT_ROUTE_3_TRAINER_6", ROUTE3_COOLTRAINER_F3: "EVENT_BEAT_ROUTE_3_TRAINER_7",
-      MTMOON1F_HIKER: "EVENT_BEAT_MT_MOON_1_TRAINER_0", MTMOON1F_YOUNGSTER1: "EVENT_BEAT_MT_MOON_1_TRAINER_1",
-      MTMOON1F_COOLTRAINER_F1: "EVENT_BEAT_MT_MOON_1_TRAINER_2", MTMOON1F_SUPER_NERD: "EVENT_BEAT_MT_MOON_1_TRAINER_3",
-      MTMOON1F_COOLTRAINER_F2: "EVENT_BEAT_MT_MOON_1_TRAINER_4", MTMOON1F_YOUNGSTER2: "EVENT_BEAT_MT_MOON_1_TRAINER_5",
-      MTMOON1F_YOUNGSTER3: "EVENT_BEAT_MT_MOON_1_TRAINER_6", MTMOONB2F_ROCKET1: "EVENT_BEAT_MT_MOON_3_TRAINER_0",
-      MTMOONB2F_ROCKET2: "EVENT_BEAT_MT_MOON_3_TRAINER_1", MTMOONB2F_ROCKET3: "EVENT_BEAT_MT_MOON_3_TRAINER_2",
-      MTMOONB2F_ROCKET4: "EVENT_BEAT_MT_MOON_3_TRAINER_3", ROUTE4_COOLTRAINER_F2: "EVENT_BEAT_ROUTE_4_TRAINER_0",
-      CERULEANGYM_COOLTRAINER_F: "EVENT_BEAT_CERULEAN_GYM_TRAINER_0", CERULEANGYM_SWIMMER: "EVENT_BEAT_CERULEAN_GYM_TRAINER_1",
-    };
     const dirs: Record<string, Dir> = {
       LEFT: "left", RIGHT: "right", UP: "up", DOWN: "down",
     };
     for (const npc of this.npcs) {
-      const range = ranges[npc.def.name ?? ""];
+      const header = trainerHeader(this.shell.data, this.map.def, npc.def.index);
+      const range = header?.range ?? 0;
       const dir = dirs[npc.def.range ?? ""];
-      if (!range || !dir || this.shell.save.flags[events[npc.def.name ?? ""] ?? (
-        npc.def.name === "PEWTERGYM_COOLTRAINER_M"
-          ? "EVENT_BEAT_PEWTER_GYM_TRAINER_0"
-          : `EVENT_BEAT_VIRIDIAN_FOREST_TRAINER_${npc.def.index - 2}`
-      )]) continue;
+      if (!npc.def.trainerClass || !header || range <= 0 || !dir ||
+          this.shell.save.flags[header.event] || this.shell.save.flags[`EVENT_BEAT_${npc.def.name}`]) continue;
       const dx = this.player.cellX - npc.cellX;
       const dy = this.player.cellY - npc.cellY;
       const distance = Math.abs(dx) + Math.abs(dy);
@@ -1216,10 +1310,26 @@ export class Overworld implements ScriptWorld {
     const index = starter === "SQUIRTLE" ? 7 : starter === "BULBASAUR" ? 8 : 9;
     const party = this.shell.data.trainers?.OPP_RIVAL1?.parties[index - 1];
     if (!party) return false;
+    const def = this.map.def.objects.find(o => o.name === "CERULEANCITY_RIVAL");
+    const rival = def ? new NPC(this.map.id, def, this.shell.npcRng) : undefined;
+    if (rival) {
+      rival.cellX = p.cellX; rival.cellY = p.cellY - 1;
+      rival.px = rival.cellX * 16; rival.py = rival.cellY * 16;
+      rival.frozen = true;
+      this.npcs.push(rival); this.entities = [p, ...this.npcs];
+    }
+    p.facing = "up";
     this.shell.showText(`${this.shell.save.player.rival}: Yo!\nYou're still struggling\nalong back here?`, () => {
       this.shell.pushTrainerBattle(`RIVAL ${this.shell.save.player.rival}`, "OPP_RIVAL1", party, () => {
         flags.EVENT_BEAT_CERULEAN_RIVAL = true;
-        this.shell.showText(`${this.shell.save.player.rival}: I went to see\nBILL! Smell ya!`);
+        this.shell.showText(`${this.shell.save.player.rival}: I went to see\nBILL! Smell ya!`, () => {
+          if (!rival) return;
+          this.scriptMove(rival, rival.cellX === 20 ? "right" : "left", 1, () =>
+            this.scriptMove(rival, "down", 6, () => {
+              this.npcs = this.npcs.filter(n => n !== rival);
+              this.entities = [this.player, ...this.npcs];
+            }));
+        });
       });
     });
     return true;
@@ -1317,21 +1427,15 @@ export class Overworld implements ScriptWorld {
       const heal = this.shell.save.lastHeal;
       if (heal) last = { id: heal.map, x: heal.x, y: heal.y };
     }
-    // Diglett's Cave has an indoor foyer at each end. `LAST_MAP` alone would
-    // retain the route used at the *other* mouth while traversing the cave,
-    // sending the far exit back across the world. Pin each foyer to its
-    // physical outdoor doorway instead.
-    const caveParent = this.map.id === "DIGLETTS_CAVE_ROUTE_2"
-      ? "ROUTE_2"
-      : this.map.id === "DIGLETTS_CAVE_ROUTE_11"
-        ? "ROUTE_11"
-        : undefined;
-    const parentWarp = caveParent && warpDef.destMap === "LAST_MAP"
-      ? this.shell.data.maps?.[caveParent]?.warps.find((w) => w.destMap === this.map.id)
-      : undefined;
-    const dest = parentWarp && caveParent
-      ? { map: caveParent, x: parentWarp.x, y: parentWarp.y }
-      : destination(this.shell.data, warpDef, last);
+    if (warpDef.destMap === "LAST_MAP") {
+      last = physicalExit(this.shell.data, this.map.id, warpDef, last) ?? last;
+    }
+    const dest = destination(this.shell.data, warpDef, last);
+    // A player already inside must always be able to leave, including old
+    // saves that entered through the rear before meeting Bill.
+    if (this.map.id === "CERULEAN_TRASHED_HOUSE" && dest.map === "CERULEAN_CITY") {
+      this.shell.save.flags.EVENT_CERULEAN_HOUSE_OPEN = true;
+    }
     // VermilionDockScript: the sailor checks the S.S.TICKET before admitting
     // Red. Once HM01 has been collected and the ship has been exited, it
     // departs and cannot be boarded again.

@@ -15,6 +15,7 @@
 
 import { fromObject } from "./data.ts";
 import { VoxelmonGame } from "./game.ts";
+import { createPspFrame } from "./psp-frame.ts";
 import type { VoxelHost } from "./host.ts";
 
 /** The story seed — voxelmon/tapes/story.tape is plotted against it
@@ -296,8 +297,11 @@ if (nat.now && nat.perf) {
   };
 }
 
-(globalThis as unknown as { frame: (buttons: number) => void }).frame = (
-  buttons: number,
-): void => {
-  game.tick(buttons);
+(globalThis as unknown as { frame: (buttons: number) => number }).frame = createPspFrame(game);
+
+// Read only on demand by the native Select debug panel.
+(globalThis as unknown as { debugWorld: () => string }).debugWorld = () => {
+  let count = 0;
+  for (const wild of game.overworld.wild.slots) if (wild.active) count++;
+  return `${game.overworld.map.id} | POKEMON ${count}`;
 };

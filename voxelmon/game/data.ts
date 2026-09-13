@@ -256,6 +256,8 @@ export interface VoxelmonData {
   cookedMaps?: string[];
   /** Original menu icon name -> streamed atlas page; enables visible wilds. */
   partyIcons?: Record<string, number>;
+  /** Species -> small animated follower sprite atlas page. */
+  followerSprites?: Record<string, number>;
   pokemon: Record<string, SpeciesDef>;
   moves: Record<string, MoveDef>;
   type_chart: TypeChartData;

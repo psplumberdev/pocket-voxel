@@ -6,6 +6,10 @@
 # instead of re-cooking 32 MB — slips past `dist/` and lands in a commit.
 /dist
 /node_modules
+/backups/
+/output/
+/save.json.edit
+/save.bak.edit
 dist/
 target/
 node_modules/

@@ -35,6 +35,11 @@ budget of ~8k ops per frame.
 
 ## PSP-1000 source and findings
 
+September 12 progress: campaign routes through Erika, visible wild Pokémon,
+a party follower, expanded status moves and TM/HM teaching, and live PSP memory
+diagnostics. See [the latest checkpoint](docs/PSP1000-FINDINGS.md#september-12-progress-checkpoint)
+for current checks and limitations. Build from source with your own supported ROM.
+
 The latest source checkpoint adds file-backed geometry and atlas streaming,
 host-compiled QuickJS bytecode, memory telemetry, persistent PSP saves, and
 expanded early-game progression. Read [the PSP-1000 engineering findings](docs/PSP1000-FINDINGS.md)

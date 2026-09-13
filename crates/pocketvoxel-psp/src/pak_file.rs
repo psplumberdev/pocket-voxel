@@ -171,14 +171,16 @@ impl MapGeometry {
         Self { requests: Vec::new(), meshes: Vec::new(), verts: Vec::new(), indices: Vec::new(), peak_bytes: 0 }
     }
 
-    /// Release every backing allocation before a hard scene load. The PSP
-    /// arena can immediately reuse these blocks for the destination map.
-    pub fn clear_hard(&mut self) {
-        // Retain the backing blocks across maps. The PSP arena is a
-        // segregated free-list allocator: dropping a large Vec and then
-        // requesting a differently sized destination Vec can strand the old
-        // block in another size class and exhaust the bump tail. Clearing
-        // lengths lets the next map reuse the same peak allocation directly.
+    /// Release all scene geometry allocations after the GE has finished.
+    /// The next sync reads a fresh working set from the Memory Stick.
+    pub fn unload(&mut self) {
+        let peak = self.peak_bytes;
+        *self = Self::new();
+        self.peak_bytes = peak;
+    }
+
+    /// Evict a warm working set while reusing storage during ordinary walks.
+    fn clear_retaining_capacity(&mut self) {
         self.requests.clear();
         self.meshes.clear();
         self.verts.clear();
@@ -193,7 +195,7 @@ impl MapGeometry {
     }
 
     /// Grow the current map's geometry cache to cover the requested spans.
-    /// Entries remain warm until `clear_hard`: camera motion must not evict
+    /// Entries remain warm until `unload`: camera motion must not evict
     /// a chunk only to reread it from the Memory Stick on the walk back.
     pub fn sync(&mut self, file: &mut PakFileReader, index: &PakIndex, set: &WorkingSet) -> Result<bool, IndexError> {
         // Leave QuickJS a hard margin on PSP-1000. Forest's thinned current
@@ -211,7 +213,7 @@ impl MapGeometry {
             // Fall back to the caller's current/deep set instead of growing
             // until the allocator fails. The current view is first in every
             // deep set, so it remains render-complete under pressure.
-            self.clear_hard();
+            self.clear_retaining_capacity();
             additions = set.geometry.clone();
         }
         // The threshold limits the warm superset, never the current frame.
@@ -281,6 +283,7 @@ impl GeometrySource for MapGeometry {
 #[derive(Clone, Copy)]
 struct CachedAtlas {
     page: u16,
+    frame: u16,
     at: usize,
     len: usize,
 }
@@ -300,9 +303,21 @@ impl AtlasCache {
         Self { pages: Vec::new(), entries: Vec::new(), words: Vec::new(), len: 0, peak_bytes: 0 }
     }
 
-    pub fn clear_hard(&mut self) {
-        // See MapGeometry::clear_hard: preserve the allocation so map swaps
-        // reuse its arena size class instead of consuming fresh bump space.
+    pub fn page_count(&self) -> usize { self.pages.len() }
+
+    pub fn kind_count(&self, pak: &pocketvoxel_core::pak::Pak<'_>, kind: u16) -> usize {
+        self.pages.iter().filter(|&&page| pak.atlases[page as usize].kind == kind).count()
+    }
+
+    /// Release every loaded map/sprite/UI/battle texture and its storage.
+    /// Caller must wait for the GE before this and before the next sync.
+    pub fn unload(&mut self) {
+        let peak = self.peak_bytes;
+        *self = Self::new();
+        self.peak_bytes = peak;
+    }
+
+    fn clear_retaining_capacity(&mut self) {
         self.pages.clear();
         self.entries.clear();
         self.words.clear();
@@ -312,54 +327,48 @@ impl AtlasCache {
     /// Whether [`sync`](Self::sync) may mutate or reallocate GE-visible
     /// texels. See [`MapGeometry::needs_sync`].
     pub fn needs_sync(&self, set: &WorkingSet) -> bool {
-        set.atlas_pages.iter().any(|page| !self.pages.contains(page))
+        set.atlas_frames.iter().any(|request| !self.entries.iter().any(|entry|
+            entry.page == request.page && entry.frame == request.frame))
     }
 
     pub fn sync(&mut self, file: &mut PakFileReader, index: &PakIndex, set: &WorkingSet) -> Result<bool, IndexError> {
-        // Unlike geometry, pages can differ across adjacent chunks and the
-        // complete pak carries many megabytes of them. Keep a warm superset
-        // while it fits, then recycle the same allocation around the exact
-        // camera working set. This bounds PSP-1000 RAM without reallocating
-        // on every ordinary camera step.
-        // World pages are small after the 512-wide atlas fix. A 512 KiB warm
-        // set covers ordinary play and protects the shared arena's JS side.
         const CACHE_BUDGET: usize = 512 * 1024;
-        let mut additions: Vec<_> = set.atlas_pages.iter().copied()
-            .filter(|page| !self.pages.contains(page)).collect();
-        if additions.is_empty() { return Ok(false); }
-        let added_bytes = additions.iter().try_fold(0usize, |total, &page| {
-            let record = index.atlases.get(page as usize).ok_or("atlas page out of range")?;
-            Ok::<usize, IndexError>(total.saturating_add(record.texels.len as usize))
+        if !self.needs_sync(set) { return Ok(false); }
+        // Frames have already been animated and swizzled by the PC cooker.
+        // Stream only the exact frames sampled by this display list.
+        let mut additions: Vec<_> = set.atlas_frames.iter().copied().filter(|request|
+            !self.entries.iter().any(|entry| entry.page == request.page && entry.frame == request.frame)
+        ).collect();
+        let added_bytes = additions.iter().try_fold(0usize, |total, request| {
+            let record = index.atlases.get(request.page as usize).ok_or("atlas page out of range")?;
+            if request.frame >= record.frames { return Err("atlas frame out of range"); }
+            Ok::<usize, IndexError>(total.saturating_add(record.frame_len as usize))
         })?;
         if self.len.saturating_add(added_bytes) > CACHE_BUDGET {
-            self.pages.clear();
-            self.entries.clear();
-            self.words.clear();
-            self.len = 0;
-            additions = set.atlas_pages.clone();
+            self.clear_retaining_capacity();
+            additions = set.atlas_frames.clone();
         }
-        // Never omit a page required by this draw list. CACHE_BUDGET is the
-        // warm-superset threshold, not a correctness limit: an unusually
-        // rich single view may exceed it, then gets recycled on the next
-        // working-set change instead of rendering with a stale texture.
-        let mut len = self.len;
-        for &page in &additions {
-            let record = index.atlases.get(page as usize).ok_or("atlas page out of range")?;
-            len = (len + record.texels.len as usize).div_ceil(16) * 16;
+        for request in additions {
+            let record = index.atlases.get(request.page as usize).ok_or("atlas page out of range")?;
+            if request.frame >= record.frames { return Err("atlas frame out of range"); }
+            let n = record.frame_len as usize;
+            // Replace an obsolete animation frame in place. Never replace a
+            // frame another draw in this same list still needs.
+            let reusable = self.entries.iter().position(|entry| entry.page == request.page &&
+                !set.atlas_frames.iter().any(|wanted| wanted.page == entry.page && wanted.frame == entry.frame));
+            let at = reusable.map(|i| self.entries[i].at).unwrap_or(self.len);
+            if reusable.is_none() {
+                self.len = (at + n).div_ceil(16) * 16;
+                self.words.resize(self.len / 16, 0);
+            }
+            let bytes = unsafe { core::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast::<u8>(), self.len) };
+            file.read_exact_at(record.texels.offset + request.frame as u64 * n as u64, &mut bytes[at..at + n])?;
+            let entry = CachedAtlas { page: request.page, frame: request.frame, at, len: n };
+            if let Some(i) = reusable { self.entries[i] = entry; } else { self.entries.push(entry); }
+            if !self.pages.contains(&request.page) { self.pages.push(request.page); }
         }
-        self.words.resize(len.div_ceil(16), 0);
-        let bytes = unsafe { core::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, len) };
-        let mut at = self.len;
-        for &page in &additions {
-            let record = &index.atlases[page as usize];
-            let n = record.texels.len as usize;
-            file.read_exact_at(record.texels.offset, &mut bytes[at..at + n])?;
-            self.entries.push(CachedAtlas { page, at, len: n });
-            self.pages.push(page);
-            at = (at + n).div_ceil(16) * 16;
-        }
-        self.len = len;
-        unsafe { pocketvoxel_gu::writeback(&bytes[..len]); }
+        let bytes = unsafe { core::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len) };
+        unsafe { pocketvoxel_gu::writeback(bytes); }
         self.peak_bytes = self.peak_bytes.max(self.allocated_bytes());
         Ok(true)
     }
@@ -375,10 +384,10 @@ impl AtlasCache {
 impl pocketvoxel_gu::AtlasSource for AtlasCache {
     fn frame<'a>(&'a self, pak: &'a pocketvoxel_core::pak::Pak<'a>, page: u16, frame: u16) -> Option<&'a [u8]> {
         let meta = pak.atlases.get(page as usize)?;
-        let entry = self.entries.iter().find(|entry| entry.page == page)?;
+        let frame = frame % meta.frames;
+        let entry = self.entries.iter().find(|entry| entry.page == page && entry.frame == frame)?;
         let frame_len = meta.frame_len as usize;
-        let frame = (frame % meta.frames) as usize;
-        let start = entry.at + frame * frame_len;
+        let start = entry.at;
         let end = start + frame_len;
         if end > entry.at + entry.len || end > self.len { return None; }
         let bytes = unsafe { core::slice::from_raw_parts(self.words.as_ptr() as *const u8, self.len) };

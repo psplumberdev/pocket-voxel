@@ -12,6 +12,7 @@
 // variants (gen1recomp TileRenderer.lua:74-92): water tile rows rotate by
 // WATER_OFFSETS per step, the flower tile cycles flower1-3.
 
+import followerDirections from "./follower-directions.json";
 import { ATLAS_KIND } from "../../contracts/spec/voxel-spec.ts";
 import { ANIM_STEPS, FLOWER_FRAMES, WATER_OFFSETS, defaultAnimatedTiles } from "./classify.ts";
 import { type Art, artOf, type GenData, PX_CLEAR, sheetKeyOf, type TilesetDef } from "./data.ts";
@@ -149,6 +150,7 @@ export function buildTerrainPage(
   gen: GenData,
   tilesets: TilesetDef[],
   redpp?: Redpp | null,
+  mapId: string | null = null,
 ): TerrainLayout {
   // Distinct sheet variants, sorted for determinism. RED++ occasionally
   // assigns different tile-group vectors to tilesets that share one bitmap
@@ -250,7 +252,7 @@ export function buildTerrainPage(
     frames.push(linear);
   }
 
-  const bakedSheets = bakeGroups(gen, tilesets, redpp, frames, w, baseX, baseY);
+  const bakedSheets = bakeGroups(gen, tilesets, redpp, frames, w, baseX, baseY, mapId);
 
   return {
     page: { w, h, kind: ATLAS_KIND.terrain, frames, name: "terrain" },
@@ -278,6 +280,7 @@ function bakeGroups(
   w: number,
   baseX: Map<string, number>,
   baseY: Map<string, number>,
+  mapId: string | null,
 ): Set<string> {
   const baked = new Set<string>();
   if (!redpp) return baked;
@@ -317,7 +320,7 @@ function bakeGroups(
       for (let row = 0; row < rows; row++) {
         for (let col = 0; col < cols; col++) {
           const tileId = row * perRow + col;
-          const group = redpp.groupOf(ts.id, null, tileId);
+          const group = redpp.groupOf(ts.id, mapId, tileId);
           if (group === null) continue;
           const shift = group * SHADES;
           for (const frame of frames) {
@@ -354,6 +357,30 @@ export function buildSpritePage(gen: GenData, key: string): PageDef {
   for (let y = 0; y < art.h; y++)
     for (let x = 0; x < art.w; x++) linear[y * w + x] = art.px(x, y);
   return { w, h: art.h, kind: ATLAS_KIND.sprites, frames: [linear], name: key };
+}
+
+/** Shared party-icon companions. Keep both original front poses verbatim;
+ * original walk sheets supply directions where available. */
+export function buildFollowerPage(gen: GenData, icon: string): PageDef {
+  const front = artOf(gen, `icons/party_${icon}`);
+  if (!front) throw new Error(`missing party icon: ${icon}`);
+  const originals: Record<string, string> = { MON: "monster", FAIRY: "fairy", BIRD: "bird", WATER: "seel" };
+  const original = originals[icon] && artOf(gen, `sprites/${originals[icon]}`);
+  const directions = (followerDirections as Record<string, string[][]>)[icon];
+  const pixels = new Uint8Array(SPRITE_PAGE_W * 96).fill(PX_CLEAR);
+  for (let frame = 0; frame < 6; frame++) for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+    let value: number;
+    if (frame === 0 || frame === 3) value = front.px(x, y + (frame === 3 ? 16 : 0));
+    else if (original) value = original.px(x, frame * 16 + y);
+    else {
+      const row = frame === 1 ? 0 : frame === 2 ? 1 : frame === 4 ? 2 : 3;
+      const shade = directions?.[row]?.[y]?.[x];
+      if (shade === undefined) throw new Error(`missing ${icon} direction ${frame}`);
+      value = shade === "." ? PX_CLEAR : Number(shade);
+    }
+    pixels[(frame * 16 + y) * SPRITE_PAGE_W + x] = value;
+  }
+  return { w: SPRITE_PAGE_W, h: 96, kind: ATLAS_KIND.sprites, frames: [pixels], name: `follower/${icon}` };
 }
 
 /** The emote page: gen's 48x16 horizontal strip restacked 16x48 vertical

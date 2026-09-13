@@ -277,10 +277,17 @@ pub struct GeometryRequest {
 
 /// Bulk VXPK resources referenced by one completed draw list. Palettes and
 /// directories are deliberately absent: those are small resident metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AtlasRequest {
+    pub page: u16,
+    pub frame: u16,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct WorkingSet {
     pub geometry: Vec<GeometryRequest>,
     pub atlas_pages: Vec<u16>,
+    pub atlas_frames: Vec<AtlasRequest>,
 }
 
 impl WorkingSet {
@@ -288,7 +295,9 @@ impl WorkingSet {
     /// seam, frustum, quality, battle, UI, and entity decisions in one place.
     pub fn from_draw_list(list: &DrawList) -> Self {
         let mut out = Self::default();
-        let mut add_page = |page: u16| {
+        let mut add_page = |page: u16, frame: u16| {
+            let request = AtlasRequest { page, frame };
+            if !out.atlas_frames.contains(&request) { out.atlas_frames.push(request); }
             if !out.atlas_pages.contains(&page) {
                 out.atlas_pages.push(page);
             }
@@ -305,11 +314,11 @@ impl WorkingSet {
                     if !out.geometry.contains(&request) {
                         out.geometry.push(request);
                     }
-                    add_page(mesh.page);
+                    add_page(mesh.page, mesh.frame);
                 }
                 Item::Ghost { page, .. }
                 | Item::Card { page, .. }
-                | Item::UiQuad { page, .. } => add_page(*page),
+                | Item::UiQuad { page, .. } => add_page(*page, 0),
                 Item::SkyBands { .. }
                 | Item::ShadowDecal { .. }
                 | Item::VideoQuad { .. }
@@ -317,6 +326,7 @@ impl WorkingSet {
             }
         }
         out.atlas_pages.sort_unstable();
+        out.atlas_frames.sort_unstable();
         out
     }
 }
@@ -1197,6 +1207,26 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn streaming_keeps_distinct_animation_frames_without_duplicate_geometry() {
+        let blob = pak::AlignedBlob::from_bytes(&pak::tests::tiny_pak_bytes());
+        let pak = pak::read(blob.bytes()).unwrap();
+        let mut list = build(&shown_scene(), &pak);
+        let mut item = *list.items.iter().find(|item| matches!(item, Item::ChunkMesh { .. })).unwrap();
+        let Item::ChunkMesh { ref mut mesh, .. } = item else { unreachable!() };
+        let page = mesh.page;
+        mesh.frame = 1;
+        let before = WorkingSet::from_draw_list(&list);
+        list.items.push(item);
+        list.items.push(item);
+        let after = WorkingSet::from_draw_list(&list);
+        assert_eq!(after.geometry, before.geometry);
+        assert_eq!(after.atlas_pages, before.atlas_pages);
+        assert!(after.atlas_frames.contains(&AtlasRequest { page, frame: 0 }));
+        assert!(after.atlas_frames.contains(&AtlasRequest { page, frame: 1 }));
+        assert_eq!(after.atlas_frames.iter().filter(|r| r.page == page && r.frame == 1).count(), 1);
     }
 
     /// A two-chunk map: the chunk at the origin and one three chunks NORTH

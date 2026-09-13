@@ -135,6 +135,8 @@ export class Scene {
    * object (overworld.ts), so identity is the change signal, and the
    * neighbor BFS + slot keys — once ~7 ms EVERY tick — run only then. */
   private lastMap: unknown = null;
+  private cutMap: SceneView["overworld"]["map"] | null = null;
+  private cutStamps = new Set<string>();
   private mapSlots: (string | null)[] = [null, null, null, null, null];
   /** Per-slot ent-op args (6 ints each) + shown flags: the numeric mirror
    * of the old per-tick `${...}` key strings. `entSeen` is the per-tick
@@ -182,6 +184,7 @@ export class Scene {
     const p = view.prof;
     const t0 = p ? p.now() : 0;
     this.emitMaps(view);
+    this.emitCuts(view);
     const t1 = p ? p.now() : 0;
     this.emitCam(view);
     this.emitEnts(view);
@@ -262,6 +265,23 @@ export class Scene {
 
   // PSP-1000 hard scenes: slot 0 is the current map and every other slot is
   // hidden. Connections load only after the old scene has been released.
+  private emitCuts(view: SceneView): void {
+    const map = view.overworld.map;
+    if (map !== this.cutMap) {
+      if (this.cutMap) for (const key of this.cutStamps) {
+        const [x, y] = key.split(",").map(Number);
+        this.host.stamp(this.cutMap.def.index, x, y, 1);
+      }
+      this.cutStamps.clear();
+      this.cutMap = map;
+    }
+    for (const key of map.removedStamps) if (!this.cutStamps.has(key)) {
+      const [x, y] = key.split(",").map(Number);
+      this.host.stamp(map.def.index, x, y, 0);
+      this.cutStamps.add(key);
+    }
+  }
+
   private emitMaps(view: SceneView): void {
     const ow = view.overworld;
     // Everything below is a pure function of the current GameMap, and a
@@ -420,13 +440,22 @@ export class Scene {
         flags,
       );
     }
+    const follower = ow.follower;
+    const followerSlot = npcs.length + 1;
+    const followerPage = follower && view.data.followerSprites?.[follower.species];
+    if (follower?.active && followerPage !== undefined && followerSlot < ENTS_MAX) {
+      const x = Math.floor(follower.px / 16), y = Math.floor(follower.py / 16);
+      if (ow.map.inBounds(x, y)) this.emitSlot(followerSlot, followerPage, follower.frame,
+        Math.round(follower.px * Q4), Math.round(follower.py * Q4),
+        ow.map.groundAt(x, y), ENT_FLAG.walker | (follower.facing === "right" ? ENT_FLAG.mirror : 0));
+    }
     // Original menu icons are separate two-frame cards. No terrain, camera,
     // NPC placement or background state changes are needed to draw them.
     for (let i = 0; i < ow.wild.slots.length; i++) {
       const wild = ow.wild.slots[i];
-      const slot = npcs.length + 1 + i;
+      const slot = npcs.length + 1 + (view.data.followerSprites ? 1 : 0) + i;
       if (slot >= ENTS_MAX) break;
-      if (!wild.active) continue;
+      if (!wild.active || !ow.map.inBounds(wild.cellX, wild.cellY)) continue;
       const page = view.data.partyIcons?.[wild.icon];
       if (page === undefined) continue;
       const bob = wild.icon === "BALL" || wild.icon === "HELIX" ? wild.frame : 0;

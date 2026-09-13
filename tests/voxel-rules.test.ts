@@ -868,6 +868,8 @@ describe("status", () => {
   });
 
   test("leech seed drains into the opponent and shares the Toxic counter", () => {
+    expect(Status.leechSeedDamage(100)).toBe(6); // 6.25% of max HP
+    expect(Status.leechSeedDamage(100, 2)).toBe(12);
     const seeded = mk({ leechSeeded: true });
     const opp = mk();
     opp.mon.hp = 10;

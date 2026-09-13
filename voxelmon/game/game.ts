@@ -1,3 +1,4 @@
+import { physicalExit } from "./world/warp.ts";
 // The Game shell: the state stack (overworld / textbox / stub-battle /
 // warp-fade), the per-tick drive, and the boot that skips title/intro
 // straight into the overworld like the reference test driver
@@ -567,7 +568,7 @@ class BattleGameState implements GameState, BattleSceneView {
           next.level,
           { name: this.trainer!.name },
         );
-        this.battle.enter();
+        this.battle.enterNextOpponent(b);
         return;
       }
       // BattleState.lua:4647-4653 — teardown pops the battle screen FIRST,
@@ -886,12 +887,17 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     // Old saves used PALLET_TOWN as the zero-checkpoint. Treat that legacy
     // outdoor value (and a missing/corrupt value) as Mom's house. A nurse
     // records a concrete *_POKECENTER map and always wins thereafter.
-    const heal = saved?.map.endsWith("POKECENTER")
-      ? saved
-      : { map: "REDS_HOUSE_1F", x: 4, y: 6 };
+    const valid = typeof saved?.map === "string" && saved.map.endsWith("POKECENTER") &&
+      this.data.maps?.[saved.map] && this.overworld.isCooked(saved.map) &&
+      Number.isInteger(saved.x) && Number.isInteger(saved.y) && saved.x >= 0 && saved.y >= 0 &&
+      saved.x < this.data.maps[saved.map].width * 2 && saved.y < this.data.maps[saved.map].height * 2;
+    const heal = valid ? saved! : { map: "REDS_HOUSE_1F", x: 4, y: 6 };
     this.save.lastHeal = heal;
-    // A blackout is a special relocation, not travel from the defeated map.
-    // Preserve lastOutdoor so the Center door still exits to its real town.
+    // Restore the checkpoint's outdoor doorway, never the route where the
+    // party fainted. Otherwise leaving the Center can select a cave warp.
+    const exit = this.data.maps?.[heal.map]?.warps.find(w => w.destMap === "LAST_MAP");
+    const parent = exit && physicalExit(this.data, heal.map, exit);
+    if (parent) this.overworld.rememberOutdoor(parent.id, parent.x, parent.y);
     this.overworld.startWarpTo(heal.map, heal.x, heal.y, "down", undefined, false);
   }
 
@@ -1183,11 +1189,11 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     const item = this.data.items?.[id];
     const machine = item?.machine;
     const mon = this.save.party[partyIndex];
-    if (!machine || !mon) return;
+    if (!machine || !mon || (this.save.inventory[id] ?? 0) < 1) return;
     const species = this.data.pokemon[mon.species];
     const monName = mon.nickname ?? species?.name ?? mon.species;
     const moveName = this.data.moves[machine.move]?.name ?? machine.move.replaceAll("_", " ");
-    if (!species?.tmhm.includes(machine.move)) {
+    if (!species?.tmhm?.includes(machine.move)) {
       this.showText(`${monName} is not\ncompatible with ${item.name}.`);
       return;
     }
@@ -1195,8 +1201,10 @@ export class VoxelmonGame implements OverworldShell, SceneView {
       this.showText(`${monName} already\nknows ${moveName}.`);
       return;
     }
-    const finish = () => {
-      mon.moves.push({ id: machine.move, pp: this.data.moves[machine.move]?.pp ?? 0 });
+    const finish = (replaceIndex?: number) => {
+      const learned = { id: machine.move, pp: this.data.moves[machine.move]?.pp ?? 0 };
+      if (replaceIndex === undefined) mon.moves.push(learned);
+      else mon.moves[replaceIndex] = learned;
       if (machine.kind === "TM") Bag.remove(this.save, id, 1);
       this.showText(`${monName} learned\n${moveName}!`);
     };
@@ -1215,8 +1223,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
         this.showText("HM moves can't be\nforgotten!");
         return;
       }
-      mon.moves.splice(moveIndex, 1);
-      finish();
+      finish(moveIndex);
     });
   }
 
@@ -1233,7 +1240,14 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     }), "CANCEL"], (itemIndex) => {
       const id = ids[itemIndex];
       if (!id) return;
-      const targets = this.save.party.map((mon) => mon.nickname ?? this.data.pokemon[mon.species]?.name ?? mon.species);
+      const machine = this.data.items?.[id]?.machine;
+      const targets = this.save.party.map((mon) => {
+        const species = this.data.pokemon[mon.species];
+        const name = mon.nickname ?? species?.name ?? mon.species;
+        if (!machine) return name;
+        const state = mon.moves.some(m => m.id === machine.move) ? "KNOWN" : species?.tmhm?.includes(machine.move) ? "ABLE" : "UNABLE";
+        return `${name} ${state}`;
+      });
       this.showMenuChoice("Use on which\nPOKéMON?", [...targets, "CANCEL"], (partyIndex) => {
         const mon = this.save.party[partyIndex];
         if (!mon) return;

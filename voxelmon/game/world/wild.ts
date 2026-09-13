@@ -95,12 +95,22 @@ export class WildPopulation {
       ? "grass" : null;
   }
 
-  update(data: VoxelmonData, map: GameMap, player: Mover, entities: readonly Mover[], pairs?: TilePairs): void {
+  update(data: VoxelmonData, map: GameMap, player: Mover, entities: readonly Mover[], pairs?: TilePairs, reservedSlots = 0): void {
     if (!data.partyIcons) return;
-    const limit = Math.max(0, Math.min(WILD_LIMIT, ENTS_MAX - entities.length));
+    const limit = Math.max(0, Math.min(WILD_LIMIT, ENTS_MAX - entities.length - reservedSlots));
     for (let i = 0; i < this.slots.length; i++) {
       const wild = this.slots[i];
       if (!wild.active) continue;
+      // A map swap can land between the population update and the renderer.
+      // Never retain or draw a stale encounter outside the new map's cell
+      // rectangle.
+      if (!map.inBounds(wild.cellX, wild.cellY) ||
+          (wild.targetX !== undefined && !map.inBounds(wild.targetX, wild.targetY!))) {
+        wild.active = false;
+        wild.moving = false;
+        wild.targetX = wild.targetY = undefined;
+        continue;
+      }
       if (i >= limit || occupied(entities, wild.cellX, wild.cellY)) {
         wild.active = false;
         continue;

@@ -220,7 +220,7 @@ describe.skipIf(!hasGen)("visible wild integration", () => {
     const wild = seedSlot(visible.game.overworld.wild, 11, 9);
     wild.species = "PIDGEY";
     plain.game.tick(0); visible.game.tick(0);
-    const slot = visible.game.overworld.npcs.length + 1;
+    const slot = visible.game.overworld.npcs.length + 1 + (visible.game.data.followerSprites ? 1 : 0);
     const extra = `o ${VOX_OP.ent} ${slot} `;
     const lines = visible.host.text().split("\n");
     expect(lines.some(line => line.startsWith(extra))).toBe(true);

@@ -31,6 +31,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 mod remote;
+mod debug;
+mod model;
 mod voxel;
 
 mod pak_file;
@@ -375,6 +377,7 @@ unsafe fn run() {
         map_geometry.resident_bytes().div_ceil(1024),
         atlas_cache.allocated_bytes().div_ceil(1024),
     );
+    let mut debug_panel = debug::DebugPanel::new();
     let mut primary_map = voxel::scene().maps[0].map_id;
     let mut pad = SceCtrlData::default();
     let mut frame: u32 = 0;
@@ -409,11 +412,19 @@ unsafe fn run() {
         #[cfg(any(feature = "capture", feature = "autopilot"))]
         let mask = capture::scripted_buttons(frame);
 
+        #[cfg(not(any(feature = "capture", feature = "autopilot")))]
+        let mask = debug_panel.buttons(mask);
+
         // One guest turn per host tick: frame(buttons), exactly once.
         let mut args = [JS_NewInt32(ctx, mask as i32)];
         let r = JS_Call(ctx, frame_fn, global, 1, args.as_mut_ptr());
+        let mut reload_request = 0i32;
         if JS_ValueGetTag(r) == JS_TAG_EXCEPTION {
             log_exception(ctx);
+        } else {
+            // psp-frame.ts: bit 0 = Start edge, bit 1 = map entry, even
+            // when a warp/Fly lands in the same map and emits no mapShow.
+            JS_ToInt32(ctx, &mut reload_request, r);
         }
         JS_FreeValue(ctx, r);
         host::drain_jobs(rt);
@@ -434,20 +445,22 @@ unsafe fn run() {
         let swapped = voxel::take_map_swapped();
         let scene = voxel::scene();
         let next_primary_map = scene.maps[0].map_id;
-        let hard_scene_swap = swapped && primary_map != next_primary_map;
-        deep_load |= hard_scene_swap;
-        if hard_scene_swap {
-            // Frame N-1 may still be sampling the old streamed buffers.
-            // Finish it before returning those blocks to the arena.
+        let reload_scene = reload_request & 3 != 0 || primary_map != next_primary_map;
+        let reload_reason = match reload_request & 3 {
+            1 => "START", 3 => "START + MAP", _ => "MAP ENTRY",
+        };
+        deep_load |= reload_scene;
+        let cleanup_before = if reload_scene {
+            // Keep music supplied across the synchronous unload/GC/reload.
+            for _ in 0..8 { audio_pump_with_lead(scene, &pak, GC_LEAD_FRAMES); }
             sys::sceGuSync(GuSyncMode::Finish, GuSyncBehavior::Wait);
-            map_geometry.clear_hard();
-            atlas_cache.clear_hard();
-            device_log!(
-                "[voxelmon] hard scene swap {} -> {}: caches released",
-                primary_map,
-                next_primary_map,
-            );
-        }
+            let before = debug::Memory::read();
+            map_geometry.unload();
+            atlas_cache.unload();
+            renderer.release_transients();
+            device_log!("[voxelmon] {}: unloaded {} -> {}", reload_reason, primary_map, next_primary_map);
+            Some(before)
+        } else { None };
         primary_map = next_primary_map;
         let gc_us = {
             const GC_BUMP_STEP: usize = 256 * 1024;
@@ -462,17 +475,19 @@ unsafe fn run() {
             // PocketJS allocation halfway through Viridian Forest.
             const MAINTENANCE_GC_TICKS: u32 = 600;
             let maintenance = frame != 0 && frame % MAINTENANCE_GC_TICKS == 0;
-            if hard_scene_swap || maintenance || (pressure && (swapped || emergency)) {
+            if reload_scene || maintenance || (pressure && (swapped || emergency)) {
                 // Top the audio ring up past the stall first: the pump's
                 // steady lead is 100 ms, a collection is longer, and the
                 // mixer starving mid-cut would put a pop where the design
                 // put silence-free continuity. Each call renders at most
                 // AUDIO_MAX_FRAMES, so reaching the deep lead takes a few.
-                for _ in 0..8 {
-                    audio_pump_with_lead(scene, &pak, GC_LEAD_FRAMES);
+                if !reload_scene {
+                    for _ in 0..8 { audio_pump_with_lead(scene, &pak, GC_LEAD_FRAMES); }
                 }
+                let before = cleanup_before.unwrap_or_else(|| debug::Memory::read());
                 let t_gc = sys::sceKernelGetSystemTimeLow();
                 JS_RunGC(rt);
+                debug_panel.record_cleanup(before, debug::Memory::read(), if reload_scene { reload_reason } else { "GC" }, reload_scene);
                 LAST_GC_BUMP = arena::stats().bump_bytes;
                 sys::sceKernelGetSystemTimeLow().wrapping_sub(t_gc)
             } else {
@@ -565,6 +580,7 @@ unsafe fn run() {
             if atlas_cache.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| host::halt(e)) {
                 device_log!("[voxelmon] streamed atlases: {} KB allocated, {} KB peak", atlas_cache.allocated_bytes().div_ceil(1024), atlas_cache.peak_bytes().div_ceil(1024));
             }
+            debug_panel.update(frame, ctx, global, scene, &pak, &map_geometry, &atlas_cache);
             let t_work_done = sys::sceKernelGetSystemTimeLow();
             sys::sceGuSync(GuSyncMode::Finish, GuSyncBehavior::Wait);
             let t_synced = sys::sceKernelGetSystemTimeLow();
@@ -581,6 +597,7 @@ unsafe fn run() {
             remote::present(&mut renderer); // staged pixels commit only while GE-idle
             sys::sceGuStart(GuContextType::Direct, host::list_ptr());
             renderer.render_with_assets(&list, &pak, &map_geometry, &atlas_cache);
+            renderer.render_debug_overlay(debug_panel.rects());
             let t_recorded = sys::sceKernelGetSystemTimeLow();
             // Belt-and-braces coherence: ~0.1 ms flushes every dirty line
             // before the kick, so no per-write WritebackRange call can be
