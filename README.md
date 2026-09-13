@@ -8,6 +8,11 @@
 
 <p align="center"><em>PSP-1000 gameplay photo supplied by psplumberdev for this progress update. It shows the game running on the handheld; the exact build revision and frame rate were not recorded with the photo.</em></p>
 
+**September 13 hardware report:** psplumberdev reports that the PSP-1000 has
+been running for days without crashes. This is user-reported sustained hardware
+use; a complete campaign playthrough and instrumented performance measurements
+remain separate checks.
+
 **Campaign: development checkpoint through Erika, the fourth gym leader.**
 The expanded local package contains 116 maps. Work covers Cerulean, Vermilion
 and Lt. Surge, Cut, Routes 9/10, Rock Tunnel, Lavender, Routes 8/7 and the
@@ -35,8 +40,9 @@ Saves now live separately in `PSP/SAVEDATA/VOXELMON/`; see
   endgame; Saffron is outside the current documented chapter.
 - Finish unsupported move effects and broaden battle checks across status,
   items, catching, party changes and trainer sequences.
-- Play through the current chapter on PSP-1000, including battles, dense maps,
-  transitions and save/reload; measure sustained frame rate and memory headroom.
+- Complete a documented chapter playthrough on PSP-1000, including battles,
+  dense maps, transitions and save/reload; measure sustained frame rate and
+  memory headroom. The user reports days of use without crashes.
 - Revalidate rendering/parity captures and other platform builds. Resolve the
   external-profile fixture mismatch and generated web/trace prerequisites before
   claiming a clean full-suite result.

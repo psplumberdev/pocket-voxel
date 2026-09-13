@@ -2,6 +2,13 @@
 
 Publication checkpoint: September 12, 2026.
 
+## September 13 user hardware report
+
+psplumberdev reports days of PSP-1000 use without crashes and supplied the
+[hardware photo](shots/psp1000voxelproof.jpeg) featured in the README. This
+updates the earlier hardware-validation status below. The report does not
+include instrumented frame timings or a complete campaign acceptance record.
+
 ## September 12 progress checkpoint
 
 This source checkpoint adds a party follower with directional sprites, visible
