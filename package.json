@@ -10,6 +10,8 @@
     "shots": "bun tools/voxel.ts shots",
     "psp": "bun tools/voxel.ts psp --release",
     "vita": "bun tools/voxel.ts vita --release",
+    "iphone4s": "bun tools/iphone4s.ts",
+    "ipodtouch4": "bun tools/ipodtouch4.ts",
     "cardputer": "bun tools/voxel.ts cardputer",
     "cardputer:install": "bun tools/voxel.ts cardputer --install",
     "desktop:serve": "bun host/desktop-stream/serve.ts",
@@ -29,6 +31,7 @@
     "docs:preview": "vitepress preview docs"
   },
   "devDependencies": {
+    "@napi-rs/canvas": "1.0.2",
     "@types/bun": "^1.2.0",
     "@types/three": "^0.185.0",
     "mermaid": "^11.16.1",
