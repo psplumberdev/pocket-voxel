@@ -84,6 +84,10 @@ export interface OverworldShell {
   /** Bedroom OpenRedsPC hidden event, owned by the game-state stack. */
   openBedroomComputer(): void;
   openStartMenu(): void;
+  openDaycare?(): void;
+  openBikeShop?(): void;
+  openFanClub?(): void;
+  onFieldStep?(): void;
   chooseStarter(species: "BULBASAUR" | "CHARMANDER" | "SQUIRTLE"): void;
   buyMagikarp(): "bought" | "money" | "party-full" | "already-bought";
   pushWarpFade(frames: number, midpoint: () => void, onDone?: () => void): void;
@@ -747,6 +751,9 @@ export class Overworld implements ScriptWorld {
    * first trainer roster. */
   private tryChapterInteraction(npc: NPC): boolean {
     const name = npc.def.name ?? "";
+    if (name === "DAYCARE_GENTLEMAN") { this.shell.openDaycare?.(); return true; }
+    if (name === "BIKESHOP_CLERK") { this.shell.openBikeShop?.(); return true; }
+    if (name === "POKEMONFANCLUB_CHAIRMAN") { this.shell.openFanClub?.(); return true; }
     if (name === "MTMOONPOKECENTER_MAGIKARP_SALESMAN") {
       this.shell.showChoice("A MAGIKARP for just\n¥500! Want it?", (yes) => {
         if (!yes) {
@@ -1139,8 +1146,9 @@ export class Overworld implements ScriptWorld {
   // land-triggers, in the original's order: warp-entry staleness, the
   // standing-on-warp refresh, arrival/held-collision warps, then the wild
   // encounter roll. (Spinners, badge gates, forced movement, Safari,
-  // day-care, poison and repel are outside the slice.)
+  // poison and repel are outside the slice.)
   onStepComplete(): void {
+    this.shell.onFieldStep?.();
     const p = this.player;
     if (this.tryLabExitGate()) return;
     if (this.tryLabRivalEvent()) return;

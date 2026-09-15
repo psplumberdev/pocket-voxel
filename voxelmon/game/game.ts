@@ -1,3 +1,4 @@
+import { useMedicine } from "./rules/medicine.ts";
 import { physicalExit } from "./world/warp.ts";
 // The Game shell: the state stack (overworld / textbox / stub-battle /
 // warp-fade), the per-tick drive, and the boot that skips title/intro
@@ -14,7 +15,7 @@ import { physicalExit } from "./world/warp.ts";
 import { fromSection, type AudioBanks } from "./audio/banks.ts";
 import { AudioDirector } from "./audio/music.ts";
 import { WildBattle } from "./battle/battle.ts";
-import { healMon, newMon, partyAdd, type PartyMon } from "./battle/mon.ts";
+import { isHmMove, healMon, newMon, partyAdd, type PartyMon } from "./battle/mon.ts";
 import { computeStaging, type BattleStaging } from "./battle/staging.ts";
 import { BattleUi } from "./battle/ui.ts";
 import type { VoxelmonData } from "./data.ts";
@@ -30,6 +31,8 @@ import {
   trainerPayout,
 } from "./rules/economy.ts";
 import { apply as applyEvolution, checkParty } from "./rules/evolution.ts";
+import { expForLevel, levelForExp } from "./rules/growth.ts";
+import { calc } from "./rules/stats.ts";
 import { movesLearnedAt } from "./rules/experience.ts";
 import { MAP_ENTRY_AFTER_BATTLE, POST_BATTLE_RETURN, YES_NO_ANSWER } from "./rules/timing.ts";
 import {
@@ -58,6 +61,7 @@ export interface GameSave extends SaveSlice {
   party: PartyMon[];
   /** Runtime performance option: false keeps the PSP audio path idle. */
   musicEnabled?: boolean;
+  daycare?: { mon: PartyMon; steps: number; depositLevel: number };
 }
 
 interface SaveFileV1 {
@@ -699,9 +703,12 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     this.audio.startMap(this.audioMap);
   }
 
+  cycling = false;
+
   private applyMovementSpeed(): void {
     if (!this.overworld?.player) return;
-    this.overworld.player.stepFrames = this.musicEnabled ? 24 : 16;
+    if (this.overworld.map?.def.tileset !== "OVERWORLD" || this.overworld.player.surfing) this.cycling = false;
+    this.overworld.player.stepFrames = (this.musicEnabled ? 24 : 16) / (this.cycling ? 2 : 1);
   }
 
   /**
@@ -861,6 +868,10 @@ export class VoxelmonGame implements OverworldShell, SceneView {
         !Array.isArray(save.party) || typeof save.flags !== "object" ||
         typeof save.inventory !== "object" || typeof save.player?.name !== "string"
       ) return false;
+      if (save.daycare && (!this.data.pokemon[save.daycare.mon?.species] ||
+          !Number.isSafeInteger(save.daycare.steps) || save.daycare.steps < 0 ||
+          !Number.isInteger(save.daycare.depositLevel) || save.daycare.depositLevel < 1 || save.daycare.depositLevel > 100)) return false;
+      this.cycling = false;
       this.save = save;
       this.save.money = Math.max(0, Math.min(MAX_MONEY, Math.floor(this.save.money ?? STARTING_MONEY)));
       this.musicEnabled = this.save.musicEnabled === true;
@@ -907,6 +918,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     const t0 = p ? p.now() : 0;
     this.input.setButtons(buttons);
     this.input.step();
+    this.applyMovementSpeed();
     const top = this.stack[this.stack.length - 1];
     top?.update();
     const t1 = p ? p.now() : 0;
@@ -1040,8 +1052,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
   /**
    * Evolution.lua:112-152 learnEvolutionMoves — the EVOLVED species' learnset
    * at exactly this level (movesLearnedAt, not movesAtLevel), each new move
-   * announced on its own page. A full moveset keeps battle.ts's v1 deviation:
-   * MoveLearnMenu is not in this slice, so the mon declines and says so.
+   * announced on its own page, with HM-safe replacement for full movesets.
    */
   private learnEvolutionMoves(mon: PartyMon, onDone: () => void): void {
     const def = this.data.pokemon[mon.species]!;
@@ -1063,10 +1074,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
         this.showText(`${name} learned\n${mdef.name}!`, () => step(i + 1));
         return;
       }
-      this.showText(
-        `${name} is trying to\nlearn ${mdef.name}!\f${name} did not learn\n${mdef.name}!`,
-        () => step(i + 1),
-      );
+      this.offerFieldMove(mon, moveId, () => step(i + 1));
     };
     step(0);
   }
@@ -1185,6 +1193,106 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     });
   }
 
+  private offerFieldMove(mon: PartyMon, moveId: string, onDone: () => void): void {
+    const def = this.data.moves[moveId];
+    if (!def || mon.moves.some(m => m.id === moveId)) { onDone(); return; }
+    const name = mon.nickname ?? this.data.pokemon[mon.species].name;
+    const finish = (index: number) => {
+      mon.moves[index] = { id: moveId, pp: def.pp };
+      this.showText(`${name} learned\n${def.name}!`, onDone);
+    };
+    if (mon.moves.length < 4) { finish(mon.moves.length); return; }
+    const choose = () => this.showMenuChoice(`Forget a move for\n${def.name}?`,
+      [...mon.moves.map(m => `${this.data.moves[m.id]?.name ?? m.id}${isHmMove(this.data,m.id) ? " (HM)" : ""}`), "CANCEL"], index => {
+        const old = mon.moves[index];
+        if (!old) { this.showText(`${name} did not learn\n${def.name}!`, onDone); return; }
+        if (isHmMove(this.data, old.id)) { this.showText("HM moves can't be\nforgotten!", choose); return; }
+        finish(index);
+      });
+    choose();
+  }
+
+  onFieldStep(): void {
+    const dc = this.save.daycare;
+    if (dc) dc.steps = Math.min(2000000, dc.steps + 1);
+  }
+
+  openDaycare(): void {
+    const dc = this.save.daycare;
+    if (!dc) {
+      if (this.save.party.length < 2) { this.showText("You need to keep a\nPOKéMON with you."); return; }
+      this.showMenuChoice("Which POKéMON\nshould I raise?", [...this.save.party.map(m => m.nickname ?? this.data.pokemon[m.species].name), "CANCEL"], index => {
+        const mon = this.save.party[index];
+        if (!mon) return;
+        if (!this.save.party.some((m,i) => i !== index && m.hp > 0)) { this.showText("Keep a healthy\nPOKéMON with you."); return; }
+        this.save.party.splice(index, 1);
+        this.save.daycare = { mon, steps: 0, depositLevel: mon.level };
+        this.showText("I'll look after your\nPOKéMON. Come back\nafter walking!");
+      });
+      return;
+    }
+    const mon = dc.mon, def = this.data.pokemon[mon.species];
+    const exp = Math.min(expForLevel(def.growthRate,100,this.data.growth_rates), mon.exp + dc.steps);
+    const level = Math.max(mon.level, levelForExp(def.growthRate,exp,100,this.data.growth_rates));
+    const fee = 100 + 100 * Math.max(0, level - dc.depositLevel);
+    this.showChoice(`${mon.nickname ?? def.name} grew to L${level}.\nTake it back for ¥${fee}?`, yes => {
+      if (!yes) return;
+      if (this.save.party.length >= 6) { this.showText("Your party is full."); return; }
+      if ((this.save.money ?? 0) < fee) { this.showText("You don't have\nenough money."); return; }
+      this.save.money = (this.save.money ?? 0) - fee;
+      const learned: string[] = [];
+      for (let lv=mon.level+1;lv<=level;lv++) learned.push(...movesLearnedAt(def,lv));
+      mon.level=level; mon.exp=exp; mon.stats=calc(def,level,mon.dvs,mon.statExp); healMon(this.data,mon);
+      this.save.party.push(mon); delete this.save.daycare;
+      const next = (i: number): void => {
+        if (i < learned.length) this.offerFieldMove(mon, learned[i], () => next(i+1));
+      };
+      this.showText("Here's your POKéMON!", () => next(0));
+    });
+  }
+
+  openFanClub(): void {
+    if (this.save.flags.EVENT_GOT_BIKE_VOUCHER || this.save.inventory.BIKE_VOUCHER || this.save.inventory.BICYCLE) {
+      this.showText("Enjoy riding your\nBICYCLE!"); return;
+    }
+    this.showChoice("Hear about my\nfavorite POKéMON?", yes => {
+      if (!yes) return;
+      this.showText("My RAPIDASH is so\nadorable and fast!\fThanks for listening.", () => {
+        if (!Bag.add(this.save,"BIKE_VOUCHER",1,this.data)) { this.showText("Your BAG is full."); return; }
+        this.save.flags.EVENT_GOT_BIKE_VOUCHER=true;
+        this.showText("Take this BIKE\nVOUCHER to the\nCERULEAN BIKE SHOP!");
+      });
+    });
+  }
+
+  openBikeShop(): void {
+    if (this.save.inventory.BICYCLE) { this.showText("Enjoy your BICYCLE!"); return; }
+    if (!this.save.inventory.BIKE_VOUCHER) {
+      this.showChoice("A BICYCLE costs\n¥1000000. Buy one?", yes => {
+        if (yes) this.showText("You can't afford it.\nBring a BIKE VOUCHER\nfrom the FAN CLUB!");
+      });
+      return;
+    }
+    this.showChoice("Exchange your BIKE\nVOUCHER for a bike?", yes => {
+      if (!yes) return;
+      // Replacing the voucher frees its bag slot even when the bag is full.
+      Bag.remove(this.save,"BIKE_VOUCHER",1);
+      if (!Bag.add(this.save,"BICYCLE",1,this.data)) { Bag.add(this.save,"BIKE_VOUCHER",1,this.data); this.showText("Your BAG is full."); return; }
+      this.save.flags.EVENT_GOT_BICYCLE=true;
+      this.showText("You received a\nBICYCLE! Use it\nfrom the BAG.");
+    });
+  }
+
+  toggleBicycle(): void {
+    if (!this.save.inventory.BICYCLE) return;
+    if (this.overworld.map.def.tileset !== "OVERWORLD" || this.overworld.player.surfing) {
+      this.showText("You can't ride a\nBICYCLE here."); return;
+    }
+    this.cycling = !this.cycling;
+    this.applyMovementSpeed();
+    this.showText(this.cycling ? "Got on the BICYCLE!" : "Got off the BICYCLE.");
+  }
+
   private teachMachine(id: string, partyIndex: number): void {
     const item = this.data.items?.[id];
     const machine = item?.machine;
@@ -1216,10 +1324,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     this.showMenuChoice(`Forget which move\nfor ${moveName}?`, [...moveLabels, "CANCEL"], (moveIndex) => {
       const old = mon.moves[moveIndex];
       if (!old) return;
-      const oldMachine = Object.values(this.data.items ?? {}).find((def) =>
-        def.machine?.kind === "HM" && def.machine.move === old.id
-      );
-      if (oldMachine) {
+      if (isHmMove(this.data, old.id)) {
         this.showText("HM moves can't be\nforgotten!");
         return;
       }
@@ -1240,6 +1345,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     }), "CANCEL"], (itemIndex) => {
       const id = ids[itemIndex];
       if (!id) return;
+      if (id === "BICYCLE") { this.toggleBicycle(); return; }
       const machine = this.data.items?.[id]?.machine;
       const targets = this.save.party.map((mon) => {
         const species = this.data.pokemon[mon.species];
@@ -1255,22 +1361,8 @@ export class VoxelmonGame implements OverworldShell, SceneView {
           this.teachMachine(id, partyIndex);
           return;
         }
-        let used = false;
-        if (id === "POTION" && mon.hp > 0 && mon.hp < mon.stats.hp) {
-          mon.hp = Math.min(mon.stats.hp, mon.hp + 20);
-          used = true;
-        } else if (id === "ANTIDOTE" && mon.status === "PSN") {
-          mon.status = null; used = true;
-        } else if (id === "PARLYZ_HEAL" && mon.status === "PAR") {
-          mon.status = null; used = true;
-        } else if (id === "BURN_HEAL" && mon.status === "BRN") {
-          mon.status = null; used = true;
-        } else if (id === "AWAKENING" && mon.status === "SLP") {
-          mon.status = null; used = true;
-        }
-        if (!used) { this.showText("It won't have any\neffect."); return; }
-        this.save.inventory[id] -= 1;
-        if (this.save.inventory[id] <= 0) delete this.save.inventory[id];
+        if (!useMedicine(mon, id)) { this.showText("It won't have any\neffect."); return; }
+        Bag.remove(this.save, id, 1);
         this.showText(`${targets[partyIndex]} recovered!`);
       });
     });

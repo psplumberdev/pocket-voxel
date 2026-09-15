@@ -1,5 +1,28 @@
 <h1><img src="./web/favicon.svg" width="40" height="40" alt="" align="absmiddle" /> Pocket Voxel</h1>
 
+## September 14, 2026: gameplay fixes
+
+- Level-up and evolution learning now offer replacement when all four move slots
+  are occupied. HM moves are locked; cancel keeps the existing moves. Newly
+  learned moves start with full PP.
+- Trainer battles now allow medicine. Choose ITEM, a potion, then a party member.
+  Potions also work from the overworld BAG; Potion, Super Potion, Hyper Potion,
+  Max Potion and Full Restore are supported. Successful battle use gives the
+  opponent an action. Cancel/no effect keeps the item; potions do not revive.
+- Route 5 daycare supports depositing one Pokémon, step-based experience,
+  saving/loading, and paid retrieval (¥100 plus ¥100 per level gained). Retrieval
+  offers new moves without deleting HMs. Keep a healthy Pokémon in your party.
+- The Vermilion Fan Club chairman gives a Bike Voucher; exchange it at the
+  Cerulean Bike Shop. Use BICYCLE from the BAG to toggle faster outdoor movement;
+  entering an indoor map dismounts. The walking sprite is currently reused.
+- Supersonic's confusion application, self-damage and expiry pass deterministic
+  tests. Reusing it on a confused target now says “already confused.” Its
+  imported accuracy is unchanged; the reported hardware failure has not yet
+  been reproduced in these tests.
+
+These changes require the updated EBOOT. They have not yet been verified on a
+physical PSP. The report of days without crashes below describes earlier builds.
+
 ## September 12, 2026: Pokémon Voxel progress
 
 <p align="center">

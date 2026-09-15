@@ -11,8 +11,10 @@
 // v1 scope cuts, each flagged where it lands: trainer battles, ghosts,
 // Safari, the old-man demo, link play, move subanimations (anim rows keep
 // their queue shape and the MOVE_ANIM_PRE beat, nothing draws), sound, the
-// pokédex, nicknaming, the box system, and the replace-move prompt.
+// pokédex, nicknaming, and the box system.
 
+import { isMedicine, useMedicine } from "../rules/medicine.ts";
+import * as Bag from "../rules/bag.ts";
 import type { MoveDef, VoxelmonData } from "../data.ts";
 import { randRange, type Rng } from "../rng.ts";
 import {
@@ -53,7 +55,7 @@ import {
   type EffectMsgs,
   type HitFx,
 } from "./effects.ts";
-import { firstHealthy, newMon, partyAdd, type MoveSlot, type PartyMon } from "./mon.ts";
+import { firstHealthy, isHmMove, newMon, partyAdd, type MoveSlot, type PartyMon } from "./mon.ts";
 
 export type BattleResult = "win" | "lose" | "run" | "caught";
 
@@ -114,7 +116,7 @@ export interface MsgShown {
   revealed: number;
 }
 
-export type BattlePhase = "messages" | "menu" | "moveSelect" | "party" | "item";
+export type BattlePhase = "messages" | "menu" | "moveSelect" | "moveLearn" | "party" | "item";
 
 export class WildBattle implements EffectBattle {
   readonly kind: "wild" | "trainer";
@@ -140,6 +142,8 @@ export class WildBattle implements EffectBattle {
   menuIndex = 1;
   moveIndex = 1;
   moveSwapIndex: number | null = null;
+  learningMove: { mon: PartyMon; moveId: string } | null = null;
+  learnIndex = 0;
   private mimicChoice?: { moves: MoveSlot[]; choose: (index: number) => void };
   get selectionMoves(): MoveSlot[] { return this.mimicChoice?.moves ?? this.player.curMoves; }
   chooseMimic(moves: MoveSlot[], choose: (index: number) => void): void {
@@ -206,6 +210,7 @@ export class WildBattle implements EffectBattle {
   partyForced = false;
   itemIndex = 0;
   itemList: string[] = [];
+  healingItem: string | null = null;
 
   private participants = new Set<PartyMon>();
   /** mons that leveled up; game.ts runs Evolution.checkParty on the way out. */
@@ -731,6 +736,11 @@ export class WildBattle implements EffectBattle {
       return;
     }
 
+    if (this.phase === "moveLearn") {
+      this.updateMoveLearning(input);
+      return;
+    }
+
     if (this.phase === "moveSelect") {
       const moves = this.selectionMoves;
       if (this.mimicChoice) {
@@ -1241,21 +1251,54 @@ export class WildBattle implements EffectBattle {
     this.participants = new Set();
   }
 
-  /** :3993-4012 learnMove — auto when a slot is free. DEVIATION (v1): with
-   * four moves the replace-move prompt (MoveLearnMenu) is SKIPPED — the mon
-   * declines automatically, message only. */
+  /** Queue learning so multiple level-ups/EXP.ALL prompts resolve in order. */
   learnMove(mon: PartyMon, moveId: string): void {
-    const mdef = this.data.moves[moveId];
-    if (!mdef) return;
-    if (mon.moves.some((mv) => mv.id === moveId)) return;
-    const name = mon.nickname ?? this.data.pokemon[mon.species].name;
-    if (mon.moves.length < 4) {
-      mon.moves.push({ id: moveId, pp: mdef.pp });
+    this.actNext(() => {
+      const mdef = this.data.moves[moveId];
+      if (!mdef || mon.moves.some(mv => mv.id === moveId)) return;
+      const name = mon.nickname ?? this.data.pokemon[mon.species].name;
+      if (mon.moves.length < 4) {
+        mon.moves.push({ id: moveId, pp: mdef.pp });
+        this.sayNext(`${name} learned\n${mdef.name}!`);
+        return;
+      }
+      this.sayNext(`${name} is trying to\nlearn ${mdef.name}!`);
+      this.sayNext("Forget a non-HM move?\nB cancels learning.");
+      this.actNext(() => {
+        this.learningMove = { mon, moveId };
+        this.learnIndex = 0;
+        this.phase = "moveLearn";
+      });
+    });
+  }
+
+  private updateMoveLearning(input: BattleInput): void {
+    const learning = this.learningMove!;
+    const { mon, moveId } = learning;
+    const count = mon.moves.length + 1; // final row is CANCEL
+    if (input.wasPressed("up")) this.learnIndex = (this.learnIndex + count - 1) % count;
+    else if (input.wasPressed("down")) this.learnIndex = (this.learnIndex + 1) % count;
+    else if (input.wasPressed("b") || input.wasPressed("a")) {
+      const old = mon.moves[this.learnIndex];
+      const cancel = input.wasPressed("b") || !old;
+      this.phase = "messages";
+      this.nextInsert = 0;
+      if (!cancel && isHmMove(this.data, old.id)) {
+        this.sayNext("HM moves can't be\nforgotten!");
+        this.actNext(() => { this.phase = "moveLearn"; });
+        return;
+      }
+      this.learningMove = null;
+      const name = mon.nickname ?? this.data.pokemon[mon.species].name;
+      const mdef = this.data.moves[moveId];
+      if (cancel) {
+        this.sayNext(`${name} did not learn\n${mdef.name}!`);
+        return;
+      }
+      mon.moves[this.learnIndex] = { id: moveId, pp: mdef.pp };
+      this.sayNext(`${name} forgot\n${this.data.moves[old.id]?.name ?? old.id}!`);
       this.sayNext(`${name} learned\n${mdef.name}!`);
-      return;
     }
-    this.sayNext(`${name} is trying to\nlearn ${mdef.name}!`);
-    this.sayNext(`${name} did not learn\n${mdef.name}!`);
   }
 
   /** :3808-3990 enemyMonFainted, wild slice: exp then the win. */
@@ -1335,18 +1378,12 @@ export class WildBattle implements EffectBattle {
   // items / catching (:4315-4575)
   // -------------------------------------------------------------------
 
-  /** :4315-4321 openItems, narrowed to balls (v1: the bag is ball-only). */
+  /** Open usable battle items; trainer battles prohibit capture, not medicine. */
   openItems(): void {
-    if (this.kind === "trainer") {
-      this.say("The trainer blocked\nthe BALL!");
-      this.phase = "messages";
-      this.afterQueue = "menu";
-      return;
-    }
     this.itemList = Object.keys(this.save.inventory).filter((id) => {
       if ((this.save.inventory[id] ?? 0) <= 0) return false;
       const def = this.data.items?.[id];
-      return def?.ball !== undefined || id.endsWith("_BALL");
+      return isMedicine(id) || def?.ball !== undefined || id.endsWith("_BALL");
     });
     if (this.itemList.length === 0) {
       // v1 stand-in for an empty battle bag; the reference opens the full
@@ -1356,6 +1393,7 @@ export class WildBattle implements EffectBattle {
       this.afterQueue = "menu";
       return;
     }
+    this.healingItem = null;
     this.itemIndex = Math.min(this.itemIndex, this.itemList.length - 1);
     this.phase = "item";
   }
@@ -1368,13 +1406,21 @@ export class WildBattle implements EffectBattle {
     } else if (input.wasPressed("b")) {
       this.phase = "menu";
     } else if (input.wasPressed("a")) {
-      const ball = this.itemList[this.itemIndex];
-      // UseBagItem consumes the ball (item_effects.asm .done)
-      this.save.inventory[ball] = (this.save.inventory[ball] ?? 1) - 1;
-      if (this.save.inventory[ball] <= 0) delete this.save.inventory[ball];
+      const id = this.itemList[this.itemIndex];
+      if (isMedicine(id)) {
+        this.healingItem = id;
+        this.partyIndex = 0; this.partyForced = false; this.phase = "party";
+        return;
+      }
       this.phase = "messages";
       this.afterQueue = "menu";
-      this.throwBall(ball);
+      if (this.kind === "trainer") {
+        this.say("The trainer blocked\nthe BALL!");
+        return;
+      }
+      if ((this.save.inventory[id] ?? 0) < 1) return;
+      Bag.remove(this.save, id, 1);
+      this.throwBall(id);
     }
   }
 
@@ -1454,6 +1500,30 @@ export class WildBattle implements EffectBattle {
   }
 
   private updateParty(input: BattleInput): void {
+    if (this.healingItem) {
+      if (input.wasPressed("up")) this.partyIndex = Math.max(0, this.partyIndex - 1);
+      else if (input.wasPressed("down")) this.partyIndex = Math.min(this.save.party.length - 1, this.partyIndex + 1);
+      else if (input.wasPressed("b")) { this.healingItem = null; this.phase = "item"; }
+      else if (input.wasPressed("a")) {
+        const id = this.healingItem, mon = this.save.party[this.partyIndex];
+        this.healingItem = null; this.phase = "messages"; this.afterQueue = "menu";
+        if ((this.save.inventory[id] ?? 0) < 1 || !mon || !useMedicine(mon, id)) {
+          this.say("It won't have any\neffect."); return;
+        }
+        Bag.remove(this.save, id, 1);
+        if (mon === this.player.mon) {
+          if (!mon.status) this.player.sleepTurns = this.player.toxicCounter = undefined;
+          this.player.shownStatus = mon.status;
+        }
+        this.say(`${mon.nickname ?? this.data.pokemon[mon.species].name} recovered!`);
+        if (mon === this.player.mon) this.queue.push({ drain: true, battler: this.player, stopAt: mon.hp });
+        this.act(() => this.executeAction(this.enemy, this.player, this.enemyAction()));
+        this.queueResidual(this.player, this.enemy);
+        this.act(() => this.endOfTurn());
+      }
+      return;
+    }
+
     const party = this.save.party;
     if (input.wasPressed("up")) {
       this.partyIndex = Math.max(0, this.partyIndex - 1);

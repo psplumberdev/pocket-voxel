@@ -289,7 +289,7 @@ export const EFFECTS: Record<string, EffectRecord> = {
   CONFUSION_SIDE_EFFECT: {
     kind: "secondary",
     run: (ctx) => {
-      if (ctx.target.confusedTurns || ctx.rng.byte() >= 25) return [];
+      if (ctx.target.substituteHP !== undefined || ctx.target.confusedTurns || ctx.rng.byte() >= 25) return [];
       ctx.target.confusedTurns = randRange(ctx.rng, 2, 5);
       return [`${displayName(ctx.target)}\nbecame confused!`];
     },
@@ -352,7 +352,8 @@ for (const [effect, status] of [["SLEEP", "SLP"], ["POISON", "PSN"], ["PARALYZE"
   } };
 }
 EFFECTS.CONFUSION_EFFECT = { kind: "primary", accuracyChecked: true, run: ctx => {
-  if (ctx.target.confusedTurns || ctx.target.substituteHP !== undefined) return ["But, it failed!"];
+  if (ctx.target.confusedTurns) return Object.assign([`${displayName(ctx.target)}\nis already confused!`], { failed: true });
+  if (ctx.target.substituteHP !== undefined) return ["But, it failed!"];
   ctx.target.confusedTurns = randRange(ctx.rng, 2, 5);
   return [`${displayName(ctx.target)}\nbecame confused!`];
 } };
