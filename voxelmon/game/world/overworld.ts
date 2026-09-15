@@ -1,3 +1,4 @@
+import { grantItem, GYM_REWARDS } from "./rewards.ts";
 import { PartyFollower } from "./follower.ts";
 import { trainerHeader } from "./trainers.ts";
 import { physicalExit } from "./warp.ts";
@@ -301,7 +302,7 @@ export class Overworld implements ScriptWorld {
       chosen.EVENT_GOT_TM28 || chosen.EVENT_BEAT_CERULEANCITY_ROCKET);
     if (obj.name === "CERULEANCITY_GUARD1") return houseOpen;
     if (obj.name === "CERULEANCITY_GUARD2") return !houseOpen;
-    if (obj.name === "CERULEANCITY_ROCKET" && (chosen.EVENT_GOT_TM28 || chosen.EVENT_BEAT_CERULEAN_ROCKET_THIEF)) return false;
+    if (obj.name === "CERULEANCITY_ROCKET" && chosen.EVENT_GOT_TM28) return false;
     if (obj.name === "SSANNE2F_RIVAL") return !chosen.EVENT_BEAT_SS_ANNE_RIVAL;
     return !(obj as MapObject & { hidden?: boolean }).hidden;
   }
@@ -775,11 +776,9 @@ export class Overworld implements ScriptWorld {
     if (name === "CERULEANCITY_ROCKET") {
       const flags = this.shell.save.flags;
       const finish = () => {
-        if (!flags.EVENT_GOT_TM28) {
-          this.shell.save.inventory.TM_DIG = (this.shell.save.inventory.TM_DIG ?? 0) + 1;
-          flags.EVENT_GOT_TM28 = true;
-        }
+        const reward = grantItem(this.shell.save, this.shell.data, "EVENT_GOT_TM28", "TM_DIG");
         flags.EVENT_BEAT_CERULEAN_ROCKET_THIEF = true;
+        if (reward === "full") { this.shell.showText("Your BAG is full.\nMake room for TM28."); return; }
         this.shell.showText("You received TM28\n- DIG!", () => {
           this.npcs = this.npcs.filter(n => n !== npc && this.objectVisible(n.def));
           const guard = this.map.def.objects.find(o => o.name === "CERULEANCITY_GUARD1");
@@ -901,8 +900,9 @@ export class Overworld implements ScriptWorld {
     }
     const item = itemBalls[name] ?? npc.def.item;
     if (item) {
-      this.shell.save.inventory[item] = (this.shell.save.inventory[item] ?? 0) + 1;
-      this.shell.save.flags[`EVENT_TAKEN_${name}`] = true;
+      const reward = grantItem(this.shell.save, this.shell.data, `EVENT_TAKEN_${name}`, item);
+      if (reward === "full") { this.shell.showText("Your BAG is full."); return true; }
+      if (reward === "already") return true;
       this.npcs = this.npcs.filter((candidate) => candidate !== npc);
       this.entities = [this.player, ...this.npcs];
       this.shell.showText(`${this.shell.save.player.name} found\n${item.replaceAll("_", " ")}!`);
@@ -962,6 +962,7 @@ export class Overworld implements ScriptWorld {
     };
     const beatFlag = header?.event ?? trainer.event ?? (name === "PEWTERGYM_BROCK" ? "EVENT_BEAT_BROCK" : (forestFlag[name] ?? `EVENT_BEAT_${name}`));
     if (this.shell.save.flags[beatFlag] || this.shell.save.flags[`EVENT_BEAT_${name}`]) {
+      if (GYM_REWARDS[name] && !this.shell.save.flags[GYM_REWARDS[name].event]) { this.giveGymReward(name); return true; }
       if (name === "PEWTERGYM_BROCK") {
         this.shell.showText("Go to the GYM in\nCERULEAN and test\nyour abilities!");
         return true;
@@ -977,23 +978,8 @@ export class Overworld implements ScriptWorld {
     this.shell.showText(pre, () => this.shell.pushTrainerBattle(label, trainer.trainerClass, party, () => {
       this.shell.save.flags[beatFlag] = true;
       npc.frozen = false;
-      if (name === "PEWTERGYM_BROCK") {
-        this.shell.save.inventory.BOULDERBADGE = 1;
-        this.shell.save.inventory.TM_BIDE = (this.shell.save.inventory.TM_BIDE ?? 0) + 1;
-        this.shell.save.flags.EVENT_GOT_TM34 = true;
-        this.shell.showText("You received the\nBOULDERBADGE!\fBROCK gave you\nTM34 - BIDE!");
-      } else if (name === "CERULEANGYM_MISTY") {
-        this.shell.save.inventory.CASCADEBADGE = 1;
-        this.shell.save.inventory.TM_BUBBLEBEAM = (this.shell.save.inventory.TM_BUBBLEBEAM ?? 0) + 1;
-        this.shell.save.flags.EVENT_GOT_TM11 = true;
-        this.shell.showText("You received the\nCASCADEBADGE!\fMISTY gave you\nTM11 - BUBBLEBEAM!");
-      } else if (name === "VERMILIONGYM_LT_SURGE" || name === "CELADONGYM_ERIKA") {
-        const surge = name === "VERMILIONGYM_LT_SURGE";
-        this.shell.save.inventory[surge ? "THUNDERBADGE" : "RAINBOWBADGE"] = 1;
-        const tm = surge ? "TM_THUNDERBOLT" : "TM_MEGA_DRAIN";
-        this.shell.save.inventory[tm] = (this.shell.save.inventory[tm] ?? 0) + 1;
-        this.shell.save.flags[surge ? "EVENT_GOT_TM24" : "EVENT_GOT_TM21"] = true;
-        this.shell.showText(surge ? "You received the\nTHUNDERBADGE!\fTM24 - THUNDERBOLT!" : "You received the\nRAINBOWBADGE!\fTM21 - MEGA DRAIN!");
+      if (GYM_REWARDS[name]) {
+        this.giveGymReward(name);
       } else if (this.map.id === "ROUTE_24" && this.bridgeComplete() && !this.shell.save.flags.EVENT_GOT_NUGGET) {
         this.awardNugget();
       } else {
@@ -1001,6 +987,15 @@ export class Overworld implements ScriptWorld {
       }
     }));
     return true;
+  }
+
+  private giveGymReward(name: string): void {
+    const reward = GYM_REWARDS[name];
+    this.shell.save.inventory[reward.badge] = 1;
+    const result = grantItem(this.shell.save, this.shell.data, reward.event, reward.tm);
+    this.shell.showText(result === "full"
+      ? `You earned the\n${reward.badge}!\fYour BAG is full.\nCome back for your TM.`
+      : `You received the\n${reward.badge}!\fYou received\n${reward.tm.replaceAll("_", " ")}!`);
   }
 
   private bridgeComplete(): boolean {

@@ -170,6 +170,38 @@ export const DEFAULT_MAPS: readonly string[] = [
   "CELADON_MART_ELEVATOR",
   "GAME_CORNER",
   "GAME_CORNER_PRIZE_ROOM",
+  // Rocket Hideout, Pokémon Tower and Saffron/Silph event chapter. These
+  // maps are streamed from the Memory Stick on PSP; they are not resident as
+  // one monolithic world allocation.
+  "ROCKET_HIDEOUT_B1F",
+  "ROCKET_HIDEOUT_B2F",
+  "ROCKET_HIDEOUT_B3F",
+  "ROCKET_HIDEOUT_B4F",
+  "ROCKET_HIDEOUT_ELEVATOR",
+  "POKEMON_TOWER_2F",
+  "POKEMON_TOWER_3F",
+  "POKEMON_TOWER_4F",
+  "POKEMON_TOWER_5F",
+  "POKEMON_TOWER_6F",
+  "POKEMON_TOWER_7F",
+  "MR_FUJIS_HOUSE",
+  "SAFFRON_CITY",
+  "SAFFRON_POKECENTER",
+  "SAFFRON_MART",
+  "SAFFRON_PIDGEY_HOUSE",
+  "FIGHTING_DOJO",
+  "SAFFRON_GYM",
+  "SILPH_CO_1F",
+  "SILPH_CO_2F",
+  "SILPH_CO_3F",
+  "SILPH_CO_4F",
+  "SILPH_CO_5F",
+  "SILPH_CO_6F",
+  "SILPH_CO_7F",
+  "SILPH_CO_8F",
+  "SILPH_CO_9F",
+  "SILPH_CO_10F",
+  "SILPH_CO_11F",
 
 ];
 

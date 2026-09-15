@@ -23,6 +23,12 @@
 These changes require the updated EBOOT. They have not yet been verified on a
 physical PSP. The report of days without crashes below describes earlier builds.
 
+The next event chapter is mapped in [the city and Team Rocket event audit](docs/audits/city-events.md).
+It tracks Game Corner, Rocket Hideout, Pokémon Tower, Saffron and Silph Co
+dependencies, reward flags, map coverage, and acceptance checks. The event maps
+are now in the default cook set; Silph's placeholder elevator destination is
+intentionally excluded until its ROM warp table is fixed.
+
 ## September 12, 2026: Pokémon Voxel progress
 
 <p align="center">
