@@ -2,6 +2,11 @@ import { grantItem, GYM_REWARDS } from "./rewards.ts";
 import { PartyFollower } from "./follower.ts";
 import { trainerHeader } from "./trainers.ts";
 import { physicalExit } from "./warp.ts";
+import {
+  OVERWORLD_ATTACK_COOLDOWN,
+  isOverworldAttackSpecies,
+  overworldAttacksFor,
+} from "./overworld-attack.ts";
 // The overworld controller SLICE. Ports the world-facing core of gen1recomp
 // src/world/OverworldController.lua: map entry and connections, grid
 // movement, ledges, warps (arrival / collision / edge), NPC wander,
@@ -202,6 +207,12 @@ export class Overworld implements ScriptWorld {
   /** Battle-port seam bookkeeping the tests and the sim read. */
   encounterCount = 0;
   lastEncounter?: { species: string; level: number };
+  /** Active real-time Pokémon pilot, owned by the overworld so movement and
+   * target coordinates remain in the same grid as normal map play. */
+  pokemonPilot?: { monIndex: number; attackIndex: number };
+  pokemonAttackCooldown = 0;
+  pokemonAttackMessage = "READY";
+  pokemonProjectile?: { x: number; y: number; frames: number };
 
   constructor(shell: OverworldShell) {
     this.shell = shell;
@@ -220,6 +231,82 @@ export class Overworld implements ScriptWorld {
 
   get save(): SaveSlice {
     return this.shell.save;
+  }
+
+  canUsePokemonPilot(monIndex = 0): boolean {
+    const mon = this.shell.save.party?.[monIndex];
+    return !!mon && mon.hp > 0 && typeof mon.species === "string" && isOverworldAttackSpecies(mon.species);
+  }
+
+  startPokemonPilot(monIndex = 0): boolean {
+    if (!this.canUsePokemonPilot(monIndex)) return false;
+    this.pokemonPilot = { monIndex, attackIndex: 0 };
+    this.pokemonAttackCooldown = 0;
+    this.pokemonAttackMessage = `${this.shell.save.party![monIndex]!.species} READY`;
+    return true;
+  }
+
+  stopPokemonPilot(): void {
+    this.pokemonPilot = undefined;
+    this.pokemonProjectile = undefined;
+    this.pokemonAttackMessage = "READY";
+  }
+
+  cyclePokemonAttack(delta = 1): void {
+    const pilot = this.pokemonPilot;
+    if (!pilot) return;
+    const attacks = overworldAttacksFor(this.shell.save.party![pilot.monIndex]!.species ?? "");
+    pilot.attackIndex = (pilot.attackIndex + delta + attacks.length) % attacks.length;
+    this.pokemonAttackMessage = attacks[pilot.attackIndex]!.name;
+  }
+
+  /** One tick of the Pokémon-controlled field mode. */
+  updatePokemonPilot(): void {
+    const pilot = this.pokemonPilot;
+    if (!pilot) return;
+    if (this.pokemonAttackCooldown > 0) this.pokemonAttackCooldown--;
+    if (this.pokemonProjectile && --this.pokemonProjectile.frames <= 0) this.pokemonProjectile = undefined;
+    const input = this.shell.input;
+    if (input.wasPressed("b") || input.wasPressed("start")) { this.stopPokemonPilot(); return; }
+    if (input.wasPressed("select") || input.wasPressed("right")) this.cyclePokemonAttack();
+    for (const dir of ["up", "down", "left", "right"] as Dir[]) {
+      if (!input.isDown(dir) || (dir === "right" && input.wasPressed("right"))) continue;
+      this.player.facing = dir;
+      if (this.player.tryMove(dir, this.map, this.entities, this.tilePairs) !== "blocked") break;
+    }
+    if (input.wasPressed("a")) this.firePokemonAttack();
+    // Wilds remain live and become hostile inside the requested five-tile ring.
+    this.wild.update(this.shell.data, this.map, this.player, this.entities, this.tilePairs, this.shell.data.followerSprites ? 1 : 0);
+    for (const wild of this.wild.slots) {
+      if (!wild.active) continue;
+      wild.aggro = Math.abs(wild.cellX - this.player.cellX) + Math.abs(wild.cellY - this.player.cellY) <= 5;
+    }
+  }
+
+  private firePokemonAttack(): void {
+    const pilot = this.pokemonPilot;
+    if (!pilot || this.pokemonAttackCooldown > 0) {
+      if (pilot) this.pokemonAttackMessage = `COOLDOWN ${Math.ceil(this.pokemonAttackCooldown / 60)}s`;
+      return;
+    }
+    const mon = this.shell.save.party![pilot.monIndex]!;
+    const attack = overworldAttacksFor(mon.species ?? "")[pilot.attackIndex]!;
+    const range = attack.kind === "melee" ? 1 : 5;
+    const dx = this.player.facing === "left" ? -1 : this.player.facing === "right" ? 1 : 0;
+    const dy = this.player.facing === "up" ? -1 : this.player.facing === "down" ? 1 : 0;
+    const targetX = this.player.cellX + dx * range;
+    const targetY = this.player.cellY + dy * range;
+    const wild = this.wild.slots.find(w => w.active &&
+      (attack.kind === "melee"
+        ? Math.abs(w.cellX - this.player.cellX) + Math.abs(w.cellY - this.player.cellY) <= 1
+        : (w.cellX - this.player.cellX) * dx + (w.cellY - this.player.cellY) * dy > 0 &&
+          Math.abs(w.cellX - this.player.cellX) + Math.abs(w.cellY - this.player.cellY) <= 5));
+    this.pokemonAttackCooldown = OVERWORLD_ATTACK_COOLDOWN;
+    this.pokemonProjectile = attack.kind === "ranged" ? { x: targetX, y: targetY, frames: 8 } : undefined;
+    if (!wild) { this.pokemonAttackMessage = `${attack.name} MISS`; return; }
+    wild.hp = Math.max(0, wild.hp - attack.power);
+    this.pokemonAttackMessage = `${attack.name} HIT ${wild.species} ${wild.hp}/${wild.maxHp}`;
+    if (wild.hp === 0) { wild.active = false; wild.aggro = false; this.pokemonAttackMessage = `${wild.species} FAINTED`; }
   }
 
   // OverworldController.lua:209 enter

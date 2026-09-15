@@ -54,6 +54,7 @@ import {
   type UiBoxSource,
 } from "./scene.ts";
 import { Overworld, type OverworldShell, type SaveSlice } from "./world/overworld.ts";
+import { isOverworldAttackSpecies, overworldAttacksFor } from "./world/overworld-attack.ts";
 import { Textbox } from "./world/textbox.ts";
 
 /** The full save: the overworld slice plus the party the battle port added. */
@@ -160,7 +161,7 @@ class StartMenuState implements GameState, SystemOverlaySource {
   private selected = 0;
   private status = "";
   private get labels(): readonly string[] {
-    return ["POKEMON", "ITEM", `MUSIC ${this.game.musicEnabled ? "ON" : "OFF"}`, "SAVE", "EXIT"];
+    return ["POKEMON", "ITEM", "OVERWORLD ATTACK", `MUSIC ${this.game.musicEnabled ? "ON" : "OFF"}`, "SAVE", "EXIT"];
   }
   constructor(private game: VoxelmonGame) {}
   update(): void {
@@ -174,12 +175,13 @@ class StartMenuState implements GameState, SystemOverlaySource {
     else if (input.wasPressed("a")) {
       if (this.selected === 0) { this.game.pop(); this.game.openParty(); return; }
       if (this.selected === 1) { this.game.pop(); this.game.openBag(); return; }
-      if (this.selected === 2) {
+      if (this.selected === 2) { this.game.pop(); this.game.openOverworldAttack(); return; }
+      if (this.selected === 3) {
         this.game.setMusicEnabled(!this.game.musicEnabled);
         this.status = this.game.musicEnabled ? "SLOW WALK" : "NORMAL WALK";
-      } else if (this.selected === 3) {
+      } else if (this.selected === 4) {
         this.status = this.game.saveGame() ? "GAME SAVED." : "SAVE FAILED!";
-      } else if (this.selected === 4) { this.game.pop(); return; }
+      } else if (this.selected === 5) { this.game.pop(); return; }
     } else return;
     this.revision += 1;
   }
@@ -189,6 +191,38 @@ class StartMenuState implements GameState, SystemOverlaySource {
       host.uiLabel(322, 38 + i * 28, 1, 0xffffffff, `${i === this.selected ? ">" : " "} ${this.labels[i]}`);
     }
     if (this.status) host.uiLabel(304, 188, 1, 0xffffffff, this.status);
+  }
+}
+
+/** Real-time field combat overlay. The world controller owns movement and
+ * collision; this state only keeps the HUD and button policy on top. */
+class OverworldAttackState implements GameState, SystemOverlaySource {
+  readonly kind = "overworld-attack";
+  revision = 0;
+  constructor(private game: VoxelmonGame, private monIndex: number) {
+    game.overworld.startPokemonPilot(monIndex);
+  }
+  update(): void {
+    const before = this.game.overworld.pokemonAttackMessage;
+    this.game.overworld.updatePokemonPilot();
+    if (this.game.overworld.pokemonAttackMessage !== before) this.revision++;
+    if (!this.game.overworld.pokemonPilot) this.game.pop();
+  }
+  emit(host: VoxelHost): void {
+    const ow = this.game.overworld;
+    const pilot = ow.pokemonPilot;
+    if (!pilot) return;
+    const mon = this.game.save.party[pilot.monIndex];
+    if (!mon) return;
+    const name = mon.nickname ?? this.game.data.pokemon[mon.species]?.name ?? mon.species;
+    const attacks = overworldAttacksFor(mon.species);
+    host.uiRect(4, 182, 224, 84, 0xdd000000);
+    host.uiLabel(10, 188, 1, 0xffffffff, `OVERWORLD ATTACK  ${name}`);
+    host.uiLabel(10, 202, 1, 0xff70e070, `HP ${mon.hp}/${mon.stats.hp}`);
+    host.uiLabel(10, 216, 1, 0xffffff80, `A ${attacks[pilot.attackIndex]?.name ?? "ATTACK"}`);
+    host.uiLabel(10, 230, 1, 0xffb0b0ff, `${attacks[pilot.attackIndex]?.kind.toUpperCase() ?? "MELEE"}  RANGE ${attacks[pilot.attackIndex]?.kind === "ranged" ? 5 : 1}`);
+    host.uiLabel(10, 244, 1, 0xffffffff, ow.pokemonAttackMessage.slice(0, 32));
+    host.uiLabel(10, 258, 1, 0xffc0c0c0, "D-PAD MOVE  RIGHT/SELECT TOGGLE  B EXIT");
   }
 }
 
@@ -1017,6 +1051,23 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     this.push(new StartMenuState(this));
   }
 
+  openOverworldAttack(): void {
+    const eligible = this.save.party
+      .map((mon, i) => ({ mon, i }))
+      .filter(({ mon }) => mon.hp > 0 && isOverworldAttackSpecies(mon.species));
+    if (eligible.length === 0) {
+      this.showText("No compatible POKéMON\nfor overworld attacks.");
+      return;
+    }
+    this.showMenuChoice("Choose your field\nPOKéMON.", [
+      ...eligible.map(({ mon }) => mon.nickname ?? this.data.pokemon[mon.species]?.name ?? mon.species),
+      "CANCEL",
+    ], index => {
+      const chosen = eligible[index];
+      if (chosen) this.push(new OverworldAttackState(this, chosen.i));
+    });
+  }
+
   pushWarpFade(frames: number, midpoint: () => void, onDone?: () => void): void {
     this.push(new WarpFadeState(this, frames, midpoint, onDone));
   }
@@ -1395,8 +1446,8 @@ export class VoxelmonGame implements OverworldShell, SceneView {
 
   systemOverlay(): SystemOverlaySource | null {
     const top = this.stack[this.stack.length - 1];
-    return top?.kind === "title" || top?.kind === "start-menu"
-      ? (top as TitleState | StartMenuState)
+    return top?.kind === "title" || top?.kind === "start-menu" || top?.kind === "overworld-attack"
+      ? (top as TitleState | StartMenuState | OverworldAttackState)
       : null;
   }
 

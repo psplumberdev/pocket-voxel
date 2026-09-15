@@ -33,6 +33,10 @@ export class WildSprite implements Mover {
   progress = 0;
   timer = 0;
   animation = 0;
+  /** Runtime health used by overworld attacks; normal contact battles ignore it. */
+  hp = 1;
+  maxHp = 1;
+  aggro = false;
   get frame(): number { return Math.floor(this.animation / 16) % 2; }
 }
 
@@ -59,7 +63,7 @@ export class WildPopulation {
   constructor(readonly rng: Rng = seededRng(0x57494c44)) {}
 
   clear(): void {
-    for (const wild of this.slots) { wild.active = false; wild.moving = false; }
+    for (const wild of this.slots) { wild.active = false; wild.moving = false; wild.aggro = false; }
     this.clock = 0;
     this.firstSpawn = true;
   }
@@ -167,6 +171,9 @@ export class WildPopulation {
       const icon = slot && data.pokemon[slot.species]?.partyIcon;
       if (!slot || !icon || data.partyIcons[icon] === undefined) return;
       free.species = slot.species; free.level = slot.level; free.icon = icon;
+      const species = data.pokemon[slot.species];
+      free.maxHp = free.hp = species ? Math.max(1, species.baseStats.hp + slot.level * 2) : 1;
+      free.aggro = false;
       free.habitat = habitat; free.surfing = habitat === "water";
       free.cellX = x; free.cellY = y; free.px = x * 16; free.py = y * 16;
       free.targetX = free.targetY = undefined;
