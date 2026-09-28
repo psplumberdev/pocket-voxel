@@ -6,7 +6,8 @@
 // side registers `globalThis.voxel` (crates/
 // pocketvoxel-psp/src/voxel.rs), one function per VOX_OP.
 //
-// Boot: one cold JSON.parse of the pak's GAME section (docs/VOXEL.md §4),
+// Boot: one cold native JSON parse of the pak's GAME section (with a
+// JSON.parse string fallback for older hosts),
 // then the game runs entirely guest-side; per tick the host calls
 // `globalThis.frame(buttons)` exactly once (§3). The Bun sim loads the SAME
 // cooked gamedata (data.ts loadRuntimeData prefers dist/voxelmon/
@@ -26,6 +27,7 @@ const SEED = 17;
 interface VoxelNative {
   bootLog(checkpoint: number): void;
   gamedata(): string;
+  parseGameData?(): Record<string, unknown>;
   audiodata(): ArrayBuffer | undefined;
   stats(): void;
   saveLoad?(): string | undefined;
@@ -245,10 +247,13 @@ class QuickJsHost implements VoxelHost {
 
 // ---- boot: one cold parse, then the guest owns the game ----
 const host = new QuickJsHost();
-const gameJson = native.gamedata();
-const source = JSON.parse(gameJson) as Record<string, unknown>;
-const data = fromObject(source);
+native.bootLog?.(1);
+const data = fromObject(native.parseGameData
+  ? native.parseGameData()
+  : JSON.parse(native.gamedata()) as Record<string, unknown>);
+native.bootLog?.(2);
 const game = new VoxelmonGame(data, host, SEED);
+native.bootLog?.(3);
 // AUDIO ON. This loads the pak's AUDI manifest, which is what lets the
 // director resolve a song name to (bank, address, engine) and emit the audio
 // ops; the ROM's channel programs stay in the pak and the chip synth that
@@ -272,6 +277,7 @@ const game = new VoxelmonGame(data, host, SEED);
 // never cross into native audiodata()/manifest parsing. Restore audio only
 // after the file-backed graphics path leaves measured RAM headroom.
 game.boot();
+native.bootLog?.(4);
 
 // Native calls this only after JS_EvalFunction has returned and the small
 // resident AUDI section is mounted. Deferring the manifest parse preserves

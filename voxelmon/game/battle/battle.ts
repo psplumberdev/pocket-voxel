@@ -13,6 +13,7 @@
 // their queue shape and the MOVE_ANIM_PRE beat, nothing draws), sound, the
 // pokédex, nicknaming, and the box system.
 
+import { useRareCandy } from "../rules/rare-candy.ts";
 import { isMedicine, useMedicine } from "../rules/medicine.ts";
 import * as Bag from "../rules/bag.ts";
 import type { MoveDef, VoxelmonData } from "../data.ts";
@@ -135,6 +136,9 @@ export class WildBattle implements EffectBattle {
   player!: WildBattler;
   enemy!: WildBattler;
   dead = false;
+  noCatch = false;
+  ghost = false;
+  pokeDollEscape = false;
 
   queue: QueueRow[] = [];
   phase: BattlePhase = "messages";
@@ -246,6 +250,21 @@ export class WildBattle implements EffectBattle {
       // keep the shared phases nil-safe like makeOldManDemo (:810-817)
       this.player = this.enemy;
     }
+  }
+
+  /** Resolve the existing move pipeline without battle-screen presentation. */
+  resolveFieldAction(user: WildBattler, target: WildBattler, action: MoveSlot & { struggle?: boolean }): string[] {
+    this.queue.length = 0;
+    this.nextInsert = 0;
+    this.executeAction(user, target, action);
+    const messages: string[] = [];
+    while (this.queue.length) {
+      const row = this.queue.shift()!;
+      this.nextInsert = 0;
+      if (row.fn) row.fn();
+      if (row.text) messages.push(row.text.replace(/\n/g, " "));
+    }
+    return messages;
   }
 
   // -------------------------------------------------------------------
@@ -602,7 +621,7 @@ export class WildBattle implements EffectBattle {
     this.act(() => this.audioCues.push(`cry:${this.enemy.mon.species}`));
     this.say(this.kind === "trainer"
       ? `${this.opponentName} sent\nout ${this.enemy.name}!`
-      : `Wild ${this.enemy.name}\nappeared!`);
+      : this.ghost ? "A restless GHOST\nappeared!" : `Wild ${this.enemy.name}\nappeared!`);
     // _InitBattleCommon clears the intro chrome the instant the intro text
     // is dismissed (:1534-1539, #317)
     this.act(() => {
@@ -698,6 +717,9 @@ export class WildBattle implements EffectBattle {
       this.clearTurnFlinches();
       // recharge/Rage/thrash/charge would skip DisplayBattleMenu
       // (:1867-1873); none is reachable from the v1 effect set
+      if (this.player.chargingMove) {
+        this.resolveTurn(this.player.chargingMove); return;
+      }
       if (this.player.bideTurns !== undefined) {
         this.resolveTurn({ id: "BIDE", pp: 1 });
         return;
@@ -837,6 +859,7 @@ export class WildBattle implements EffectBattle {
    * slot is missing or disabled.
    */
   enemyAction(): MoveSlot & { struggle?: boolean } {
+    if (this.enemy.chargingMove) return this.enemy.chargingMove;
     const usable: MoveSlot[] = [];
     this.enemy.curMoves.forEach((mv, i) => {
       if (this.enemy.disabledSlot !== i + 1 && (this.ruleset.enemyUnlimitedPP || mv.pp > 0)) {
@@ -957,7 +980,9 @@ export class WildBattle implements EffectBattle {
     user.boundTurns =
       target.trappingTurns !== undefined ? Math.max(1, target.trappingTurns) : undefined;
 
-    if (!this.statusInterrupt(user, target)) {
+    const interrupted = this.statusInterrupt(user, target);
+    if (interrupted && user.chargingMove) { user.chargingMove = undefined; user.invulnerable = undefined; }
+    if (!interrupted) {
       if (user.bideTurns !== undefined) {
         user.bideTurns -= 1;
         if (user.bideTurns > 0) this.sayNext(`${displayName(user)}\nis storing energy!`);
@@ -1038,17 +1063,20 @@ export class WildBattle implements EffectBattle {
     moveInst: MoveSlot & { struggle?: boolean },
     isCalled: boolean,
   ): void {
+    if (this.ghost && user.isPlayer) { this.sayNext("Too scared to move!"); return; }
     const move = this.data.moves[moveInst.id];
     if (!move) {
       console.warn(`unknown move instance ${moveInst.id}`);
       return;
     }
     const record = effectRecord(move.effect);
+    const releasingCharge = user.chargingMove?.id === move.id;
+    if (releasingCharge) { user.chargingMove = undefined; user.invulnerable = undefined; }
 
     // PP: not for struggle, called moves, or (gen1_faithful) enemies —
     // DecrementPP only ever mutates the player side (:3411-3429)
     const enemyUnlimited = !user.isPlayer && this.ruleset.enemyUnlimitedPP;
-    if (!moveInst.struggle && !isCalled && !enemyUnlimited) {
+    if (!moveInst.struggle && !isCalled && !enemyUnlimited && !releasingCharge) {
       moveInst.pp = Math.max(0, moveInst.pp - 1);
     }
 
@@ -1070,10 +1098,12 @@ export class WildBattle implements EffectBattle {
     }
     user.lastMove = move.id;
 
-    // charge moves (:3470-3498) — no charge record is registered in v1
-    if (record?.charge) {
+    // Fly/Dig hide for one turn; field combat owns its separate timed charge.
+    if ((move.id === "FLY" || move.id === "DIG") && move.effect !== "NO_ADDITIONAL_EFFECT" && !releasingCharge) {
+      user.chargingMove = moveInst;
+      user.invulnerable = true;
       this.cancelMoveAnim();
-      this.sayNext(`${displayName(user)}\nis charging up!`);
+      this.sayNext(`${displayName(user)}\n${move.id === "FLY" ? "flew up high!" : "dug underground!"}`);
       return;
     }
 
@@ -1383,7 +1413,7 @@ export class WildBattle implements EffectBattle {
     this.itemList = Object.keys(this.save.inventory).filter((id) => {
       if ((this.save.inventory[id] ?? 0) <= 0) return false;
       const def = this.data.items?.[id];
-      return isMedicine(id) || def?.ball !== undefined || id.endsWith("_BALL");
+      return ((id === "POKE_DOLL" || id === "ESCAPE_ROPE") && this.kind === "wild") || id === "RARE_CANDY" || isMedicine(id) || def?.ball !== undefined || id.endsWith("_BALL");
     });
     if (this.itemList.length === 0) {
       // v1 stand-in for an empty battle bag; the reference opens the full
@@ -1407,7 +1437,12 @@ export class WildBattle implements EffectBattle {
       this.phase = "menu";
     } else if (input.wasPressed("a")) {
       const id = this.itemList[this.itemIndex];
-      if (isMedicine(id)) {
+      if ((id === "POKE_DOLL" || id === "ESCAPE_ROPE") && this.kind === "wild" && (this.save.inventory[id] ?? 0) > 0) {
+        Bag.remove(this.save, id, 1);
+        this.pokeDollEscape = id === "POKE_DOLL"; this.result = "run"; this.phase = "messages"; this.afterQueue = "finish";
+        this.say("Got away safely!"); return;
+      }
+      if (isMedicine(id) || id === "RARE_CANDY") {
         this.healingItem = id;
         this.partyIndex = 0; this.partyForced = false; this.phase = "party";
         return;
@@ -1448,6 +1483,11 @@ export class WildBattle implements EffectBattle {
 
   /** :4484-4575 throwBall, wild branch (trainer block-ball is out). */
   throwBall(ball: string): void {
+    if (this.noCatch) {
+      this.say("The GHOST dodged\nthe BALL!");
+      this.act(() => this.executeAction(this.enemy, this.player, this.enemyAction()));
+      return;
+    }
     const itemDef = this.data.items?.[ball];
     const itemName = itemDef?.name ?? ball;
     // Data-defined balls (mods and fixtures) name the stock capture profile
@@ -1507,7 +1547,7 @@ export class WildBattle implements EffectBattle {
       else if (input.wasPressed("a")) {
         const id = this.healingItem, mon = this.save.party[this.partyIndex];
         this.healingItem = null; this.phase = "messages"; this.afterQueue = "menu";
-        if ((this.save.inventory[id] ?? 0) < 1 || !mon || !useMedicine(mon, id)) {
+        if ((this.save.inventory[id] ?? 0) < 1 || !mon || !(id === "RARE_CANDY" ? useRareCandy(this.data, mon) : useMedicine(mon, id))) {
           this.say("It won't have any\neffect."); return;
         }
         Bag.remove(this.save, id, 1);
@@ -1515,7 +1555,11 @@ export class WildBattle implements EffectBattle {
           if (!mon.status) this.player.sleepTurns = this.player.toxicCounter = undefined;
           this.player.shownStatus = mon.status;
         }
-        this.say(`${mon.nickname ?? this.data.pokemon[mon.species].name} recovered!`);
+        if (id === "RARE_CANDY") {
+          this.leveledUp.add(mon);
+          this.say(`${mon.nickname ?? this.data.pokemon[mon.species].name} grew\nto level ${mon.level}!`);
+          for (const move of movesLearnedAt(this.data.pokemon[mon.species], mon.level)) this.learnMove(mon, move);
+        } else this.say(`${mon.nickname ?? this.data.pokemon[mon.species].name} recovered!`);
         if (mon === this.player.mon) this.queue.push({ drain: true, battler: this.player, stopAt: mon.hp });
         this.act(() => this.executeAction(this.enemy, this.player, this.enemyAction()));
         this.queueResidual(this.player, this.enemy);

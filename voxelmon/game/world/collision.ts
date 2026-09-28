@@ -22,6 +22,9 @@ export interface Mover {
   targetY?: number;
   passable?: boolean;
   surfing?: boolean;
+  flying?: boolean;
+  waterWalking?: boolean;
+  ledgeTiles?: readonly number[];
 }
 
 export interface TilePair {
@@ -108,11 +111,13 @@ export function canMove(
   }
   if (!map.isWalkableCell(tx, ty)) {
     // Collision.lua:61 — surfers may ride water cells
-    if (!(mover.surfing && map.isWaterCell(tx, ty))) {
+    if (!((mover.surfing || mover.waterWalking || mover.flying) && map.isWaterCell(tx, ty)) &&
+        !(mover.flying && mover.ledgeTiles?.includes(map.cellTile(tx, ty)))) {
       return { ok: false, why: "tile" };
     }
   }
-  if (pairBlocked(map, mover, mover.cellX, mover.cellY, tx, ty, tilePairs)) {
+  if (!(mover.flying && (mover.ledgeTiles?.includes(map.cellTile(mover.cellX, mover.cellY)) ||
+      mover.ledgeTiles?.includes(map.cellTile(tx, ty)))) && pairBlocked(map, mover, mover.cellX, mover.cellY, tx, ty, tilePairs)) {
     return { ok: false, why: "tile" };
   }
   if (occupied(entities, tx, ty, mover)) {

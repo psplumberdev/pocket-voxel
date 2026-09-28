@@ -1,50 +1,71 @@
-/** Data and rules for the optional real-time overworld Pokémon control mode. */
+import { FIELD_MOVES } from "./field-moves.ts";
+import { CONTACT_MOVES } from "../../shared/move-contact.ts";
 
-export const OVERWORLD_ATTACK_SPECIES = ["BEEDRILL", "ONIX", "IVYSAUR", "PIKACHU"] as const;
-export const OVERWORLD_ATTACK_MAPS = new Set(["ROCK_TUNNEL_1F", "ROCK_TUNNEL_B1F"]);
-export const OVERWORLD_ATTACK_COOLDOWN = 180; // 3 seconds at 60 Hz
+/** National Pokédex #001–050; retain the existing Onix field pilot too. */
+export const OVERWORLD_ATTACK_SPECIES = [
+  "BULBASAUR", "IVYSAUR", "VENUSAUR", "CHARMANDER", "CHARMELEON",
+  "CHARIZARD", "SQUIRTLE", "WARTORTLE", "BLASTOISE", "CATERPIE",
+  "METAPOD", "BUTTERFREE", "WEEDLE", "KAKUNA", "BEEDRILL",
+  "PIDGEY", "PIDGEOTTO", "PIDGEOT", "RATTATA", "RATICATE",
+  "SPEAROW", "FEAROW", "EKANS", "ARBOK", "PIKACHU",
+  "RAICHU", "SANDSHREW", "SANDSLASH", "NIDORAN_F", "NIDORINA",
+  "NIDOQUEEN", "NIDORAN_M", "NIDORINO", "NIDOKING", "CLEFAIRY",
+  "CLEFABLE", "VULPIX", "NINETALES", "JIGGLYPUFF", "WIGGLYTUFF",
+  "ZUBAT", "GOLBAT", "ODDISH", "GLOOM", "VILEPLUME",
+  "PARAS", "PARASECT", "VENONAT", "VENOMOTH", "DIGLETT",
+  "ONIX",
+] as const;
+const PILOT_SPECIES = new Set<string>(OVERWORLD_ATTACK_SPECIES);
+/** The host can advance 60 logic ticks/sec (two ticks per 30 Hz display).
+ * Budget for that fastest cadence, not measured slowdown on a busy PSP. */
+export const FIELD_LOGIC_HZ = 60;
+export const FIELD_WALK_TICKS = 24;
+export const OVERWORLD_ATTACK_COOLDOWN = 3 * FIELD_LOGIC_HZ;
+export const OVERWORLD_PROJECTILE_SPEED = 2;
+export const MELEE_FLASH_TICKS = FIELD_LOGIC_HZ / 4;
 
+const SELF_MOVES = new Set([
+  "SWORDS_DANCE", "MIST", "GROWTH", "MEDITATE", "AGILITY", "DOUBLE_TEAM",
+  "RECOVER", "HARDEN", "MINIMIZE", "WITHDRAW", "DEFENSE_CURL", "BARRIER",
+  "LIGHT_SCREEN", "HAZE", "REFLECT", "FOCUS_ENERGY", "SOFTBOILED", "AMNESIA",
+  "SPLASH", "ACID_ARMOR", "REST", "SHARPEN", "CONVERSION", "SUBSTITUTE", "TELEPORT",
+]);
 export type OverworldAttackKind = "melee" | "ranged";
-
 export interface OverworldAttack {
+  id: string;
   name: string;
   kind: OverworldAttackKind;
+  target: "self" | "opponent";
   power: number;
-  /** Ranged attacks travel at bicycle speed (one cell per tick). */
+  range: number;
+  area?: "self" | "forward";
+  /** Ratio of the base walking speed. */
   speed: number;
 }
 
-export const OVERWORLD_ATTACKS: Record<string, readonly OverworldAttack[]> = {
-  BEEDRILL: [
-    { name: "FURY ATTACK", kind: "melee", power: 15, speed: 0 },
-    { name: "TWINEEDLE", kind: "ranged", power: 25, speed: 2 },
-    { name: "POISON STING", kind: "ranged", power: 15, speed: 2 },
-    { name: "PIN MISSILE", kind: "ranged", power: 20, speed: 2 },
-  ],
-  ONIX: [
-    { name: "TACKLE", kind: "melee", power: 20, speed: 0 },
-    { name: "ROCK THROW", kind: "ranged", power: 25, speed: 2 },
-    { name: "BIND", kind: "melee", power: 15, speed: 0 },
-    { name: "ROCK SLIDE", kind: "ranged", power: 30, speed: 2 },
-  ],
-  IVYSAUR: [
-    { name: "TACKLE", kind: "melee", power: 20, speed: 0 },
-    { name: "VINE WHIP", kind: "melee", power: 25, speed: 0 },
-    { name: "RAZOR LEAF", kind: "ranged", power: 30, speed: 2 },
-    { name: "LEECH SEED", kind: "ranged", power: 10, speed: 2 },
-  ],
-  PIKACHU: [
-    { name: "QUICK ATTACK", kind: "melee", power: 20, speed: 0 },
-    { name: "THUNDER SHOCK", kind: "ranged", power: 25, speed: 2 },
-    { name: "THUNDER WAVE", kind: "ranged", power: 10, speed: 2 },
-    { name: "SLAM", kind: "melee", power: 30, speed: 0 },
-  ],
-};
-
-export function overworldAttacksFor(species: string): readonly OverworldAttack[] {
-  return OVERWORLD_ATTACKS[species] ?? [];
+/** Use every learned slot, in order, with its original battle definition. */
+export function overworldAttacksFor(
+  _species: string,
+  learned: readonly { id: string }[] = [],
+  moves?: Record<string, { name?: string; power?: number; contact?: boolean }>,
+): readonly OverworldAttack[] {
+  return learned.map(slot => {
+    const def = moves?.[slot.id];
+    const rule = FIELD_MOVES[slot.id];
+    const contact = rule ? rule.delivery === "melee" : def?.contact ?? CONTACT_MOVES.has(slot.id);
+    return {
+      id: slot.id,
+      name: def?.name ?? slot.id.replaceAll("_", " "),
+      kind: contact ? "melee" : "ranged",
+      target: (rule ? rule.target === "self" : SELF_MOVES.has(slot.id)) ? "self" : "opponent",
+      power: def?.power ?? 0,
+      range: rule?.range ?? (rule?.area === "self" ? 3 : rule?.area === "forward" ? 4 : contact ? 1 : 5),
+      area: rule?.area,
+      speed: contact ? 0 : OVERWORLD_PROJECTILE_SPEED,
+    };
+  });
 }
 
 export function isOverworldAttackSpecies(species: string): boolean {
-  return OVERWORLD_ATTACKS[species] !== undefined;
+  return PILOT_SPECIES.has(species);
 }

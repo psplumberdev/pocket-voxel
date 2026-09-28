@@ -3,7 +3,8 @@
 //! API — the openstrike-psp `strike` surface pattern. Every numeric op
 //! applies synchronously into the shared retained [`Scene`] (the core's
 //! dispatch is defensive by contract, so a hostile guest can at worst
-//! no-op); `gamedata()` returns the pak's GAME JSON as a JS string;
+//! no-op); `parseGameData()` parses GAME directly from its native buffer;
+//! `gamedata()` remains the compatibility string transport;
 //! `uiText` and `uiLabel` carry one string argument each.
 //!
 //! Single-threaded host (the QuickJS worker) — `static mut` matches the
@@ -31,6 +32,8 @@ const SAVE_MAX: usize = 128 * 1024;
 // C library — the established local-extern pattern, strike.rs / hosts/psp
 // main.rs's JS_NewArrayBuffer). size_t stays usize (MIPS o32).
 extern "C" {
+    fn JS_ParseJSON(ctx: *mut JSContext, buf: *const core::ffi::c_char, len: usize,
+        filename: *const core::ffi::c_char) -> JSValue;
     fn JS_NewStringLen(ctx: *mut JSContext, s: *const u8, len: usize) -> JSValue;
     fn JS_NewArrayBuffer(
         ctx: *mut JSContext,
@@ -44,7 +47,7 @@ extern "C" {
 
 /// The retained scene every op mutates and the frame loop draws.
 static mut SCENE: Option<Scene> = None;
-/// The pak's GAME section (JSON, zero-copy over the leaked pak buffer).
+/// GAME JSON plus a NUL sentinel, borrowed until startup evaluation ends.
 static mut GAME: &[u8] = &[];
 /// The pak's AUDI section (zero-copy, same buffer). Empty until [`set_audio`]
 /// runs, and an empty section is a pak without audio: `audiodata()` then
@@ -236,7 +239,20 @@ unsafe extern "C" fn js_gamedata(
     _argv: *mut JSValue,
 ) -> JSValue {
     scene().op(op::GAMEDATA, &[], None);
-    JS_NewStringLen(ctx, GAME.as_ptr(), GAME.len())
+    JS_NewStringLen(ctx, GAME.as_ptr(), GAME.len().saturating_sub(1))
+}
+
+/// Parse the NUL-terminated native GAME buffer without an intermediate JS
+/// string or JSON.parse's UTF-8 conversion buffer. The result owns its data.
+unsafe extern "C" fn js_parse_game_data(
+    ctx: *mut JSContext, _this: JSValue, _argc: i32, _argv: *mut JSValue,
+) -> JSValue {
+    if GAME.last() != Some(&0) { return JS_UNDEFINED; }
+    crate::boot::checkpoint("GAME parse begin");
+    scene().op(op::GAMEDATA, &[], None);
+    let value = JS_ParseJSON(ctx, GAME.as_ptr().cast(), GAME.len() - 1, b"GAME\0".as_ptr().cast());
+    crate::boot::checkpoint("GAME parse end");
+    value
 }
 
 /// `audiodata()`: the pak's AUDI section as an ArrayBuffer, zero-copy over
@@ -282,7 +298,11 @@ unsafe extern "C" fn js_boot_log(
     argc: i32,
     argv: *mut JSValue,
 ) -> JSValue {
-    psp::dprintln!("[voxelmon] js startup checkpoint {}", arg_i32(ctx, argc, argv, 0));
+    let stage = match arg_i32(ctx, argc, argv, 0) {
+        1 => "guest entered", 2 => "guest data ready", 3 => "game constructed",
+        4 => "game booted", _ => "guest checkpoint",
+    };
+    crate::boot::checkpoint(stage);
     JS_UNDEFINED
 }
 
@@ -476,6 +496,7 @@ unsafe extern "C" fn js_perf(
 pub unsafe fn register(ctx: *mut JSContext, global: JSValue) {
     let obj = JS_NewObject(ctx);
     add_fn(ctx, obj, b"gamedata\0", js_gamedata, 0);
+    add_fn(ctx, obj, b"parseGameData\0", js_parse_game_data, 0);
     add_fn(ctx, obj, b"audiodata\0", js_audiodata, 0);
     add_fn(ctx, obj, b"stats\0", js_stats, 0);
     add_fn(ctx, obj, b"bootLog\0", js_boot_log, 1);

@@ -18,26 +18,47 @@ pub struct PakFileReader {
     len: u64,
 }
 
+/// Preserve the kernel result so hardware failures identify the operation
+/// and error code instead of collapsing every failure into "could not open".
+pub enum PakOpenError {
+    Io(&'static str, i64),
+    Index(IndexError),
+}
+
+impl core::fmt::Display for PakOpenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Io(operation, code) => write!(f, "{}: 0x{:08X} ({})", operation, *code as u32, code),
+            Self::Index(error) => write!(f, "index: {}", error),
+        }
+    }
+}
+
 impl PakFileReader {
     /// Open one VXPK and record its length without allocating its payload.
-    pub unsafe fn open(path: &'static [u8]) -> Result<Self, IndexError> {
+    pub unsafe fn open(path: &'static [u8]) -> Result<Self, PakOpenError> {
         let fd = sys::sceIoOpen(path.as_ptr(), IoOpenFlags::RD_ONLY, 0o777);
         if fd.0 < 0 {
-            return Err("could not open voxelmon.vxpak");
+            return Err(PakOpenError::Io("sceIoOpen", fd.0 as i64));
         }
         let len = sys::sceIoLseek(fd, 0, IoWhence::End);
-        if len <= 0 || sys::sceIoLseek(fd, 0, IoWhence::Set) != 0 {
+        if len <= 0 {
             sys::sceIoClose(fd);
-            return Err("could not size voxelmon.vxpak");
+            return Err(PakOpenError::Io("sceIoLseek end", len));
+        }
+        let rewind = sys::sceIoLseek(fd, 0, IoWhence::Set);
+        if rewind != 0 {
+            sys::sceIoClose(fd);
+            return Err(PakOpenError::Io("sceIoLseek start", rewind));
         }
         Ok(Self { fd, len: len as u64 })
     }
 
     /// Open and validate the small resident catalog. Bulk payloads remain on
     /// the Memory Stick and `self` stays open for later cache fills.
-    pub unsafe fn open_index(path: &'static [u8]) -> Result<(Self, PakIndex), IndexError> {
+    pub unsafe fn open_index(path: &'static [u8]) -> Result<(Self, PakIndex), PakOpenError> {
         let mut file = Self::open(path)?;
-        let index = read_index(&mut file)?;
+        let index = read_index(&mut file).map_err(PakOpenError::Index)?;
         Ok((file, index))
     }
 }
@@ -65,8 +86,11 @@ impl PakFileReader {
     /// full resident image (atlases, palettes, tables) can be deferred until
     /// after JS_EvalFunction for the PSP-1000 startup-memory experiment.
     pub fn load_startup(&mut self, index: &PakIndex) -> Result<Vec<u8>, IndexError> {
-        let mut game = vec![0; index.game.len as usize];
-        self.read_exact_at(index.game.offset, &mut game)?;
+        // QuickJS's native JSON parser requires a NUL sentinel after the
+        // input. Allocate it up front, avoiding a whole-buffer Vec growth.
+        let len = index.game.len as usize;
+        let mut game = vec![0; len.checked_add(1).ok_or("GAME too large")?];
+        self.read_exact_at(index.game.offset, &mut game[..len])?;
         Ok(game)
     }
 

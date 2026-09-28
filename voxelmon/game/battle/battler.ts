@@ -47,6 +47,7 @@ export interface WildBattler extends DamageBattler {
    * menu-lock checks read them (BattleState.lua:1699-1729). */
   mustRecharge?: boolean;
   invulnerable?: boolean;
+  chargingMove?: MoveSlot;
   /** Substitute / Mist / trapping — unreachable in v1 but the pipeline's
    * guards read them (EffectRegistry.lua, MoveEffects.lua changeStage). */
   substituteHP?: number;

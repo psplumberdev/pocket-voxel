@@ -145,6 +145,11 @@ export interface PakStats {
 }
 
 export function writePak(input: PakInput): { bytes: Uint8Array; stats: PakStats } {
+  const mapIds = new Set<number>();
+  for (const map of input.maps) {
+    if (mapIds.has(map.mapId)) throw new Error(`duplicate map id: ${map.mapId}`);
+    mapIds.add(map.mapId);
+  }
   // --- shared vertex/index pools + mesh ranges -----------------------------
   const verts = new ByteWriter();
   const indexPool = new ByteWriter();

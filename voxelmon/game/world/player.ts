@@ -42,6 +42,9 @@ export class Player implements Mover {
   /** Monotonic landed-step counter (port addition: the tape's walk unit). */
   landedCount = 0;
   surfing = false;
+  flying = false;
+  waterWalking = false;
+  ledgeTiles: number[] = [];
   lastBlockReason?: string;
 
   // Player.lua:34 Player.new

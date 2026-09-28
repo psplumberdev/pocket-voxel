@@ -2,6 +2,32 @@
 
 Publication checkpoint: September 12, 2026.
 
+## September 24 immediate startup crash investigation
+
+The user reports that the recent field-combat build works in the Windows
+emulator but crashes immediately on PSP-1000. The exact failing stage and
+whether it is out of memory are not yet confirmed.
+
+Startup now parses the NUL-terminated GAME buffer with the pinned engine's
+`JS_ParseJSON` instead of making a JavaScript string and passing it through
+`JSON.parse`. This avoids the intermediate string and its UTF-8 conversion
+buffer; the native input is still released after guest evaluation. Map and
+gameplay content are unchanged. This reduces avoidable allocation pressure,
+but is not evidence that the reported hardware crash is fixed.
+
+`voxel-boot.log` beside `EBOOT.PBP` is overwritten each launch. It records
+module entry, pack loading, graphics initialization, QuickJS bytecode read
+and evaluation, GAME parsing, game boot, audio and initial map streaming.
+Checkpoints include kernel largest-free-block, arena capacity/free/largest
+block and QuickJS live/peak/failed-request bytes. Logging uses a fixed stack
+buffer and closes the file after each write. Caught JavaScript exceptions
+and host halts also go to the file. A crash before module entry cannot be
+diagnosed by this in-process log; absence of a new log is not proof of OOM.
+
+The Windows test/install destination remains `J:\VOXELMON`, mounted as
+`/mnt/voxelrw/VOXELMON` through the VirtualBox `Voxel` share. A new physical
+PSP-1000 launch and its log are required to resolve this report.
+
 ## September 13 user hardware report
 
 psplumberdev reports days of PSP-1000 use without crashes and supplied the

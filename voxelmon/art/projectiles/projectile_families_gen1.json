@@ -1,0 +1,104 @@
+{
+  "target": "Pokemon Red Voxel PSP - Overworld Battles",
+  "style": "Game Boy Color-inspired pixel art",
+  "sprite_spec": {
+    "frame_size": "16x16 preferred",
+    "frames_per_projectile": 4,
+    "impact_frames": 1,
+    "background": "transparent",
+    "filtering": "nearest-neighbor only",
+    "atlas": "single shared projectile atlas preferred"
+  },
+  "families": {
+    "NORMAL": {
+      "sprite": "normal_hit.png",
+      "impact": "normal_impact.png",
+      "notes": "small white hit/pellet"
+    },
+    "FIRE": {
+      "sprite": "fire_ball.png",
+      "impact": "fire_impact.png",
+      "notes": "fireball / flame shot"
+    },
+    "WATER": {
+      "sprite": "water_wave.png",
+      "impact": "water_impact.png",
+      "notes": "bubbles / water wave"
+    },
+    "GRASS": {
+      "sprite": "grass_leaf.png",
+      "impact": "grass_impact.png",
+      "notes": "leaf projectile"
+    },
+    "ELECTRIC": {
+      "sprite": "electric_bolt.png",
+      "impact": "electric_impact.png",
+      "notes": "lightning bolt"
+    },
+    "ICE": {
+      "sprite": "ice_shard.png",
+      "impact": "ice_impact.png",
+      "notes": "ice shard"
+    },
+    "ROCK": {
+      "sprite": "rock_chunk.png",
+      "impact": "rock_impact.png",
+      "notes": "rock chunk"
+    },
+    "GROUND": {
+      "sprite": "ground_dust.png",
+      "impact": "ground_impact.png",
+      "notes": "dust / dirt burst"
+    },
+    "POISON": {
+      "sprite": "poison_skull.png",
+      "impact": "poison_impact.png",
+      "notes": "purple skull/blob"
+    },
+    "BUG": {
+      "sprite": "bug_web.png",
+      "impact": "bug_impact.png",
+      "notes": "web projectile"
+    },
+    "FLYING": {
+      "sprite": "flying_tornado.png",
+      "impact": "flying_impact.png",
+      "notes": "mini tornado"
+    },
+    "PSYCHIC": {
+      "sprite": "psychic_orb.png",
+      "impact": "psychic_impact.png",
+      "notes": "pink/purple orb"
+    },
+    "GHOST": {
+      "sprite": "ghost_orb.png",
+      "impact": "ghost_impact.png",
+      "notes": "dark purple shadow orb"
+    },
+    "FIGHTING": {
+      "sprite": "fighting_wave.png",
+      "impact": "fighting_impact.png",
+      "notes": "punch/impact wave"
+    },
+    "DRAGON": {
+      "sprite": "dragon_orb.png",
+      "impact": "dragon_impact.png",
+      "notes": "blue/cyan dragon-energy orb"
+    }
+  },
+  "special_overrides": {
+    "STRING_SHOT": "bug_web.png",
+    "LEECH_SEED": "grass_leaf.png",
+    "SOLAR_BEAM": "grass_leaf.png",
+    "FIRE_SPIN": "fire_ball.png",
+    "ROCK_THROW": "rock_chunk.png",
+    "ROCK_SLIDE": "rock_chunk.png",
+    "THUNDER_SHOCK": "electric_bolt.png",
+    "THUNDERBOLT": "electric_bolt.png",
+    "FLASH": "electric_bolt.png",
+    "SAND_ATTACK": "ground_dust.png",
+    "WHIRLWIND": "flying_tornado.png",
+    "GUST": "flying_tornado.png",
+    "DRAGON_RAGE": "dragon_orb.png"
+  }
+}

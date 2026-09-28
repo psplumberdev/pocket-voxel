@@ -54,6 +54,13 @@ export function cook(mapNames: readonly string[], outPath: string, genDir = GEN_
       keepHidden: process.env.VOXEL_KEEP_HIDDEN === "1",
       treeBoxes: process.env.VOXEL_TREE_BOXES === "1",
     },
+  }, progress => {
+    if (progress.phase === "ground-bake") {
+      // Geometry analysis creates large temporary object graphs. Reclaim them
+      // between maps so a full campaign cook fits on the build VM.
+      Bun.gc(true);
+      console.log(`voxel cook: ${progress.completed}/${progress.total} ${progress.label}`);
+    }
   });
 
   mkdirSync(dirname(outPath), { recursive: true });

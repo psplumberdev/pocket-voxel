@@ -1,10 +1,32 @@
+import { chapterDoors, doorOpen, SAFFRON_GATES, DRINKS, type ChapterField } from "../../shared/chapter.ts";
+import * as Bag from "../rules/bag.ts";
+import { MAX_MONEY, trainerPayout } from "../rules/economy.ts";
+import { FIELD_MOVES, fieldCells } from "./field-moves.ts";
+import { FieldBattle } from "./field-battle.ts";
+import { makeBattler } from "../battle/battler.ts";
+import { newMon, type PartyMon, type MoveSlot } from "../battle/mon.ts";
+import type { WildSprite } from "./wild.ts";
+import { PROJECTILE_IMPACT_LIMIT, PROJECTILE_IMPACT_TICKS } from "../../shared/projectiles.ts";
+
+interface FieldCharge {
+  move: MoveSlot & { struggle?: boolean }; source?: WildSprite; sourceMon?: PartyMon;
+  facing: Dir; ticks: number;
+}
+interface FieldProjectile {
+  x: number; y: number; dx: number; dy: number; remaining: number;
+  name: string; monIndex: number; frame: number; ticks: number; stepTicks: number;
+  move: MoveSlot & { struggle?: boolean }; source?: WildSprite; sourceMon?: PartyMon;
+}
 import { grantItem, GYM_REWARDS } from "./rewards.ts";
 import { PartyFollower } from "./follower.ts";
 import { trainerHeader } from "./trainers.ts";
 import { physicalExit } from "./warp.ts";
 import {
   OVERWORLD_ATTACK_COOLDOWN,
-  isOverworldAttackSpecies,
+  FIELD_LOGIC_HZ,
+  FIELD_WALK_TICKS,
+  OVERWORLD_PROJECTILE_SPEED,
+  MELEE_FLASH_TICKS,
   overworldAttacksFor,
 } from "./overworld-attack.ts";
 // The overworld controller SLICE. Ports the world-facing core of gen1recomp
@@ -54,14 +76,17 @@ const COMPASS: Record<Dir, "north" | "south" | "east" | "west"> = {
 };
 
 export interface SaveSlice {
-  party?: { hp: number; species?: string; nickname?: string; moves?: { id: string }[] }[];
+  party?: { hp: number; species?: string; nickname?: string; moves?: { id: string }[]; stats?: { hp: number } }[];
   flags: Record<string, boolean>;
   inventory: Record<string, number>;
   bagOrder?: string[];
   money?: number;
   player: { name: string; rival: string };
   lastOutdoor?: LastOutdoor;
+  silphElevatorFloor?: string;
+  elevatorFloors?: Record<string, string>;
   lastHeal?: { map: string; x: number; y: number };
+  visitedOutdoor?: Record<string, { x: number; y: number }>;
 }
 
 /** What the overworld needs from the game shell (game.ts implements it). */
@@ -69,8 +94,8 @@ export interface OverworldShell {
   data: VoxelmonData;
   save: SaveSlice;
   input: {
-    isDown(btn: "up" | "down" | "left" | "right" | "a" | "b" | "start" | "select"): boolean;
-    wasPressed(btn: "up" | "down" | "left" | "right" | "a" | "b" | "start" | "select"): boolean;
+    isDown(btn: "up" | "down" | "left" | "right" | "a" | "b" | "start" | "select" | "l" | "r"): boolean;
+    wasPressed(btn: "up" | "down" | "left" | "right" | "a" | "b" | "start" | "select" | "l" | "r"): boolean;
   };
   /** Encounter/battle roll stream (the guest owns the RNG). */
   rng: Rng;
@@ -85,8 +110,11 @@ export interface OverworldShell {
   restoreMapMusic(): void;
   /** Music.lua:339 playMap, called where the reference calls it. */
   startMapMusic(mapId: string): void;
+  awardFieldExperience(monIndex: number, species: string, level: number, trainer?: boolean): { gained: number; levels: number[] };
   showText(text: string, onDone?: () => void): void;
   showChoice(text: string, choice: (yes: boolean) => void): void;
+  showMenuChoice?(text: string, labels: readonly string[], choice: (index: number) => void): void;
+  pushGhostBattle?(onWin: () => void, onEscape: () => void): void;
   /** Bedroom OpenRedsPC hidden event, owned by the game-state stack. */
   openBedroomComputer(): void;
   openStartMenu(): void;
@@ -96,8 +124,9 @@ export interface OverworldShell {
   onFieldStep?(): void;
   chooseStarter(species: "BULBASAUR" | "CHARMANDER" | "SQUIRTLE"): void;
   buyMagikarp(): "bought" | "money" | "party-full" | "already-bought";
+  receiveGiftPokemon?(species: string, level: number, event: string): "granted" | "full" | "already";
   pushWarpFade(frames: number, midpoint: () => void, onDone?: () => void): void;
-  pushStubBattle(species: string, level: number): void;
+  pushStubBattle(species: string, level: number, onWin?: () => void): void;
   pushTrainerBattle(
     name: string,
     trainerClass: string,
@@ -173,6 +202,7 @@ export class Overworld implements ScriptWorld {
    * the pak has no geometry for it, so warps bump and connections neither
    * show nor cross. Old gamedata without the list means "everything". */
   isCooked(mapId: string): boolean {
+    if (mapId === "UNUSED_MAP_ED" && this.map?.id === "SILPH_CO_ELEVATOR") return true;
     if (mapId === "LAST_MAP") return true; // resolves to a map we came from
     const list = this.shell.data.cookedMaps;
     return !list || list.includes(mapId);
@@ -193,6 +223,7 @@ export class Overworld implements ScriptWorld {
   warpEntryCell?: { x: number; y: number };
   transitioning = false;
   private doorWarp = false;
+  private inPurifiedZone = false;
   /** OverworldController.lua:1221 — 16 ticks between wall-bonk cues. */
   private bumpCooldown = 0;
   /** A play_once jingle is in flight (Music.lua:389 pendingRestore). */
@@ -211,8 +242,23 @@ export class Overworld implements ScriptWorld {
    * target coordinates remain in the same grid as normal map play. */
   pokemonPilot?: { monIndex: number; attackIndex: number };
   pokemonAttackCooldown = 0;
-  pokemonAttackMessage = "READY";
-  pokemonProjectile?: { x: number; y: number; frames: number };
+  private attackMessage = "READY";
+  private fieldNotices: { text: string; ticks: number }[] = [];
+  get pokemonAttackMessage(): string { return this.fieldNotices[0]?.text ?? this.attackMessage; }
+  set pokemonAttackMessage(value: string) { this.attackMessage = value; }
+  private fieldTrainer?: { name: string; trainerClass: string; party: readonly { species: string; level: number }[];
+    index: number; delay: number; onWin: () => void; boss?: "BROCK" | "MISTY" };
+  get fieldTrainerActive(): boolean { return this.fieldTrainer !== undefined; }
+  private fieldNotice(text: string): void { this.fieldNotices.push({ text, ticks: 180 }); }
+  private solidActors(): Mover[] { return [...this.entities, ...this.wild.slots.filter(w => w.active)]; }
+
+  pokemonProjectiles: FieldProjectile[] = [];
+  pokemonImpacts: { x: number; y: number; moveId: string; ticks: number }[] = [];
+  pokemonMeleeFlashes: { x: number; y: number; ticks: number }[] = [];
+  get pokemonProjectile(): FieldProjectile | undefined { return this.pokemonProjectiles[0]; }
+  get pokemonPilotMoves(): readonly MoveSlot[] { return this.fieldBattle?.player.curMoves ?? []; }
+  private fieldBattle?: FieldBattle;
+  private fieldCharges: FieldCharge[] = [];
 
   constructor(shell: OverworldShell) {
     this.shell = shell;
@@ -233,29 +279,81 @@ export class Overworld implements ScriptWorld {
     return this.shell.save;
   }
 
+  private pilotLand?: { map: string; x: number; y: number };
+
+  private refreshPilotMobility(): void {
+    const mon = this.shell.save.party?.[this.pokemonPilot?.monIndex ?? -1];
+    const types = mon?.species ? this.shell.data.pokemon[mon.species]?.types ?? [] : [];
+    this.player.flying = types.includes("FLYING");
+    this.player.waterWalking = types.includes("WATER");
+    const ledges = this.shell.data.field?.ledges as { tileset?: string; ledgeTile: number }[] | undefined;
+    this.player.ledgeTiles = (ledges ?? []).filter(l => (l.tileset ?? "OVERWORLD") === this.map.def.tileset).map(l => l.ledgeTile);
+    this.rememberPilotLand();
+  }
+
+  private rememberPilotLand(): void {
+    const p = this.player, last = this.pilotLand;
+    if (last?.map === this.map.id && last.x === p.cellX && last.y === p.cellY) return;
+    if (this.map.isWalkableCell(p.cellX, p.cellY) && !this.map.isWaterCell(p.cellX, p.cellY)) {
+      this.pilotLand = { map: this.map.id, x: p.cellX, y: p.cellY };
+    }
+  }
+
   canUsePokemonPilot(monIndex = 0): boolean {
     const mon = this.shell.save.party?.[monIndex];
-    return !!mon && mon.hp > 0 && typeof mon.species === "string" && isOverworldAttackSpecies(mon.species);
+    return !!mon && mon.hp > 0 && typeof mon.species === "string" && !!this.shell.data.pokemon[mon.species]?.partyIcon;
   }
 
   startPokemonPilot(monIndex = 0): boolean {
     if (!this.canUsePokemonPilot(monIndex)) return false;
+    const mon = this.shell.save.party![monIndex] as PartyMon;
+    this.fieldBattle = new FieldBattle(this.shell.data, {
+      party: [mon], inventory: this.shell.save.inventory, player: this.shell.save.player,
+    }, this.shell.rng, mon.species, mon.level);
+
     this.pokemonPilot = { monIndex, attackIndex: 0 };
+    this.refreshPilotMobility();
+    this.player.stepFrames = FIELD_WALK_TICKS;
+    for (const wild of this.wild.slots) {
+      if (wild.moving) wild.progress *= FIELD_WALK_TICKS / wild.moveStepTicks;
+      wild.moveStepTicks = FIELD_WALK_TICKS;
+    }
     this.pokemonAttackCooldown = 0;
     this.pokemonAttackMessage = `${this.shell.save.party![monIndex]!.species} READY`;
     return true;
   }
 
   stopPokemonPilot(): void {
+    const p = this.player;
+    if (this.pokemonPilot) {
+      p.moving = false; p.targetX = p.targetY = undefined; p.progress = 0;
+      p.px = p.cellX * 16; p.py = p.cellY * 16;
+    }
+    if (this.pokemonPilot && !(this.map.isWalkableCell(p.cellX, p.cellY) && !this.map.isWaterCell(p.cellX, p.cellY)) &&
+        !(p.surfing && this.map.isWaterCell(p.cellX, p.cellY)) && this.pilotLand) {
+      const land = this.pilotLand;
+      const changedMap = land.map !== this.map.id;
+      this.setMap(land.map, land.x, land.y, p.facing);
+      if (changedMap) this.shell.startMapMusic(land.map);
+    }
+    p.flying = p.waterWalking = false;
+    p.ledgeTiles = [];
+    this.pilotLand = undefined;
     this.pokemonPilot = undefined;
-    this.pokemonProjectile = undefined;
+    this.cancelFieldTrainer();
+    this.fieldCharges.length = 0;
+    this.pokemonProjectiles.length = 0;
+    this.pokemonImpacts.length = 0;
+    this.pokemonMeleeFlashes.length = 0;
     this.pokemonAttackMessage = "READY";
   }
 
   cyclePokemonAttack(delta = 1): void {
     const pilot = this.pokemonPilot;
     if (!pilot) return;
-    const attacks = overworldAttacksFor(this.shell.save.party![pilot.monIndex]!.species ?? "");
+    const mon = this.fieldBattle!.player.mon;
+    const attacks = overworldAttacksFor(mon.species, this.fieldBattle!.player.curMoves, this.shell.data.moves);
+    if (attacks.length === 0) return;
     pilot.attackIndex = (pilot.attackIndex + delta + attacks.length) % attacks.length;
     this.pokemonAttackMessage = attacks[pilot.attackIndex]!.name;
   }
@@ -264,49 +362,442 @@ export class Overworld implements ScriptWorld {
   updatePokemonPilot(): void {
     const pilot = this.pokemonPilot;
     if (!pilot) return;
+    if (this.fieldNotices[0] && --this.fieldNotices[0].ticks <= 0) this.fieldNotices.shift();
+    this.runner.update();
+    if (this.emote) {
+      if (--this.emote.frames <= 0) { const done = this.emote.onDone; this.emote = undefined; done?.(); }
+      this.player.update(); return;
+    }
+    for (const npc of this.npcs) npc.update(this.map, this.solidActors(), this.shell.npcRng, this.tilePairs);
+    this.updateScriptMoves();
+    if (this.runner.isRunning() || this.scriptMoves.length || this.emote || this.transitioning) { this.player.update(); return; }
+    this.advanceFieldTrainer();
+    this.pokemonMeleeFlashes = this.pokemonMeleeFlashes.filter(flash => --flash.ticks > 0);
+    this.pokemonImpacts = this.pokemonImpacts.filter(impact => --impact.ticks > 0);
     if (this.pokemonAttackCooldown > 0) this.pokemonAttackCooldown--;
-    if (this.pokemonProjectile && --this.pokemonProjectile.frames <= 0) this.pokemonProjectile = undefined;
+    this.tickFieldStatuses();
+    if (!this.pokemonPilot) return;
+    this.advanceFieldCharges();
+    if (!this.pokemonPilot) return;
+    this.advancePokemonProjectile();
+    if (!this.pokemonPilot) return;
+    this.rememberPilotLand();
     const input = this.shell.input;
     if (input.wasPressed("b") || input.wasPressed("start")) { this.stopPokemonPilot(); return; }
-    if (input.wasPressed("select") || input.wasPressed("right")) this.cyclePokemonAttack();
+    if (input.wasPressed("l")) this.cyclePokemonAttack(-1);
+    if (input.wasPressed("r")) this.cyclePokemonAttack(1);
+    this.player.stepFrames = this.fieldBattle!.moveTicks(this.fieldBattle!.player, FIELD_WALK_TICKS);
     for (const dir of ["up", "down", "left", "right"] as Dir[]) {
-      if (!input.isDown(dir) || (dir === "right" && input.wasPressed("right"))) continue;
-      this.player.facing = dir;
-      if (this.player.tryMove(dir, this.map, this.entities, this.tilePairs) !== "blocked") break;
+      if (this.fieldBattle!.locked(this.fieldBattle!.player) || this.fieldCharges.some(c => !c.source)) break;
+      if (!input.isDown(dir)) continue;
+      if (this.player.moving) break;
+      if (!this.player.flying && this.checkLedgeHop(dir)) return;
+      if (!this.fieldTrainer && this.checkEdgeExit(dir)) return;
+      const [x, y] = target(this.player.cellX, this.player.cellY, dir);
+      const warp = this.map.warpAtCell(x, y);
+      if (warp && this.map.isWarpTileCell(x, y) && (!this.isCooked(warp.def.destMap) || this.fieldTrainer)) break;
+      const result = this.player.tryMove(dir, this.map, this.solidActors(), this.tilePairs);
+      if (result === "blocked" && !this.fieldTrainer && this.canCollisionWarp()) {
+        const exit = onCollision(this.map, this.carpets, this.player.cellX, this.player.cellY, dir);
+        if (exit) { this.takeWarp(exit.def); return; }
+      }
+      if (result !== "blocked") break;
     }
-    if (input.wasPressed("a")) this.firePokemonAttack();
-    // Wilds remain live and become hostile inside the requested five-tile ring.
-    this.wild.update(this.shell.data, this.map, this.player, this.entities, this.tilePairs, this.shell.data.followerSprites ? 1 : 0);
+    const stepped = !this.fieldBattle!.locked(this.fieldBattle!.player) && !this.fieldCharges.some(c => !c.source) && this.player.update();
+    if (stepped && this.pendingSeamMusic) { this.pendingSeamMusic = null; this.shell.startMapMusic(this.map.id); }
+    if (stepped && !this.fieldTrainer) { this.onStepComplete(); return; }
+    this.follower.update(this.player, this.shell.save.party?.[pilot.monIndex]);
+    if (input.wasPressed("a")) {
+      const [x, y] = this.player.facingCell();
+      const npc = this.npcAtCell(x, y);
+      if (npc && !this.fieldTrainer && !this.player.moving) { this.talkTo(npc); return; }
+      if (!this.fieldTrainer && !this.player.moving) {
+        if (this.tryChapterDoor(x, y)) return;
+        const sign = this.map.signAtCell(x, y);
+        if (sign && this.tryChapterSign(sign.text)) return;
+      }
+      this.firePokemonAttack();
+    }
+    if (!this.pokemonPilot) return;
+    // Aggression is rolled once at spawn. Passive creatures only retaliate.
     for (const wild of this.wild.slots) {
       if (!wild.active) continue;
-      wild.aggro = Math.abs(wild.cellX - this.player.cellX) + Math.abs(wild.cellY - this.player.cellY) <= 5;
+      const wasAggro = wild.aggro;
+      wild.aggro = wild.trainerOwned || wild.provoked || (wild.aggressive &&
+        Math.abs(wild.cellX - this.player.cellX) + Math.abs(wild.cellY - this.player.cellY) <= 5);
+      if (wild.aggro && !wasAggro) { wild.timer = 0; wild.attackCooldown = OVERWORLD_ATTACK_COOLDOWN; }
+    }
+    if (!this.inPurifiedZone) this.wild.update(this.shell.data, this.map, this.player, this.entities, this.tilePairs,
+      (this.shell.data.followerSprites ? 1 : 0) + 5,
+      wild => wild.aggro && wild.attackCooldown <= 0 &&
+        (wild.mon?.moves ?? []).some(move => move.pp > 0 && this.fieldInRange(wild, move.id)),
+      wild => this.fieldBattle!.locked(this.fieldActor(wild)) || this.fieldCharges.some(c => c.source === wild),
+      wild => this.fieldBattle!.moveTicks(this.fieldActor(wild), FIELD_WALK_TICKS));
+    for (const wild of this.wild.slots) {
+      if (!wild.active || !wild.aggro || wild.moving || wild.attackCooldown > 0 || this.fieldCharges.some(c => c.source === wild)) continue;
+      const battle = this.prepareFieldBattle(wild);
+      if (battle.locked(battle.enemy)) continue;
+      const usable = battle.enemy.curMoves.filter((move, i) => move.pp > 0 && battle.enemy.disabledSlot !== i + 1);
+      const possible = usable.length ? usable : [{ id: "STRUGGLE", pp: 1, struggle: true }];
+      let moves = possible.filter(move => this.fieldInRange(wild, move.id));
+      if (wild.bossPattern?.length) {
+        const wanted = wild.bossPattern[wild.bossPatternIndex % wild.bossPattern.length];
+        const scripted = moves.find(move => move.id === wanted);
+        moves = scripted ? [scripted] : [];
+      }
+      if (!moves.length) continue;
+      const selected = moves[this.shell.rng.int(moves.length)]!;
+      if (wild.bossPattern?.length) wild.bossPatternIndex++;
+      this.beginFieldMove(selected, wild);
+      if (!this.pokemonPilot) break;
     }
   }
 
   private firePokemonAttack(): void {
     const pilot = this.pokemonPilot;
     if (!pilot || this.pokemonAttackCooldown > 0) {
-      if (pilot) this.pokemonAttackMessage = `COOLDOWN ${Math.ceil(this.pokemonAttackCooldown / 60)}s`;
+      if (pilot) this.pokemonAttackMessage = `COOLDOWN ${Math.ceil(this.pokemonAttackCooldown / FIELD_LOGIC_HZ)}s`;
       return;
     }
-    const mon = this.shell.save.party![pilot.monIndex]!;
-    const attack = overworldAttacksFor(mon.species ?? "")[pilot.attackIndex]!;
-    const range = attack.kind === "melee" ? 1 : 5;
-    const dx = this.player.facing === "left" ? -1 : this.player.facing === "right" ? 1 : 0;
-    const dy = this.player.facing === "up" ? -1 : this.player.facing === "down" ? 1 : 0;
-    const targetX = this.player.cellX + dx * range;
-    const targetY = this.player.cellY + dy * range;
-    const wild = this.wild.slots.find(w => w.active &&
-      (attack.kind === "melee"
-        ? Math.abs(w.cellX - this.player.cellX) + Math.abs(w.cellY - this.player.cellY) <= 1
-        : (w.cellX - this.player.cellX) * dx + (w.cellY - this.player.cellY) * dy > 0 &&
-          Math.abs(w.cellX - this.player.cellX) + Math.abs(w.cellY - this.player.cellY) <= 5));
-    this.pokemonAttackCooldown = OVERWORLD_ATTACK_COOLDOWN;
-    this.pokemonProjectile = attack.kind === "ranged" ? { x: targetX, y: targetY, frames: 8 } : undefined;
-    if (!wild) { this.pokemonAttackMessage = `${attack.name} MISS`; return; }
-    wild.hp = Math.max(0, wild.hp - attack.power);
-    this.pokemonAttackMessage = `${attack.name} HIT ${wild.species} ${wild.hp}/${wild.maxHp}`;
-    if (wild.hp === 0) { wild.active = false; wild.aggro = false; this.pokemonAttackMessage = `${wild.species} FAINTED`; }
+    const battle = this.fieldBattle!;
+    if (battle.locked(battle.player) || this.fieldCharges.some(c => !c.source)) {
+      this.pokemonAttackMessage = "CANNOT ACT"; return;
+    }
+    const moves = battle.player.curMoves;
+    if (!moves.length || moves.every(move => move.pp <= 0)) {
+      this.beginFieldMove({ id: "STRUGGLE", pp: 1, struggle: true }); return;
+    }
+    const move = moves[pilot.attackIndex % moves.length]!;
+    this.beginFieldMove(move);
+  }
+
+  private fieldActor(wild?: WildSprite) {
+    return wild ? this.prepareFieldBattle(wild).enemy : this.fieldBattle!.player;
+  }
+
+  private fieldInRange(wild: WildSprite, id: string): boolean {
+    const rule = FIELD_MOVES[id];
+    const x = Math.round(this.player.px / 16), y = Math.round(this.player.py / 16);
+    if (rule?.target === "self") return true;
+    const attack = overworldAttacksFor(wild.species, [{ id }], this.shell.data.moves)[0]!;
+    if (rule?.area || attack.kind === "melee") {
+      return fieldCells(wild.cellX, wild.cellY, wild.facing, rule?.area ?? "melee").some(([cx, cy]) => cx === x && cy === y);
+    }
+    const dx = x - wild.cellX, dy = y - wild.cellY;
+    return (dx === 0 || dy === 0) && Math.abs(dx) + Math.abs(dy) > 0 && Math.abs(dx) + Math.abs(dy) <= (rule?.range ?? 5);
+  }
+
+  private beginFieldMove(move: MoveSlot & { struggle?: boolean }, source?: WildSprite): void {
+    const pilot = this.pokemonPilot;
+    if (!pilot) return;
+    const actor = this.fieldActor(source);
+    if (this.fieldBattle!.locked(actor)) return;
+    if (actor.disabledSlot && actor.curMoves[actor.disabledSlot - 1]?.id === move.id) {
+      this.pokemonAttackMessage = "MOVE DISABLED"; return;
+    }
+    if (!move.struggle && move.pp <= 0) { this.pokemonAttackMessage = "NO PP LEFT"; return; }
+    const original = move.id;
+    let id = original;
+    if (id === "METRONOME") {
+      const choices = Object.keys(FIELD_MOVES).filter(key => key !== "METRONOME" && key !== "STRUGGLE" && this.shell.data.moves[key]);
+      id = choices[this.shell.rng.int(choices.length)] ?? "TACKLE";
+    }
+    const rule = FIELD_MOVES[id];
+    const cooldown = FIELD_MOVES[original]?.cooldown ?? OVERWORLD_ATTACK_COOLDOWN;
+    if (source) source.attackCooldown = cooldown;
+    else this.pokemonAttackCooldown = cooldown;
+    if (!move.struggle) move.pp--;
+    const actorPosition = source ?? this.player;
+    const action = { move: { id, pp: 1, struggle: move.struggle }, source, sourceMon: source?.mon,
+      facing: actorPosition.facing, ticks: rule?.charge ?? 0 };
+    this.pokemonAttackMessage = `${this.shell.data.moves[id]?.name ?? id}${action.ticks ? " CHARGING" : "!"}`;
+    if (action.ticks) {
+      this.fieldBattle!.applyChargeBuff(actor, id);
+      this.fieldCharges.push(action);
+      this.pokemonMeleeFlashes.push({ x: Math.round(actorPosition.px / 16), y: Math.round(actorPosition.py / 16), ticks: action.ticks });
+    } else this.deliverFieldMove(action);
+  }
+
+  private advanceFieldCharges(): void {
+    for (const charge of [...this.fieldCharges]) {
+      if (charge.source && (!charge.source.active || charge.source.mon !== charge.sourceMon)) {
+        this.fieldCharges.splice(this.fieldCharges.indexOf(charge), 1); continue;
+      }
+      if (this.fieldBattle!.locked(this.fieldActor(charge.source))) continue;
+      if (--charge.ticks > 0) continue;
+      this.fieldCharges.splice(this.fieldCharges.indexOf(charge), 1);
+      this.deliverFieldMove(charge);
+      if (!this.pokemonPilot) break;
+    }
+  }
+
+  private displaceFieldActor(source: WildSprite | undefined, facing: Dir, tiles: number): void {
+    const actor = source ?? this.player;
+    // Finish no partial steps during a controlled dash/knockback.
+    actor.cellX = Math.round(actor.px / 16); actor.cellY = Math.round(actor.py / 16);
+    actor.moving = false; actor.targetX = actor.targetY = undefined;
+    for (let n = 0; n < tiles; n++) {
+      const [x, y] = target(actor.cellX, actor.cellY, facing);
+      if (!this.map.inBounds(x, y) || !canMove(this.map, this.entities, actor, facing, this.tilePairs).ok ||
+          this.wild.slots.some(w => w !== source && w.active && w.cellX === x && w.cellY === y)) break;
+      actor.cellX = x; actor.cellY = y;
+    }
+    actor.px = actor.cellX * 16; actor.py = actor.cellY * 16;
+  }
+
+  private deliverFieldMove(action: FieldCharge): void {
+    const pilot = this.pokemonPilot;
+    if (!pilot) return;
+    const { move, source, facing } = action;
+    const actor = source ?? this.player;
+    const rule = FIELD_MOVES[move.id];
+    const attack = overworldAttacksFor("", [move], this.shell.data.moves)[0]!;
+    if (rule?.dash) this.displaceFieldActor(source, facing, 1);
+    const x = Math.round(actor.px / 16), y = Math.round(actor.py / 16);
+    if (attack.target === "self") {
+      this.resolveFieldHit(source, { ...move }, !source, pilot.monIndex); return;
+    }
+    if (!rule?.area && attack.kind === "ranged") {
+      const [nx, ny] = target(x, y, facing);
+      this.pokemonProjectiles.push({ x, y, dx: nx - x, dy: ny - y, remaining: rule?.range ?? 5,
+        move: { ...move }, name: attack.name, source, sourceMon: source?.mon, monIndex: pilot.monIndex,
+        frame: 0, ticks: 0, stepTicks: FIELD_WALK_TICKS / OVERWORLD_PROJECTILE_SPEED });
+      return;
+    }
+    const cells = fieldCells(x, y, facing, rule?.area ?? "melee").filter(([cx, cy]) => this.map.inBounds(cx, cy));
+    for (const [cx, cy] of cells) this.flashMelee(cx, cy);
+    const contains = (px: number, py: number) => cells.some(([cx, cy]) => cx === Math.round(px / 16) && cy === Math.round(py / 16));
+    const hits = source ? (contains(this.player.px, this.player.py) ? [source] : [])
+      : this.wild.slots.filter(w => w.active && contains(w.px, w.py));
+    // Haze also resets its user when no opponent is inside the radius.
+    if (move.id === "HAZE" && !hits.length) {
+      const battler = this.fieldActor(source);
+      this.pokemonAttackMessage = this.fieldBattle!.resolveFieldAction(battler, battler, { ...move }).join(" ");
+    }
+    for (const wild of hits) {
+      this.resolveFieldHit(wild, { ...move }, !source, pilot.monIndex);
+      if (!this.pokemonPilot) break;
+    }
+    if (move.id === "SELFDESTRUCT" || move.id === "EXPLOSION") {
+      const battler = this.fieldActor(source);
+      battler.mon.hp = 0;
+      if (source) this.finishFieldOpponent(source, pilot.monIndex);
+      else { this.stopPokemonPilot(); this.pokemonAttackMessage = `${battler.name} FAINTED`; }
+    }
+    if (!hits.length && move.id !== "HAZE") this.pokemonAttackMessage = `${attack.name} MISS`;
+  }
+
+  private flashMelee(x: number, y: number): void {
+    if (!this.map.inBounds(x, y)) return;
+    const existing = this.pokemonMeleeFlashes.find(flash => flash.x === x && flash.y === y);
+    if (existing) existing.ticks = Math.max(existing.ticks, MELEE_FLASH_TICKS);
+    else this.pokemonMeleeFlashes.push({ x, y, ticks: MELEE_FLASH_TICKS });
+  }
+
+  private advancePokemonProjectile(): void {
+    for (const shot of [...this.pokemonProjectiles]) {
+      if (shot.source && (!shot.source.active || shot.source.mon !== shot.sourceMon)) { this.removeFieldShot(shot); continue; }
+      shot.frame++;
+      if (++shot.ticks < shot.stepTicks) continue;
+      shot.ticks = 0;
+      shot.x += shot.dx; shot.y += shot.dy; shot.remaining--;
+      if (!this.map.inBounds(shot.x, shot.y) || (!this.map.isWalkableCell(shot.x, shot.y) && !this.map.isWaterCell(shot.x, shot.y))) {
+        this.addProjectileImpact(shot);
+        this.removeFieldShot(shot);
+        this.pokemonAttackMessage = `${shot.name} BLOCKED`;
+        continue;
+      }
+      const wild = shot.source
+        ? (Math.round(this.player.px / 16) === shot.x && Math.round(this.player.py / 16) === shot.y ? shot.source : undefined)
+        : this.wild.slots.find(w => w.active && Math.round(w.px / 16) === shot.x && Math.round(w.py / 16) === shot.y);
+      if (wild) {
+        this.addProjectileImpact(shot);
+        this.resolveFieldHit(wild, shot.move, !shot.source, shot.monIndex,
+          shot.dx < 0 ? "left" : shot.dx > 0 ? "right" : shot.dy < 0 ? "up" : "down");
+        this.removeFieldShot(shot);
+        if (!this.pokemonPilot) break;
+      } else if (shot.remaining <= 0) {
+        this.removeFieldShot(shot);
+        this.pokemonAttackMessage = `${shot.name} MISS`;
+      }
+    }
+  }
+
+  private removeFieldShot(shot: FieldProjectile): void {
+    const index = this.pokemonProjectiles.indexOf(shot);
+    if (index >= 0) this.pokemonProjectiles.splice(index, 1);
+  }
+
+  private addProjectileImpact(shot: FieldProjectile): void {
+    if (!this.map.inBounds(shot.x, shot.y)) return;
+    if (this.pokemonImpacts.length >= PROJECTILE_IMPACT_LIMIT) this.pokemonImpacts.shift();
+    this.pokemonImpacts.push({ x: shot.x, y: shot.y, moveId: shot.move.id, ticks: PROJECTILE_IMPACT_TICKS });
+  }
+
+  startFieldTrainer(name: string, trainerClass: string, party: readonly { species: string; level: number }[], onWin: () => void): boolean {
+    if (!this.pokemonPilot || this.fieldTrainer || !party.length) return false;
+    if (party.some(mon => !this.shell.data.pokemon[mon.species])) return false;
+    this.wild.clear();
+    this.wild.trainerBattle = true;
+    this.pokemonProjectiles.length = 0;
+    this.pokemonImpacts.length = 0;
+    this.fieldCharges.length = 0;
+    const boss = name === "BROCK" ? "BROCK" : name === "MISTY" ? "MISTY" : undefined;
+    this.fieldTrainer = { name, trainerClass, party, index: 0, delay: 0, onWin, boss };
+    this.advanceFieldTrainer();
+    return true;
+  }
+
+  private cancelFieldTrainer(): void {
+    if (!this.fieldTrainer) return;
+    this.fieldTrainer = undefined;
+    this.wild.clear();
+    for (const npc of this.npcs) npc.frozen = false;
+  }
+
+  private advanceFieldTrainer(): void {
+    const trainer = this.fieldTrainer;
+    if (!trainer || this.wild.slots.some(w => w.active && w.trainerOwned)) return;
+    if (trainer.delay > 0) { trainer.delay--; return; }
+    if (trainer.index >= trainer.party.length) {
+      if (this.fieldNotices.length) return; // let the final XP notice finish first
+      this.fieldTrainer = undefined;
+      this.wild.trainerBattle = false;
+      const prize = trainerPayout(this.shell.data.trainers?.[trainer.trainerClass], trainer.party);
+      this.shell.save.money = Math.min(MAX_MONEY, (this.shell.save.money ?? 0) + prize);
+      this.fieldNotice(`+${prize} MONEY ${trainer.name}`);
+      trainer.onWin();
+      return;
+    }
+    const occupiedCells = this.solidActors();
+    let cell: [number, number] | undefined;
+    // Leaders enter from deliberate arena positions. Brock's Onix starts on
+    // the central rock platform; Misty's Starmie starts in the pool.
+    if (trainer.boss === "BROCK" && trainer.party[trainer.index]?.species === "ONIX") {
+      cell = this.arenaCell(6, 6, false);
+    } else if (trainer.boss === "MISTY" && trainer.party[trainer.index]?.species === "STARMIE") {
+      cell = this.arenaCell(6, 6, true);
+    }
+    for (let radius = 2; radius <= 6 && !cell; radius++) {
+      for (let dy = -radius; dy <= radius && !cell; dy++) for (let dx = -radius; dx <= radius; dx++) {
+        if (Math.abs(dx) + Math.abs(dy) !== radius) continue;
+        const x = this.player.cellX + dx, y = this.player.cellY + dy;
+        if (this.map.inBounds(x, y) && this.map.isWalkableCell(x, y) && !this.map.warpAtCell(x, y) &&
+            !occupied(occupiedCells, x, y)) { cell = [x, y]; break; }
+      }
+    }
+    if (!cell) { trainer.delay = 30; this.pokemonAttackMessage = "MAKE ROOM FOR TRAINER POKEMON"; return; }
+    const member = trainer.party[trainer.index]!;
+    const wild = this.wild.slots[0]!;
+    const mon = newMon(this.shell.data, member.species, member.level, this.shell.rng);
+    const bossPattern = trainer.boss === "BROCK" && member.species === "ONIX"
+      ? ["ROCK_THROW", "ROCK_THROW", "WRAP", "ROCK_THROW"]
+      : trainer.boss === "MISTY" && member.species === "STARMIE"
+        ? ["SWIFT", "CONFUSION", "TACKLE"] : undefined;
+    Object.assign(wild, { trainerOwned: true, active: true, species: member.species, level: member.level,
+      icon: this.shell.data.pokemon[member.species]!.partyIcon ?? "MON", mon,
+      battler: makeBattler(this.shell.data, mon, false), hp: mon.hp, maxHp: mon.stats.hp,
+      cellX: cell[0], cellY: cell[1], px: cell[0] * 16, py: cell[1] * 16,
+      targetX: undefined, targetY: undefined, moving: false, progress: 0, timer: 0,
+      aggressive: true, provoked: true, aggro: true, rewarded: false,
+      surfing: trainer.boss === "MISTY" && member.species === "STARMIE",
+      habitat: trainer.boss === "MISTY" && member.species === "STARMIE" ? "water" : "grass",
+      bossPattern, bossPatternIndex: 0, bossPatternTimer: 0,
+      attackCooldown: OVERWORLD_ATTACK_COOLDOWN, moveStepTicks: FIELD_WALK_TICKS });
+    if (trainer.boss === "BROCK" && member.species === "ONIX") {
+      const moves = ["ROCK_THROW", "WRAP", "TACKLE"].map(id => ({ id, pp: 99 }));
+      mon.moves = moves;
+      wild.battler!.curMoves = mon.moves;
+    }
+    if (trainer.boss === "MISTY" && member.species === "STARMIE") {
+      const moves = ["SWIFT", "CONFUSION", "TACKLE"].map(id => ({ id, pp: 99 }));
+      mon.moves = moves;
+      wild.battler!.curMoves = mon.moves;
+    }
+    this.fieldNotice(`${member.species} ${trainer.index + 1}/${trainer.party.length} SENT OUT`);
+  }
+
+  private arenaCell(cx: number, cy: number, water: boolean): [number, number] | undefined {
+    const candidates: [number, number][] = [[cx, cy], [cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]];
+    return candidates.find(([x, y]) => this.map.inBounds(x, y) &&
+      (water ? this.map.isWaterCell(x, y) : this.map.isWalkableCell(x, y)) &&
+      !occupied(this.solidActors(), x, y));
+  }
+
+  private finishFieldOpponent(wild: WildSprite, monIndex: number): void {
+    if (wild.rewarded) return;
+    wild.rewarded = true; wild.active = false; wild.aggro = false; wild.moving = false;
+    const reward = this.shell.awardFieldExperience(monIndex, wild.species, wild.level, wild.trainerOwned);
+    this.fieldNotice(`+${reward.gained} EXP ${wild.species}${reward.levels.length ? ` LV${reward.levels.at(-1)}` : ""}`);
+    if (wild.trainerOwned && this.fieldTrainer) {
+      this.fieldTrainer.index++;
+      this.fieldTrainer.delay = 120;
+    }
+  }
+
+  private tickFieldStatuses(): void {
+    const battle = this.fieldBattle!, pilot = this.pokemonPilot!;
+    const messages = battle.tickStatus(battle.player);
+    for (const wild of this.wild.slots) {
+      if (!wild.active) continue;
+      this.prepareFieldBattle(wild);
+      messages.push(...battle.tickStatus(wild.battler!));
+      wild.hp = wild.mon!.hp;
+      if (wild.hp <= 0 && !wild.rewarded) this.finishFieldOpponent(wild, pilot.monIndex);
+    }
+    battle.retainActors([battle.player, ...this.wild.slots.filter(w => w.active && w.battler).map(w => w.battler!)]);
+    if (messages.length) this.pokemonAttackMessage = messages.join(" ");
+    if (battle.player.mon.hp <= 0) {
+      this.stopPokemonPilot();
+      this.pokemonAttackMessage = `${battle.player.mon.species} FAINTED`;
+    }
+  }
+
+  private prepareFieldBattle(wild: WildSprite): FieldBattle {
+    const battle = this.fieldBattle!;
+    if (!battle.player.transformedSpecies) battle.player.curStats = battle.player.mon.stats;
+    wild.mon ??= newMon(this.shell.data, wild.species, wild.level, this.shell.rng);
+    wild.battler ??= makeBattler(this.shell.data, wild.mon, false);
+    battle.enemy = wild.battler;
+    return battle;
+  }
+
+  private resolveFieldHit(wild: WildSprite | undefined, move: MoveSlot & { struggle?: boolean }, fromPlayer: boolean, monIndex: number, knockbackDirection?: Dir): void {
+    if (wild && (!wild.active || wild.rewarded)) return;
+    const battle = wild ? this.prepareFieldBattle(wild) : this.fieldBattle!;
+    if (!wild) battle.enemy = battle.idleTarget;
+    if (wild && fromPlayer) wild.provoked = true;
+    const target = fromPlayer ? battle.enemy : battle.player;
+    const hpBefore = target.mon.hp;
+    const messages = battle.resolveFieldAction(
+      fromPlayer ? battle.player : battle.enemy,
+      fromPlayer ? battle.enemy : battle.player, move);
+    if (move.id === "PAY_DAY" && target.mon.hp < hpBefore) {
+      const user = fromPlayer ? battle.player : battle.enemy;
+      this.shell.save.money = Math.min(999999, (this.shell.save.money ?? 0) + 2 * user.mon.level);
+    }
+    if (battle.lastPush && wild) {
+      const attacker = fromPlayer ? this.player : wild;
+      this.displaceFieldActor(fromPlayer ? wild : undefined, knockbackDirection ?? attacker.facing, FIELD_MOVES[move.id]?.push ?? 2);
+    }
+    if (wild) {
+      wild.hp = battle.enemy.mon.hp;
+      wild.maxHp = battle.enemy.mon.stats.hp;
+      wild.aggro = true;
+      wild.timer = 0;
+    }
+    const outcome = messages.filter(message => !message.includes(" used ")).join(" ");
+    this.pokemonAttackMessage = outcome || `${this.shell.data.moves[move.id]?.name ?? move.id} ${Math.max(0, hpBefore - target.mon.hp)} DMG`;
+    if (wild && wild.hp === 0 && !wild.rewarded) this.finishFieldOpponent(wild, monIndex);
+    if (battle.result === "run") {
+      if (fromPlayer) this.stopPokemonPilot();
+      else if (wild) { wild.active = false; wild.aggro = false; }
+      battle.result = null;
+    }
+    if (battle.player.mon.hp <= 0) {
+      this.stopPokemonPilot();
+      this.pokemonAttackMessage = `${battle.player.mon.species} FAINTED`;
+    }
   }
 
   // OverworldController.lua:209 enter
@@ -338,7 +829,14 @@ export class Overworld implements ScriptWorld {
     const tileset = this.shell.data.tilesets?.[def.tileset];
     if (!tileset) throw new Error(`unknown tileset ${def.tileset} for ${mapId}`);
     this.map = new GameMap(def, tileset);
+    this.refreshChapterDoors();
+    this.inPurifiedZone = false;
+    this.cancelFieldTrainer();
     this.wild.clear();
+    this.fieldCharges.length = 0;
+    this.pokemonProjectiles.length = 0;
+    this.pokemonImpacts.length = 0;
+    this.pokemonMeleeFlashes.length = 0;
     // NPC instances persist across connection crossings in the pool (keyed
     // by NPC.id) so nothing snaps back to its spawn point at a seam; warps
     // rebuild from scratch, like the original's per-entry sprite init
@@ -370,6 +868,10 @@ export class Overworld implements ScriptWorld {
     } else {
       this.player = new Player(x, y, facing);
     }
+    if (isOutside(def) && this.map.isWalkableCell(x, y) && !this.map.isWaterCell(x, y)) {
+      (this.shell.save.visitedOutdoor ??= {})[mapId] = { x, y };
+    }
+    if (this.pokemonPilot) this.refreshPilotMobility();
     this.entities = [this.player, ...this.npcs];
     this.follower.reset(this.player);
   }
@@ -391,6 +893,28 @@ export class Overworld implements ScriptWorld {
     if (obj.name === "CERULEANCITY_GUARD2") return !houseOpen;
     if (obj.name === "CERULEANCITY_ROCKET" && chosen.EVENT_GOT_TM28) return false;
     if (obj.name === "SSANNE2F_RIVAL") return !chosen.EVENT_BEAT_SS_ANNE_RIVAL;
+    if (obj.name === "POKEMONTOWER2F_RIVAL") return !chosen.EVENT_BEAT_POKEMON_TOWER_RIVAL;
+    if (obj.name === "SILPHCO7F_RIVAL") return !chosen.EVENT_BEAT_SILPH_CO_RIVAL;
+    if (obj.name === "FIGHTINGDOJO_HITMONLEE_POKE_BALL") return !chosen.EVENT_GOT_HITMONLEE;
+    if (obj.name === "FIGHTINGDOJO_HITMONCHAN_POKE_BALL") return !chosen.EVENT_GOT_HITMONCHAN;
+    if (obj.name?.startsWith("SAFFRONCITY_ROCKET")) {
+      if (chosen.EVENT_BEAT_SILPH_CO_GIOVANNI) return false;
+      if (obj.name === "SAFFRONCITY_ROCKET8" && chosen.EVENT_RESCUED_MR_FUJI) return false;
+      if (obj.name === "SAFFRONCITY_ROCKET9") return !!chosen.EVENT_RESCUED_MR_FUJI;
+    }
+    if (obj.name?.startsWith("SAFFRONCITY_") && obj.hidden && !obj.name.includes("ROCKET") && chosen.EVENT_BEAT_SILPH_CO_GIOVANNI) return true;
+    if (this.map.id.startsWith("SILPH_CO_") && chosen.EVENT_BEAT_SILPH_CO_GIOVANNI &&
+        (obj.trainerClass === "OPP_ROCKET" || obj.trainerClass === "OPP_SCIENTIST" || obj.trainerClass === "OPP_GIOVANNI")) return false;
+    if (obj.name === "MRFUJISHOUSE_MR_FUJI") return !!chosen.EVENT_RESCUED_MR_FUJI;
+    if (obj.name === "GAMECORNER_ROCKET") return !chosen.EVENT_BEAT_GAMECORNER_ROCKET;
+    if (obj.name === "ROCKETHIDEOUTB4F_GIOVANNI" && chosen.EVENT_BEAT_ROCKET_HIDEOUT_GIOVANNI) return false;
+    if (this.map.id === "POKEMON_TOWER_7F" && obj.trainerClass === "OPP_ROCKET" &&
+        (chosen[`EVENT_BEAT_${obj.name}`] || chosen[trainerHeader(this.shell.data, this.map.def, obj.index)?.event ?? ""])) return false;
+    if (obj.name === "ROCKETHIDEOUTB4F_LIFT_KEY") return !!chosen.EVENT_ROCKET_DROPPED_LIFT_KEY;
+    if (obj.name === "POKEMONTOWER7F_MR_FUJI") return !chosen.EVENT_RESCUED_MR_FUJI;
+    if (obj.name === "ROCKETHIDEOUTB4F_SILPH_SCOPE") return !!chosen.EVENT_BEAT_ROCKET_HIDEOUT_GIOVANNI;
+    if (obj.name === "ROUTE12_SNORLAX") return !chosen.EVENT_BEAT_ROUTE12_SNORLAX;
+    if (obj.name === "ROUTE16_SNORLAX") return !chosen.EVENT_BEAT_ROUTE16_SNORLAX;
     return !(obj as MapObject & { hidden?: boolean }).hidden;
   }
 
@@ -422,7 +946,7 @@ export class Overworld implements ScriptWorld {
       return;
     }
     for (const npc of this.npcs) {
-      npc.update(this.map, this.entities, this.shell.npcRng, this.tilePairs);
+      npc.update(this.map, this.solidActors(), this.shell.npcRng, this.tilePairs);
     }
     this.updateScriptMoves();
     // emote is included: a hold queued from a scriptMove onDone is assigned
@@ -431,7 +955,7 @@ export class Overworld implements ScriptWorld {
     const scripted =
       this.runner.isRunning() || this.scriptMoves.length > 0 || this.emote !== undefined;
     if (!scripted && !this.transitioning) {
-      if (this.shell.save.party?.some(mon => mon.hp > 0)) {
+      if (!this.inPurifiedZone && this.shell.save.party?.some(mon => mon.hp > 0)) {
         this.wild.update(this.shell.data, this.map, this.player, this.entities, this.tilePairs, this.shell.data.followerSprites ? 1 : 0);
       }
       this.handleInput();
@@ -516,7 +1040,6 @@ export class Overworld implements ScriptWorld {
       if (!this.player.moving && this.player.facing === dir) {
         if (this.checkEdgeExit(dir)) return;
         if (this.checkLedgeHop(dir)) return;
-        if (this.touchWild(dir)) return;
         // boulder pushes: outside the slice
       }
       // Content boundary, standing case: a warp TILE whose destination map
@@ -538,7 +1061,10 @@ export class Overworld implements ScriptWorld {
           return;
         }
       }
-      const result = this.player.tryMove(dir, this.map, this.entities, this.tilePairs);
+      const result = this.player.tryMove(dir, this.map, this.solidActors(), this.tilePairs);
+      // Walking into a visible wild starts a classic encounter. Field mode
+      // has its own movement loop and keeps opponents solid for combat.
+      if (result === "blocked" && this.player.lastBlockReason === "entity" && this.touchWild(dir)) return;
       // a collision while standing on a warp square fires the warp when
       // the extra check passes (CheckWarpsCollision), only while
       // BIT_STANDING_ON_WARP is set (issue #230)
@@ -595,7 +1121,7 @@ export class Overworld implements ScriptWorld {
           const landing = this.connectionLanding(dir);
           if (!landing) return false;
           const { dest, ts, x, y } = landing;
-          if (!defPassable(dest, ts, x, y, p.surfing)) return false;
+          if (!defPassable(dest, ts, x, y, (p.surfing || p.waterWalking || p.flying))) return false;
           this.shell.audio.playSfx("Ledge"); // OverworldController.lua:1352
           p.hopFrames = 32;
           p.hopTotal = 32;
@@ -692,7 +1218,7 @@ export class Overworld implements ScriptWorld {
     if (!landing) return false;
     const { dest, ts, x, y } = landing;
     const p = this.player;
-    if (!defPassable(dest, ts, x, y, p.surfing)) {
+    if (!defPassable(dest, ts, x, y, p.surfing || p.waterWalking || p.flying)) {
       return false;
     }
     // Every connection is a hard PSP-1000 scene boundary. Hold the old scene
@@ -771,15 +1297,136 @@ export class Overworld implements ScriptWorld {
       }
       return;
     }
+    if (this.tryChapterDoor(fx, fy)) return;
     if (this.tryCut(fx, fy)) return;
     const sign = this.map.signAtCell(fx, fy);
     if (sign) {
+      if (this.tryChapterSign(sign.text)) return;
       this.showMapText(sign.text);
       return;
     }
     if (this.isBedroomComputer(fx, fy)) {
       this.shell.openBedroomComputer();
     }
+  }
+
+  private refreshChapterDoors(): void {
+    for (const door of chapterDoors(this.shell.data.field as ChapterField, this.map.id)) {
+      const open = doorOpen(door, this.shell.save.flags);
+      this.map.setChapterBlock(door.bx, door.by, open ? door.open : door.block, open);
+    }
+  }
+
+  private refreshChapterObjects(): void {
+    this.npcs = this.npcs.filter(npc => this.objectVisible(npc.def));
+    for (const def of this.map.def.objects) {
+      if (this.objectVisible(def) && !this.npcs.some(npc => npc.def.index === def.index)) this.npcs.push(this.pooledNPC(this.map.id, def));
+    }
+    this.entities = [this.player, ...this.npcs];
+  }
+
+  private tryChapterDoor(x: number, y: number): boolean {
+    if (!this.map.id.startsWith("SILPH_CO_")) return false;
+    const door = chapterDoors(this.shell.data.field as ChapterField, this.map.id)
+      .find(door => door.bx === Math.floor(x / 2) && door.by === Math.floor(y / 2));
+    if (!door?.event || doorOpen(door, this.shell.save.flags)) return false;
+    if (!this.shell.save.inventory.CARD_KEY) {
+      this.shell.showText("This door needs\na CARD KEY!"); return true;
+    }
+    this.shell.save.flags[door.event] = true;
+    this.refreshChapterDoors();
+    this.shell.audio.playSfx("Go_Inside");
+    this.shell.showText("The CARD KEY\nopened the door!");
+    return true;
+  }
+
+  private giveGuardDrink(): boolean {
+    const save = this.shell.save;
+    if (save.flags.EVENT_GAVE_GUARDS_DRINK) { this.shell.showText("You can go through!"); return true; }
+    const drink = DRINKS.find(item => (save.inventory[item] ?? 0) > 0);
+    if (!drink) { this.shell.showText("I'm thirsty!\nThe road is closed."); return false; }
+    Bag.remove(save, drink, 1);
+    save.flags.EVENT_GAVE_GUARDS_DRINK = true;
+    this.shell.showText("Thanks for the drink!\nI'll share with the guards.\fYou can go through!");
+    return true;
+  }
+
+  private tryChapterSign(text: string): boolean {
+    const poster = (this.shell.data.field as ChapterField).gameCornerPoster;
+    if (poster && this.map.id === poster.map && text === poster.posterText) {
+      if (this.npcs.some(npc => npc.def.name === "GAMECORNER_ROCKET")) {
+        this.shell.showText("The ROCKET is guarding\nthe poster."); return true;
+      }
+      this.shell.showText("A switch behind\nthe poster!", () => {
+        this.shell.save.flags[poster.event] = true;
+        this.refreshChapterDoors(); this.shell.audio.playSfx("Go_Inside");
+      });
+      return true;
+    }
+    if (this.map.id === "CELADON_MART_ROOF" && text.includes("VENDING_MACHINE")) {
+      this.shell.openMart(DRINKS.map((item, index) => ({ item, price: [200, 300, 350][index] })));
+      return true;
+    }
+    if (!this.map.id.endsWith("_ELEVATOR")) return false;
+    if (this.map.id === "ROCKET_HIDEOUT_ELEVATOR" && !this.shell.save.inventory.LIFT_KEY) {
+      this.shell.showText("The lift needs\na LIFT KEY!"); return true;
+    }
+    const elevator = this.map.id;
+    const floors = Object.values(this.shell.data.maps ?? {}).filter(map => this.isCooked(map.id) && map.warps.some(warp => warp.destMap === elevator))
+      .sort((a, b) => Number(a.id.match(/(\d+)F$/)?.[1]) - Number(b.id.match(/(\d+)F$/)?.[1]));
+    this.shell.showMenuChoice?.("Which floor?", [...floors.map(map => map.id.split("_").at(-1)!), "CANCEL"], index => {
+      const floor = floors[index];
+      if (!floor) return;
+      (this.shell.save.elevatorFloors ??= {})[elevator] = floor.id;
+      this.shell.audio.playSfx("Go_Inside");
+      this.shell.showText(`Arrived at ${floor.id.split("_").at(-1)}.`);
+    });
+    return true;
+  }
+
+  private startTowerGhost(): void {
+    if (!this.shell.pushGhostBattle) return;
+    this.shell.showText("Be gone...\nIntruders!", () => this.shell.pushGhostBattle!(() => {
+      this.shell.save.flags.EVENT_BEAT_GHOST_MAROWAK = true;
+      this.shell.showText("The restless soul\nwas calmed.");
+    }, () => this.scriptMove(this.player, "right", 1)));
+  }
+
+  private tryChapterStep(): boolean {
+    const { cellX: x, cellY: y } = this.player;
+    const gate = SAFFRON_GATES[this.map.id];
+    if (gate && !this.shell.save.flags.EVENT_GAVE_GUARDS_DRINK && gate.cells.some(cell => cell[0] === x && cell[1] === y)) {
+      const drink = DRINKS.find(item => (this.shell.save.inventory[item] ?? 0) > 0);
+      if (drink) this.giveGuardDrink();
+      else {
+        const back = gate.horizontal ? (this.player.facing === "left" ? "right" : "left") : (this.player.facing === "up" ? "down" : "up");
+        this.shell.showText("I'm thirsty!\nThe road is closed.", () => this.scriptMove(this.player, back, 1));
+      }
+      return true;
+    }
+    const purified = this.map.id === "POKEMON_TOWER_5F" && (x === 10 || x === 11) && (y === 8 || y === 9);
+    if (purified) {
+      this.wild.clear();
+      if (!this.inPurifiedZone) { this.inPurifiedZone = true; this.shell.healParty(); this.shell.showText("You entered a\npurified zone.\fYour POKéMON are healed!"); }
+      return true;
+    }
+    this.inPurifiedZone = false;
+    if (this.map.id === "POKEMON_TOWER_6F" && x === 10 && y === 16 && !this.shell.save.flags.EVENT_BEAT_GHOST_MAROWAK) {
+      this.startTowerGhost(); return true;
+    }
+    const spinner = (this.shell.data.field as ChapterField).spinners?.[this.map.id]?.find(spinner => spinner.x === x && spinner.y === y);
+    if (spinner) {
+      this.shell.audio.playSfx("Arrow_Tiles");
+      const map = this.map;
+      const slide = (index: number): void => {
+        if (this.map !== map) return;
+        const move = spinner.moves[index];
+        if (!move) { this.onStepComplete(); return; }
+        this.scriptMove(this.player, move.dir, move.count, () => slide(index + 1));
+      };
+      slide(0); return true;
+    }
+    return false;
   }
 
   private tryCut(x: number, y: number): boolean {
@@ -826,6 +1473,7 @@ export class Overworld implements ScriptWorld {
   // TX_SCRIPT marts/nurses are the battle/menu ports' seams.
   talkTo(npc: NPC): void {
     if (this.tryChooseStarter(npc)) return;
+    if (this.tryPokemonTowerRivalEvent(npc)) return;
     if (this.tryChapterInteraction(npc)) return;
     npc.frozen = true;
     const unfreeze = () => {
@@ -839,6 +1487,87 @@ export class Overworld implements ScriptWorld {
    * first trainer roster. */
   private tryChapterInteraction(npc: NPC): boolean {
     const name = npc.def.name ?? "";
+    const flags = this.shell.save.flags;
+    if (SAFFRON_GATES[this.map.id] && name.endsWith("_GUARD")) { this.giveGuardDrink(); return true; }
+    if (name === "SILPHCO9F_NURSE") { this.shell.healParty(); this.shell.showText("Your POKéMON are healed!"); return true; }
+    if (name === "SILPHCO7F_RIVAL") {
+      if (flags.EVENT_BEAT_SILPH_CO_RIVAL) return true;
+      const starter = this.rivalStarter();
+      const index = starter === "SQUIRTLE" ? 6 : starter === "BULBASAUR" ? 7 : 8;
+      const party = this.shell.data.trainers?.OPP_RIVAL2?.parties[index];
+      if (!party) return false;
+      this.shell.showText(`${this.shell.save.player.rival}: Let's see how\nstrong you are!`, () => {
+        this.shell.pushTrainerBattle(`RIVAL ${this.shell.save.player.rival}`, "OPP_RIVAL2", party, () => {
+          flags.EVENT_BEAT_SILPH_CO_RIVAL = true;
+          this.npcs = this.npcs.filter(candidate => candidate !== npc);
+          this.entities = [this.player, ...this.npcs];
+        });
+      });
+      return true;
+    }
+    if (name === "SILPHCO7F_SILPH_WORKER_M1" || name === "FIGHTINGDOJO_HITMONLEE_POKE_BALL" || name === "FIGHTINGDOJO_HITMONCHAN_POKE_BALL") {
+      const lapras = name === "SILPHCO7F_SILPH_WORKER_M1";
+      const event = lapras ? "EVENT_GOT_LAPRAS" : "EVENT_GOT_DOJO_POKEMON";
+      const species = lapras ? "LAPRAS" : name.includes("HITMONLEE") ? "HITMONLEE" : "HITMONCHAN";
+      if (!(lapras ? flags.EVENT_BEAT_SILPH_CO_RIVAL : flags.EVENT_BEAT_KARATE_MASTER || flags.EVENT_BEAT_FIGHTINGDOJO_KARATE_MASTER)) {
+        this.shell.showText(lapras ? "Please defeat your rival\nfirst!" : "Defeat the KARATE MASTER\nfirst!");
+        return true;
+      }
+      if (flags[event] || (!lapras && (flags.EVENT_GOT_HITMONLEE || flags.EVENT_GOT_HITMONCHAN))) { this.shell.showText("Take good care of your\nPOKéMON!"); return true; }
+      this.shell.showChoice(`Would you like\n${species}?`, yes => {
+        if (!yes) return;
+        const result = this.shell.receiveGiftPokemon?.(species, lapras ? 15 : 30, event);
+        if (result === "full") { this.shell.showText("Your party is full.\nMake room and come back!"); return; }
+        if (result !== "granted") return;
+        if (!lapras) {
+          flags[`EVENT_GOT_${species}`] = true;
+          flags.EVENT_DEFEATED_FIGHTING_DOJO = true;
+        }
+        this.npcs = this.npcs.filter(candidate => this.objectVisible(candidate.def));
+        this.entities = [this.player, ...this.npcs];
+        this.shell.showText(`You received\n${species}!`);
+      });
+      return true;
+    }
+    if (name === "SILPHCO11F_SILPH_PRESIDENT") {
+      if (!flags.EVENT_BEAT_SILPH_CO_GIOVANNI) { this.shell.showText("Please help us defeat\nTEAM ROCKET!"); return true; }
+      const result = grantItem(this.shell.save, this.shell.data, "EVENT_GOT_MASTER_BALL", "MASTER_BALL");
+      this.shell.showText(result === "full" ? "Make room in your BAG\nfor the MASTER BALL!" : result === "already" ? "Thank you for saving\nSILPH CO.!" : "You received the\nMASTER BALL!");
+      return true;
+    }
+    if (name === "POKEMONTOWER7F_MR_FUJI") {
+      const rockets = this.map.def.objects.filter(object => object.trainerClass === "OPP_ROCKET");
+      if (rockets.some(object => !flags[trainerHeader(this.shell.data, this.map.def, object.index)?.event ?? `EVENT_BEAT_${object.name}`] && !flags[`EVENT_BEAT_${object.name}`])) {
+        this.shell.showText("Please defeat the\nTEAM ROCKET trainers!");
+        return true;
+      }
+      const reward = grantItem(this.shell.save, this.shell.data, "EVENT_GOT_POKE_FLUTE", "POKE_FLUTE");
+      if (reward === "full") { this.shell.showText("Make room in your BAG\nfor the POKé FLUTE!"); return true; }
+      this.shell.save.flags.EVENT_RESCUED_MR_FUJI = true;
+      this.npcs = this.npcs.filter(candidate => candidate !== npc);
+      this.entities = [this.player, ...this.npcs];
+      this.shell.showText("MR. FUJI: You came to\nrescue me!\fYou received the\nPOKé FLUTE!");
+      return true;
+    }
+    if (name === "MRFUJISHOUSE_MR_FUJI") {
+      this.shell.showText("MR. FUJI: The POKé FLUTE\ncan wake sleeping POKéMON.");
+      return true;
+    }
+    if (name === "ROUTE12_SNORLAX" || name === "ROUTE16_SNORLAX") {
+      const flag = name === "ROUTE12_SNORLAX" ? "EVENT_BEAT_ROUTE12_SNORLAX" : "EVENT_BEAT_ROUTE16_SNORLAX";
+      if (!this.shell.save.inventory.POKE_FLUTE) {
+        this.shell.showText("It's a sleeping SNORLAX.\nIt won't wake up!");
+        return true;
+      }
+      this.shell.showText("The POKé FLUTE woke up\nSNORLAX!", () => {
+        this.shell.pushStubBattle("SNORLAX", 30, () => {
+          this.shell.save.flags[flag] = true;
+          this.npcs = this.npcs.filter(candidate => candidate !== npc);
+          this.entities = [this.player, ...this.npcs];
+        });
+      });
+      return true;
+    }
     if (name === "DAYCARE_GENTLEMAN") { this.shell.openDaycare?.(); return true; }
     if (name === "BIKESHOP_CLERK") { this.shell.openBikeShop?.(); return true; }
     if (name === "POKEMONFANCLUB_CHAIRMAN") { this.shell.openFanClub?.(); return true; }
@@ -1049,6 +1778,11 @@ export class Overworld implements ScriptWorld {
     };
     const beatFlag = header?.event ?? trainer.event ?? (name === "PEWTERGYM_BROCK" ? "EVENT_BEAT_BROCK" : (forestFlag[name] ?? `EVENT_BEAT_${name}`));
     if (this.shell.save.flags[beatFlag] || this.shell.save.flags[`EVENT_BEAT_${name}`]) {
+      if (name === "ROCKETHIDEOUTB4F_ROCKET3") {
+        this.shell.save.flags.EVENT_ROCKET_DROPPED_LIFT_KEY = true;
+        this.refreshChapterObjects();
+        this.shell.showText("I dropped the LIFT KEY!"); return true;
+      }
       if (GYM_REWARDS[name] && !this.shell.save.flags[GYM_REWARDS[name].event]) { this.giveGymReward(name); return true; }
       if (name === "PEWTERGYM_BROCK") {
         this.shell.showText("Go to the GYM in\nCERULEAN and test\nyour abilities!");
@@ -1064,8 +1798,24 @@ export class Overworld implements ScriptWorld {
     const pre = (header?.battle && (this.shell.data.text as Record<string, string> | undefined)?.[header.battle]) || this.resolveText(npc.def.text) || `${label} wants\nto battle!`;
     this.shell.showText(pre, () => this.shell.pushTrainerBattle(label, trainer.trainerClass, party, () => {
       this.shell.save.flags[beatFlag] = true;
+      this.shell.save.flags[`EVENT_BEAT_${name}`] = true;
+      this.refreshChapterDoors();
+      if (name === "FIGHTINGDOJO_KARATE_MASTER") this.shell.save.flags.EVENT_BEAT_KARATE_MASTER = true;
+      if (name === "SILPHCO11F_GIOVANNI") {
+        this.shell.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI = true;
+        this.npcs = this.npcs.filter(candidate => this.objectVisible(candidate.def));
+        this.entities = [this.player, ...this.npcs];
+      }
+      if (name === "ROCKETHIDEOUTB4F_GIOVANNI") {
+        this.shell.save.flags.EVENT_BEAT_ROCKET_HIDEOUT_GIOVANNI = true;
+        this.shell.showText("GIOVANNI dropped something!\fThe SILPH SCOPE is now\nwithin reach.");
+      }
       npc.frozen = false;
-      if (GYM_REWARDS[name]) {
+      if (name === "ROCKETHIDEOUTB4F_GIOVANNI") {
+        this.refreshChapterObjects();
+      } else if (name === "GAMECORNER_ROCKET" || (this.map.id === "POKEMON_TOWER_7F" && trainer.trainerClass === "OPP_ROCKET")) {
+        this.refreshChapterObjects();
+      } else if (GYM_REWARDS[name]) {
         this.giveGymReward(name);
       } else if (this.map.id === "ROUTE_24" && this.bridgeComplete() && !this.shell.save.flags.EVENT_GOT_NUGGET) {
         this.awardNugget();
@@ -1213,6 +1963,7 @@ export class Overworld implements ScriptWorld {
   }
 
   private touchWild(dir: Dir): boolean {
+    if (this.pokemonPilot) return false;
     if (!this.shell.data.partyIcons || !this.shell.save.party?.some(mon => mon.hp > 0)) return false;
     const [x, y] = target(this.player.cellX, this.player.cellY, dir);
     const wild = this.wild.atCell(x, y);
@@ -1232,11 +1983,18 @@ export class Overworld implements ScriptWorld {
   onStepComplete(): void {
     this.shell.onFieldStep?.();
     const p = this.player;
+    if (this.tryChapterStep()) return;
     if (this.tryLabExitGate()) return;
     if (this.tryLabRivalEvent()) return;
     if (this.tryPalletOakEvent()) return;
     if (this.tryRoute22RivalEvent()) return;
     if (this.tryCeruleanRivalEvent()) return;
+    if (this.tryPokemonTowerRivalEvent()) return;
+    if (this.map.id === "SILPH_CO_7F" && !this.shell.save.flags.EVENT_BEAT_SILPH_CO_RIVAL &&
+        this.player.cellX === 3 && (this.player.cellY === 2 || this.player.cellY === 3)) {
+      const rival = this.npcs.find(npc => npc.def.name === "SILPHCO7F_RIVAL");
+      if (rival && this.tryChapterInteraction(rival)) return;
+    }
     if (this.tryTrainerSight()) return;
     // The arrival disable is POSITIONAL (issue #265): the cell we warped in
     // on is inert until we step off it; pokered has no one-shot counter —
@@ -1294,6 +2052,7 @@ export class Overworld implements ScriptWorld {
 
   /** All cooked trainers use their imported sight range and defeat flag. */
   private tryTrainerSight(): boolean {
+    if (this.fieldTrainer) return false;
     const dirs: Record<string, Dir> = {
       LEFT: "left", RIGHT: "right", UP: "up", DOWN: "down",
     };
@@ -1425,6 +2184,48 @@ export class Overworld implements ScriptWorld {
     return true;
   }
 
+  /** Pokémon Tower 2F rival ambush (PokemonTower2F.asm). */
+  private tryPokemonTowerRivalEvent(npc?: NPC): boolean {
+    const flags = this.shell.save.flags;
+    if (this.map.id !== "POKEMON_TOWER_2F" || flags.EVENT_BEAT_POKEMON_TOWER_RIVAL) return false;
+    const rival = npc ?? this.npcs.find(n => n.def.name === "POKEMONTOWER2F_RIVAL");
+    if (!rival) return false;
+    const playerX = this.player.cellX;
+    const playerY = this.player.cellY;
+    const adjacent = (playerX === 14 && playerY === 6) || (playerX === 15 && playerY === 5);
+    if (!npc && !adjacent) return false;
+    if (npc && Math.abs(playerX - rival.cellX) + Math.abs(playerY - rival.cellY) > 1) return false;
+    if (rival.def.name !== "POKEMONTOWER2F_RIVAL") return false;
+    const starter = this.rivalStarter();
+    const index = starter === "SQUIRTLE" ? 4 : starter === "BULBASAUR" ? 5 : 6;
+    const party = this.shell.data.trainers?.OPP_RIVAL2?.parties[index - 1];
+    if (!party) return false;
+    rival.frozen = true;
+    rival.facePlayer(this.player);
+    const exit = playerX === 15
+      ? ["down", "down", "right", "right", "right", "right", "down", "down"] as const
+      : ["right", "down", "down", "right", "down", "down", "right", "right"] as const;
+    this.shell.showText(`${this.shell.save.player.rival}: What brings you
+here?`, () => {
+      this.shell.pushTrainerBattle(`RIVAL ${this.shell.save.player.rival}`, "OPP_RIVAL2", party, () => {
+        flags.EVENT_BEAT_POKEMON_TOWER_RIVAL = true;
+        this.shell.showText(`${this.shell.save.player.rival}: How's your
+POKéDEX coming?`, () => {
+          const walk = (i: number) => {
+            if (i >= exit.length) {
+              this.npcs = this.npcs.filter(n => n !== rival);
+              this.entities = [this.player, ...this.npcs];
+              return;
+            }
+            this.scriptMove(rival, exit[i], 1, () => walk(i + 1));
+          };
+          walk(0);
+        });
+      });
+    });
+    return true;
+  }
+
   /** PalletTownOakHeyWaitScript, before warp and encounter processing. */
   private tryPalletOakEvent(): boolean {
     const flags = this.shell.save.flags;
@@ -1510,6 +2311,27 @@ export class Overworld implements ScriptWorld {
 
   // OverworldController.lua:3907 takeWarp
   takeWarp(warpDef: MapWarp): void {
+    const elevator = this.map.id.endsWith("_ELEVATOR");
+    if (warpDef.destMap.endsWith("_ELEVATOR")) {
+      (this.shell.save.elevatorFloors ??= {})[warpDef.destMap] = this.map.id;
+    }
+    if (elevator) {
+      const fallback = this.map.id === "SILPH_CO_ELEVATOR" ? "SILPH_CO_1F" : this.map.id === "ROCKET_HIDEOUT_ELEVATOR" ? "ROCKET_HIDEOUT_B1F" : "CELADON_MART_1F";
+      const floor = this.shell.save.elevatorFloors?.[this.map.id] ?? (this.map.id === "SILPH_CO_ELEVATOR" ? this.shell.save.silphElevatorFloor : undefined) ?? fallback;
+      const index = this.shell.data.maps?.[floor]?.warps.findIndex(warp => warp.destMap === this.map.id) ?? -1;
+      if (index < 0) return;
+      warpDef = { ...warpDef, destMap: floor, destWarp: index + 1 };
+    }
+    if (this.map.id === "GAME_CORNER" && warpDef.destMap === "ROCKET_HIDEOUT_B1F" && !this.shell.save.flags.EVENT_FOUND_ROCKET_HIDEOUT) return;
+    if (this.map.id === "POKEMON_TOWER_6F" && warpDef.destMap === "POKEMON_TOWER_7F" && !this.shell.save.flags.EVENT_BEAT_GHOST_MAROWAK) {
+      this.startTowerGhost(); return;
+    }
+    if (this.map.id === "SAFFRON_CITY" && warpDef.destMap === "SILPH_CO_1F" && !this.shell.save.flags.EVENT_RESCUED_MR_FUJI && !this.shell.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI) {
+      this.shell.showText("TEAM ROCKET is blocking\nthe entrance."); return;
+    }
+    if (this.map.id === "SAFFRON_CITY" && warpDef.destMap === "SAFFRON_GYM" && !this.shell.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI) {
+      this.shell.showText("Free SILPH CO. from\nTEAM ROCKET first!"); return;
+    }
     let last = this.lastOutdoor;
     if (warpDef.destMap === "LAST_MAP" && !last) {
       // old saves / unexpected states: never crash on an exit mat — fall

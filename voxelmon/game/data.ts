@@ -68,6 +68,8 @@ export interface SpeciesDef {
 }
 
 export interface MoveDef {
+  /** Bulbapedia contact classification, used for overworld reach only. */
+  contact?: boolean;
   id: string;
   index: number;
   name: string;
@@ -258,6 +260,8 @@ export interface VoxelmonData {
   partyIcons?: Record<string, number>;
   /** Species -> small animated follower sprite atlas page. */
   followerSprites?: Record<string, number>;
+  /** Shared 16px elemental flight/impact tiles, five cells per family. */
+  projectilePage?: number;
   pokemon: Record<string, SpeciesDef>;
   moves: Record<string, MoveDef>;
   type_chart: TypeChartData;

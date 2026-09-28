@@ -1,3 +1,4 @@
+import { CONTACT_MOVES } from "../../shared/move-contact.ts";
 // Port of gen1recomp RomExtractor.lua animationFlags + extractMoves
 // (lines 522-589).
 
@@ -79,6 +80,7 @@ export function extractMoves(ctx: Ctx): Record<string, unknown> {
     if (flags[i][1]) animation.flash = true;
     out[moveId] = {
       id: moveId,
+      contact: CONTACT_MOVES.has(moveId),
       index,
       name: decodedNames[i],
       source: `ROM:Moves[${index}]`,

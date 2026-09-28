@@ -1,3 +1,5 @@
+import { chapterDoors, type ChapterField } from "../shared/chapter.ts";
+import { chapterStamp } from "./chapter-stamps.ts";
 // Browser-safe in-memory VXPK cooker. Node/Bun input discovery and output
 // writes stay in cli.ts/data-node.ts.
 
@@ -32,6 +34,7 @@ import {
   type UvTransform,
 } from "./mesh.ts";
 import { writePak, type PakInput } from "./pak.ts";
+import { buildProjectileAtlas } from "./projectiles.ts";
 import {
   planColour,
   Redpp,
@@ -156,6 +159,11 @@ export const DEFAULT_MAPS: readonly string[] = [
   "CELADON_CHIEF_HOUSE",
   "CELADON_DINER",
   "CELADON_HOTEL",
+  // Celadon west exit, Cycling Road, and the Snorlax block.
+  "ROUTE_16",
+  "ROUTE_16_GATE_1F",
+  "ROUTE_16_GATE_2F",
+  "ROUTE_16_FLY_HOUSE",
   "CELADON_MANSION_1F",
   "CELADON_MANSION_2F",
   "CELADON_MANSION_3F",
@@ -184,11 +192,21 @@ export const DEFAULT_MAPS: readonly string[] = [
   "POKEMON_TOWER_5F",
   "POKEMON_TOWER_6F",
   "POKEMON_TOWER_7F",
-  "MR_FUJIS_HOUSE",
+  // Lavender's south exit and the fishing route immediately beyond it.
+  // Keep the two gate floors and the Super Rod house with the route so every
+  // doorway resolves in the streamed package instead of sealing the player
+  // at Lavender's southern edge.
+  "ROUTE_12",
+  "ROUTE_12_GATE_1F",
+  "ROUTE_12_GATE_2F",
+  "ROUTE_12_SUPER_ROD_HOUSE",
   "SAFFRON_CITY",
   "SAFFRON_POKECENTER",
   "SAFFRON_MART",
   "SAFFRON_PIDGEY_HOUSE",
+  "COPYCATS_HOUSE_1F",
+  "COPYCATS_HOUSE_2F",
+  "MR_PSYCHICS_HOUSE",
   "FIGHTING_DOJO",
   "SAFFRON_GYM",
   "SILPH_CO_1F",
@@ -202,6 +220,7 @@ export const DEFAULT_MAPS: readonly string[] = [
   "SILPH_CO_9F",
   "SILPH_CO_10F",
   "SILPH_CO_11F",
+  "SILPH_CO_ELEVATOR",
 
 ];
 
@@ -253,7 +272,7 @@ export function cookVoxelPak(
   onProgress?: CookProgressHook,
 ): CookArtifacts {
   const { gen, profile } = input;
-  const mapNames = input.mapNames ?? DEFAULT_MAPS;
+  const mapNames = [...new Set(input.mapNames ?? DEFAULT_MAPS)];
   const options = input.options ?? {};
   const redpp = input.redpp ? new Redpp(input.redpp) : null;
 
@@ -262,7 +281,9 @@ export function cookVoxelPak(
     if (!def) throw new Error(`unknown map: ${name}`);
     const tileset = gen.tilesets[def.tileset];
     if (!tileset) throw new Error(`unknown tileset: ${def.tileset} (map ${name})`);
-    return new GameMap(def, tileset);
+    const blocks = [...def.blocks];
+    for (const door of chapterDoors(gen.field as ChapterField, name)) blocks[door.by * def.width + door.bx] = door.open;
+    return new GameMap({ ...def, blocks }, tileset);
   });
   const cookedMaps = new Set(mapNames);
 
@@ -435,6 +456,7 @@ export function cookVoxelPak(
       pageH: mapTerrain.page.h,
     };
     const packed = packMap(geometry, uvt);
+    for (const door of chapterDoors(gen.field as ChapterField, map.id)) packed.stamps.push(chapterStamp(map, door, uvt));
     const verts = packed.chunks.reduce(
       (n, chunk) => n + chunk.meshes.reduce((m, mesh) => m + mesh.verts.length, 0),
       0,
@@ -583,11 +605,19 @@ export function cookVoxelPak(
     while (colour.pagePal.length < pages.length) colour.pagePal.push(COLOR_PAL_NONE);
   }
 
+  const projectilePage = pages.length;
+  const projectiles = buildProjectileAtlas();
+  const projectilePalette = palettes.length;
+  pages.push(projectiles.page);
+  palettes.push(projectiles.palette);
+  if (colour) colour.pagePal.push(projectilePalette);
+
   // --- GAME + CMAP + pack ------------------------------------------------
   const atlas: AtlasIndex = {
     sprites: spriteIndex,
     partyIcons,
     followerSprites,
+    projectilePage,
     picFront: frontIndex,
     picBack: backIndex,
     emotePage,
@@ -623,7 +653,7 @@ export function cookVoxelPak(
         worldPal: colour?.maps.find((entry) => entry.mapId === map.def.index)?.worldPal ?? COLOR_PAL_NONE,
         terrainPage: mapTerrainPages.get(map.def.index)!,
       })),
-      pagePal: colour?.pagePal ?? pages.map(() => COLOR_PAL_NONE),
+      pagePal: colour?.pagePal ?? pages.map((_, i) => i === projectilePage ? projectilePalette : COLOR_PAL_NONE),
       flags: colour?.flags ?? 0,
     },
   });

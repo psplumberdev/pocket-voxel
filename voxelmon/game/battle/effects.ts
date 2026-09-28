@@ -234,6 +234,8 @@ function drainHalf(ctx: EffectCtx): void {
 export const EFFECTS: Record<string, EffectRecord> = {
   // MoveEffects.lua:480
   NO_ADDITIONAL_EFFECT: { kind: "full" },
+  FLY_EFFECT: { kind: "full" },
+  CHARGE_EFFECT: { kind: "full" },
 
   // MoveEffects.lua:175-179 via statDown; ACC_CHECKED (MoveEffects.lua:403-409)
   ATTACK_DOWN1_EFFECT: { kind: "primary", accuracyChecked: true, run: statDown("attack", 1) },

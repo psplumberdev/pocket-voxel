@@ -786,8 +786,13 @@ pub fn build(scene: &Scene, pak: &Pak) -> DrawList {
     let card_w = CELL_PX as f32;
     for ent in scene.ents.iter().filter(|e| e.shown && !scene.battle.active) {
         items.push(Item::ShadowDecal {
-            corners: shadow_quad(ent_feet(ent), card_w),
-            abgr: alpha_abgr(SHADOW_ALPHA_FIELD),
+            corners: if ent.flags & ent_flag::MELEE != 0 {
+                let c = ent_feet(ent);
+                let h = CELL_PX as f32 / 2.0;
+                let y = c.y + SHADOW_LIFT_PX;
+                [[c.x-h,y,c.z-h], [c.x+h,y,c.z-h], [c.x+h,y,c.z+h], [c.x-h,y,c.z+h]]
+            } else { shadow_quad(ent_feet(ent), card_w) },
+            abgr: alpha_abgr(if ent.flags & ent_flag::MELEE != 0 { 0.78 } else { SHADOW_ALPHA_FIELD }),
         });
     }
     let (ox0, oy0) = slot0_offset(scene);
@@ -810,7 +815,15 @@ pub fn build(scene: &Scene, pak: &Pak) -> DrawList {
     }
 
     // 5. Player ghost (inverted depth), then 6. entity + battle cards.
-    let sheet_uv = |page: &crate::pak::AtlasPage, frame: i32| -> [f32; 4] {
+    let sheet_uv = |page: &crate::pak::AtlasPage, frame: i32, tiled: bool| -> [f32; 4] {
+        if tiled {
+            let cols = (page.w as i32 / CELL_PX).max(1);
+            let rows = (page.h as i32 / CELL_PX).max(1);
+            let cell = frame.rem_euclid(cols * rows);
+            let x = (cell % cols) as f32 / cols as f32;
+            let y = (cell / cols) as f32 / rows as f32;
+            return [x, y, x + 1.0 / cols as f32, y + 1.0 / rows as f32];
+        }
         // Walk sheets stack 16x16 frames vertically at x in [0, CELL_PX);
         // pages are padded wider than the content (the GE missamples
         // 16-px-wide pages), so U normalizes by the page width.
@@ -827,21 +840,21 @@ pub fn build(scene: &Scene, pak: &Pak) -> DrawList {
             items.push(Item::Ghost {
                 verts: card_verts(ent_feet(ent), card_w, card_w, a),
                 page: ent.sheet as u16,
-                uv: sheet_uv(page, ent.frame),
+                uv: sheet_uv(page, ent.frame, ent.flags & ent_flag::TILED != 0),
                 mirror: ent.flags & ent_flag::MIRROR != 0,
                 pull: pull_card,
                 abgr: GHOST_ABGR,
             });
         }
     }
-    for ent in scene.ents.iter().filter(|e| e.shown && !scene.battle.active) {
+    for ent in scene.ents.iter().filter(|e| e.shown && !scene.battle.active && e.flags & ent_flag::MELEE == 0) {
         let Some(page) = page_at(pak, ent.sheet) else {
             continue;
         };
         items.push(Item::Card {
             verts: card_verts(ent_feet(ent), card_w, card_w, a),
             page: ent.sheet as u16,
-            uv: sheet_uv(page, ent.frame),
+            uv: sheet_uv(page, ent.frame, ent.flags & ent_flag::TILED != 0),
             mirror: ent.flags & ent_flag::MIRROR != 0,
             pull: pull_card,
         });
@@ -852,7 +865,7 @@ pub fn build(scene: &Scene, pak: &Pak) -> DrawList {
                 items.push(Item::Card {
                     verts: card_verts(feet, card_w, card_w, a),
                     page: epage as u16,
-                    uv: sheet_uv(page, ent.emote as i32 - 1),
+                    uv: sheet_uv(page, ent.emote as i32 - 1, false),
                     mirror: false,
                     pull: pull_card,
                 });
@@ -968,6 +981,29 @@ mod tests {
         s.op(op::MAP_SHOW, &[0, 7, 0, 0], None);
         s.op(op::CAM, &[64 * Q4, 64 * Q4], None);
         s
+    }
+
+    #[test]
+    fn melee_flash_is_a_dark_cell_without_a_texture_or_sprite() {
+        let blob = pak::AlignedBlob::from_bytes(&pak::tests::tiny_pak_bytes());
+        let pak = pak::read(blob.bytes()).unwrap();
+        let mut scene = shown_scene();
+        scene.ents[0].shown = true;
+        scene.ents[0].sheet = -1;
+        scene.ents[0].flags = ent_flag::MELEE;
+        scene.ents[0].x = 24 * spec::Q4;
+        scene.ents[0].y = 40 * spec::Q4;
+        let (list, working) = build_with_working_set(&scene, &pak);
+        let corners = list.items.iter().find_map(|item| match item {
+            Item::ShadowDecal { corners, abgr } if *abgr == alpha_abgr(0.78) => Some(corners),
+            _ => None,
+        }).expect("melee ground mark");
+        assert_eq!(corners[0][0], 16.0);
+        assert_eq!(corners[1][0], 32.0);
+        assert_eq!(corners[0][2], 32.0);
+        assert_eq!(corners[2][2], 48.0);
+        assert!(!list.items.iter().any(|item| matches!(item, Item::Card { .. })));
+        assert!(!working.atlas_pages.contains(&u16::MAX));
     }
 
     #[test]
@@ -1090,6 +1126,25 @@ mod tests {
         // Deterministic: the same scene builds the same list.
         let again = build(&s, &pak);
         assert_eq!(list.items, again.items);
+    }
+
+    #[test]
+    fn elemental_projectiles_address_all_75_tiles_on_one_page() {
+        let blob = pak::AlignedBlob::from_bytes(&pak::tests::tiny_pak_bytes());
+        let mut pak = pak::read(blob.bytes()).unwrap();
+        pak.atlases[1].w = 128;
+        pak.atlases[1].h = 256;
+        let mut scene = shown_scene();
+        for tile in 0..75 {
+            scene.op(op::ENT, &[0, 1, tile, 64 * Q4, 64 * Q4, 6, ent_flag::TILED as i32], None);
+            let list = build(&scene, &pak);
+            let uv = list.items.iter().find_map(|item| match item {
+                Item::Card { page: 1, uv, .. } => Some(*uv), _ => None,
+            }).unwrap();
+            let x = (tile % 8) as f32 / 8.0;
+            let y = (tile / 8) as f32 / 16.0;
+            assert_eq!(uv, [x, y, x + 0.125, y + 0.0625]);
+        }
     }
 
     #[test]

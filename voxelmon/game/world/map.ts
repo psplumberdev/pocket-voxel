@@ -186,6 +186,13 @@ export class GameMap {
     return this.blockOverrides.get(by * this.def.width + bx) ?? this.def.blocks[by * this.def.width + bx];
   }
 
+  setChapterBlock(bx: number, by: number, block: number, open: boolean): void {
+    this.blockOverrides.set(by * this.def.width + bx, block);
+    const key = `${bx * 2},${by * 2}`;
+    if (open) this.removedStamps.add(key);
+    else this.removedStamps.delete(key);
+  }
+
   cutBlock(bx: number, by: number, after: number): void {
     this.blockOverrides.set(by * this.def.width + bx, after);
     for (let y = by * 2; y < by * 2 + 2; y++) {

@@ -9,6 +9,7 @@
 // that centre in Q4.
 
 import { ENT_FLAG, ENTS_MAX, Q4, Q8 } from "../../contracts/spec/voxel-spec.ts";
+import { projectileFrame } from "../shared/projectiles.ts";
 import type { WildBattle } from "./battle/battle.ts";
 import { desiredCards, type BattleStaging } from "./battle/staging.ts";
 import type { BattleUi } from "./battle/ui.ts";
@@ -275,6 +276,11 @@ export class Scene {
       this.cutStamps.clear();
       this.cutMap = map;
     }
+    for (const key of this.cutStamps) if (!map.removedStamps.has(key)) {
+      const [x, y] = key.split(",").map(Number);
+      this.host.stamp(map.def.index, x, y, 1);
+      this.cutStamps.delete(key);
+    }
     for (const key of map.removedStamps) if (!this.cutStamps.has(key)) {
       const [x, y] = key.split(",").map(Number);
       this.host.stamp(map.def.index, x, y, 0);
@@ -397,10 +403,18 @@ export class Scene {
         ((p.facing === "down" || p.facing === "up") && phase === 1 && p.animFlip());
       let flags = ENT_FLAG.ghost | ENT_FLAG.walker;
       if (mirror) flags |= ENT_FLAG.mirror;
+      const pilot = ow.pokemonPilot;
+      const pilotMon = pilot && ow.save.party?.[pilot.monIndex];
+      const pilotPage = typeof pilotMon?.species === "string"
+        ? view.data.followerSprites?.[pilotMon.species]
+        : undefined;
+      const pilotIcon = typeof pilotMon?.species === "string" ? view.data.pokemon[pilotMon.species]?.partyIcon : undefined;
+      const iconPage = pilotIcon ? view.data.partyIcons?.[pilotIcon] : undefined;
+      const pilotFrame = (p.facing === "down" ? 0 : p.facing === "up" ? 1 : 2) + (phase === 1 ? 3 : 0);
       this.emitSlot(
         0,
-        this.sheetIndex(view, "SPRITE_RED"),
-        frame,
+        pilotPage ?? iconPage ?? this.sheetIndex(view, "SPRITE_RED"),
+        pilotPage !== undefined ? pilotFrame : iconPage !== undefined ? phase : frame,
         p.px * Q4,
         p.py * Q4,
         ow.map.groundAt(p.cellX, p.cellY) + p.hopLift(),
@@ -442,10 +456,15 @@ export class Scene {
     }
     const follower = ow.follower;
     const followerSlot = npcs.length + 1;
-    const followerPage = follower && view.data.followerSprites?.[follower.species];
+    const followerPage = ow.pokemonPilot
+      ? this.sheetIndex(view, "SPRITE_RED")
+      : follower && view.data.followerSprites?.[follower.species];
     if (follower?.active && followerPage !== undefined && followerSlot < ENTS_MAX) {
       const x = Math.floor(follower.px / 16), y = Math.floor(follower.py / 16);
-      if (ow.map.inBounds(x, y)) this.emitSlot(followerSlot, followerPage, follower.frame,
+      const followerFrame = ow.pokemonPilot
+        ? (follower.frame >= 3 ? WALK[follower.facing] : STAND[follower.facing])
+        : follower.frame;
+      if (ow.map.inBounds(x, y)) this.emitSlot(followerSlot, followerPage, followerFrame,
         Math.round(follower.px * Q4), Math.round(follower.py * Q4),
         ow.map.groundAt(x, y), ENT_FLAG.walker | (follower.facing === "right" ? ENT_FLAG.mirror : 0));
     }
@@ -456,11 +475,44 @@ export class Scene {
       const slot = npcs.length + 1 + (view.data.followerSprites ? 1 : 0) + i;
       if (slot >= ENTS_MAX) break;
       if (!wild.active || !ow.map.inBounds(wild.cellX, wild.cellY)) continue;
-      const page = view.data.partyIcons?.[wild.icon];
+      const walkerPage = ow.pokemonPilot ? view.data.followerSprites?.[wild.species] : undefined;
+      const page = walkerPage ?? view.data.partyIcons?.[wild.icon];
       if (page === undefined) continue;
       const bob = wild.icon === "BALL" || wild.icon === "HELIX" ? wild.frame : 0;
-      this.emitSlot(slot, page, wild.frame, wild.px * Q4, wild.py * Q4,
-        ow.map.groundAt(wild.cellX, wild.cellY) + bob, ENT_FLAG.walker);
+      const frame = walkerPage === undefined ? wild.frame
+        : (wild.facing === "down" ? 0 : wild.facing === "up" ? 1 : 2) + (wild.moving && wild.frame ? 3 : 0);
+      this.emitSlot(slot, page, frame, wild.px * Q4, wild.py * Q4,
+        ow.map.groundAt(wild.cellX, wild.cellY) + (walkerPage === undefined ? bob : 0),
+        ENT_FLAG.walker | (walkerPage !== undefined && wild.facing === "right" ? ENT_FLAG.mirror : 0));
+    }
+    // Reuse any free entity slots so crowded maps do not hide attack cues.
+    const effectSlot = (): number => this.entSeen.findIndex(seen => seen === 0);
+    const elementalPage = view.data.projectilePage;
+    const projectilePage = elementalPage ?? view.data.partyIcons?.BALL;
+    for (const projectile of ow.pokemonProjectiles ?? []) {
+      const slot = effectSlot();
+      if (projectilePage === undefined || slot < 0) break;
+      const travel = projectile.ticks / projectile.stepTicks;
+      const frame = elementalPage === undefined ? Math.floor(projectile.frame / 8) % 2
+        : projectileFrame(projectile.move.id, view.data.moves[projectile.move.id]?.type, projectile.frame);
+      this.emitSlot(slot, projectilePage, frame,
+        Math.floor((projectile.x + projectile.dx * travel) * 16 * Q4),
+        Math.floor((projectile.y + projectile.dy * travel) * 16 * Q4),
+        ow.map.groundAt(projectile.x, projectile.y) + 6, ENT_FLAG.walker |
+          (elementalPage === undefined ? 0 : ENT_FLAG.tiled | (projectile.dx < 0 ? ENT_FLAG.mirror : 0)));
+    }
+    if (elementalPage !== undefined) for (const impact of ow.pokemonImpacts) {
+      const slot = effectSlot();
+      if (slot < 0) break;
+      this.emitSlot(slot, elementalPage, projectileFrame(impact.moveId, view.data.moves[impact.moveId]?.type, 0, true),
+        impact.x * 16 * Q4, impact.y * 16 * Q4, ow.map.groundAt(impact.x, impact.y) + 6,
+        ENT_FLAG.walker | ENT_FLAG.tiled);
+    }
+    for (const flash of ow.pokemonMeleeFlashes ?? []) {
+      const slot = effectSlot();
+      if (slot < 0) break;
+      this.emitSlot(slot, -1, 0, (flash.x * 16 + 8) * Q4, (flash.y * 16 + 8) * Q4,
+        ow.map.groundAt(flash.x, flash.y), ENT_FLAG.melee);
     }
     for (let slot = 0; slot < ENTS_MAX; slot++) {
       if (this.entSeen[slot] === 0 && this.entShown[slot] !== 0) {

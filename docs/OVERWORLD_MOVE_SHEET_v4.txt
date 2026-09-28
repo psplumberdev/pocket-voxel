@@ -1,0 +1,236 @@
+POKEMON RED / BLUE - OVERWORLD BATTLE MOVE IMPLEMENTATION SHEET
+=================================================================
+
+PURPOSE
+-------
+This is a CODING DESIGN SHEET for the optional real-time "Overworld Battles" mode.
+The 165 move names are the Generation I move roster. MELEE/RANGED/SELF classification
+below is OUR action-game implementation choice, not a canonical Pokemon category.
+
+
+LATEST OVERWORLD SIMPLIFICATION RULES
+-------------------------------------
+- Normal move cooldown: 3 seconds.
+- Multi-hit moves: 1 second cooldown; intentionally button-mash friendly.
+- Flinch: immobilize target for 2 seconds.
+- Trap moves (Bind, Wrap, Fire Spin, Clamp): immobilize target for 10 seconds on hit.
+- Whirlwind and Roar: push target back 2 tiles.
+- Two-turn/charge moves: one charge-up period, then attack; no turn system.
+- Quick Attack / priority-style moves: fast dash/lunge.
+- Teleport: temporary ranged damage move with 15-tile range.
+- Bide, Counter, Mirror Move, Substitute: use Tackle behavior for now and leave TODO notes.
+- Rage: Tackle-style melee plus temporary +5 stacking rule, maximum 5 stacks.
+- Thrash and Petal Dance: use ordinary attack behavior for now; retain TODO notes for special repeat/lock behavior.
+- Self-only buffs/status effects last 10 seconds; reapplying refreshes the timer.
+- Stat stages use -6 to +6.
+
+MELEE HIT AREA
+--------------
+Melee hits the 5 adjacent front-facing squares wrapped around the Pokemon:
+front-left, front, front-right, left-side, right-side. Rear 3 adjacent squares are excluded.
+
+CORE DELIVERY RULES
+-------------------
+MELEE:
+- Hits the five adjacent front-facing tiles wrapped around the Pokemon:
+  forward-left, forward, forward-right, left-side, right-side.
+- One tile deep only.
+- Rear three adjacent tiles are excluded.
+
+RANGED:
+- Fires/places a simple effect in the facing direction.
+- Prototype visual may remain a single shaded square.
+- Normal projectile speed = roughly bicycle movement speed.
+- Status/debuff moves that target an opponent are RANGED unless explicitly noted AREA.
+
+SELF:
+- Applies directly to the user; no projectile required.
+
+AREA:
+- Ranged/AoE behavior centered on user or target as noted.
+
+GENERAL ACTION-MODE RULES
+-------------------------
+- Normal attack cooldown: 3.0 seconds unless a future move-specific rule overrides it.
+- Stat stages are clamped from -6 to +6.
+- SELF stat buffs/status buffs last 10 seconds.
+- Reapplying a SELF buff refreshes its 10-second timer and applies the move's stage change,
+  up to the +6 cap.
+- Damage/stat math should reuse the existing battle backend wherever possible.
+- Poison/Burn/Sleep/Paralysis/Confusion/Freeze/Trap/DOT are TARGET status systems and should
+  be implemented as action-mode status effects rather than discarded.
+- Multi-hit attacks should use the existing hit-count/damage behavior; do not turn each hit
+  into a separate 3-second cooldown.
+- Special two-turn moves can be stubbed initially but are explicitly marked for later behavior.
+
+COLUMNS
+-------
+ID | MOVE | DELIVERY | TARGET | PRIMARY | SECONDARY / STAGE | ACTION-MODE NOTES
+
+MOVE TABLE
+----------
+001 | Pound | MELEE | ENEMY | Damage | None |
+002 | Karate Chop | MELEE | ENEMY | Damage | High crit |
+003 | Double Slap | MELEE | ENEMY | Damage | Multi-hit 2-5 | | 1s cooldown; button-mash style
+004 | Comet Punch | MELEE | ENEMY | Damage | Multi-hit 2-5 | | 1s cooldown; button-mash style
+005 | Mega Punch | MELEE | ENEMY | Damage | None |
+006 | Pay Day | RANGED | ENEMY | Damage | Money reward | Projectile coin
+007 | Fire Punch | MELEE | ENEMY | Damage | Chance Burn |
+008 | Ice Punch | MELEE | ENEMY | Damage | Chance Freeze | Freeze follows Sleep rules.
+009 | Thunder Punch | MELEE | ENEMY | Damage | Chance Paralysis |
+010 | Scratch | MELEE | ENEMY | Damage | None |
+011 | Vise Grip | MELEE | ENEMY | Damage | None |
+012 | Guillotine | MELEE | ENEMY | OHKO | None | Use normal hit check; dangerous boss move
+013 | Razor Wind | RANGED | ENEMY | Damage | Charge move / high crit | Wind-up then projectile | Overworld: charge-up then attack
+014 | Swords Dance | SELF | SELF | Buff | Attack +2 stages | 10s; reapply refreshes timer
+015 | Cut | MELEE | ENEMY | Damage | None |
+016 | Gust | RANGED | ENEMY | Damage | None | Wind projectile
+017 | Wing Attack | MELEE | ENEMY | Damage | None |
+018 | Whirlwind | RANGED | ENEMY | Control | Force switch / wild flee | Strong pushback + disengage candidate
+019 | Fly | MELEE | ENEMY | Damage | Two-step / airborne | Later special behavior | Overworld: charge-up then attack
+020 | Bind | MELEE | ENEMY | Damage | Trap: immobilize 10s |
+021 | Slam | MELEE | ENEMY | Damage | None |
+022 | Vine Whip | RANGED | ENEMY | Damage | None | Short-range whip/projectile
+023 | Stomp | MELEE | ENEMY | Damage | Chance Flinch | | Flinch = immobilize 2s
+024 | Double Kick | MELEE | ENEMY | Damage | Hits twice | | 1s cooldown; button-mash style
+025 | Mega Kick | MELEE | ENEMY | Damage | None |
+026 | Jump Kick | MELEE | ENEMY | Damage | Miss recoil |
+027 | Rolling Kick | MELEE | ENEMY | Damage | Chance Flinch | | Flinch = immobilize 2s
+028 | Sand Attack | RANGED | ENEMY | Damage | 30 Ground damage | Accuracy removed in overworld mode
+029 | Headbutt | MELEE | ENEMY | Damage | Chance Flinch | | Flinch = immobilize 2s
+030 | Horn Attack | MELEE | ENEMY | Damage | None |
+031 | Fury Attack | MELEE | ENEMY | Damage | Multi-hit 2-5 | | 1s cooldown; button-mash style
+032 | Horn Drill | MELEE | ENEMY | OHKO | None |
+033 | Tackle | MELEE | ENEMY | Damage | None |
+034 | Body Slam | MELEE | ENEMY | Damage | Chance Paralysis |
+035 | Wrap | MELEE | ENEMY | Damage | Trap: immobilize 10s |
+036 | Take Down | MELEE | ENEMY | Damage | Recoil |
+037 | Thrash | MELEE | ENEMY | Damage | Locks user / later Confusion | Later special behavior
+038 | Double-Edge | MELEE | ENEMY | Damage | Recoil |
+039 | Tail Whip | RANGED | ENEMY | Debuff | Defense -1 stage | Status projectile
+040 | Poison Sting | RANGED | ENEMY | Damage | Chance Poison | Needle projectile
+041 | Twineedle | RANGED | ENEMY | Damage | Hits twice; chance Poison | Two needle projectiles | 1s cooldown; button-mash style
+042 | Pin Missile | RANGED | ENEMY | Damage | Multi-hit 2-5 | | 1s cooldown; button-mash style
+043 | Leer | RANGED | ENEMY | Debuff | Defense -1 stage | Status projectile
+044 | Bite | MELEE | ENEMY | Damage | Chance Flinch | | Flinch = immobilize 2s
+045 | Growl | RANGED | ENEMY | Debuff | Attack -1 stage | Status projectile
+046 | Roar | RANGED | ENEMY | Control | Force switch / wild flee | Pushback + disengage candidate
+047 | Sing | RANGED | ENEMY | Status | Sleep |
+048 | Supersonic | RANGED | ENEMY | Status | Confusion |
+049 | Sonic Boom | RANGED | ENEMY | Fixed Damage | 20 HP |
+050 | Disable | RANGED | ENEMY | Status | Disable recent move |
+051 | Acid | RANGED | ENEMY | Damage | Chance Defense -1 stage | Gen I intent
+052 | Ember | RANGED | ENEMY | Damage | Chance Burn |
+053 | Flamethrower | RANGED | ENEMY | Damage | Chance Burn |
+054 | Mist | SELF | SELF | Buff | Prevents stat reductions | 10s; reapply refreshes
+055 | Water Gun | RANGED | ENEMY | Damage | None |
+056 | Hydro Pump | RANGED | ENEMY | Damage | None |
+057 | Surf | RANGED | AREA | Damage | Area hit | Broad wave later; simple ranged first
+058 | Ice Beam | RANGED | ENEMY | Damage | Chance Freeze | Freeze follows Sleep rules.
+059 | Blizzard | RANGED | AREA | Damage | Chance Freeze | FORWARD AREA; 4-tile strip/cone Freeze follows Sleep rules.
+060 | Psybeam | RANGED | ENEMY | Damage | Chance Confusion |
+061 | Bubble Beam | RANGED | ENEMY | Damage | Chance Speed -1 stage |
+062 | Aurora Beam | RANGED | ENEMY | Damage | Chance Attack -1 stage |
+063 | Hyper Beam | RANGED | ENEMY | Damage | Recharge | Extra recharge later
+064 | Peck | MELEE | ENEMY | Damage | None |
+065 | Drill Peck | MELEE | ENEMY | Damage | None |
+066 | Submission | MELEE | ENEMY | Damage | Recoil |
+067 | Low Kick | MELEE | ENEMY | Damage | None | Reuse existing backend
+068 | Counter | MELEE | ENEMY | Tackle fallback | TODO true Counter | Prototype = Tackle
+069 | Seismic Toss | MELEE | ENEMY | Fixed Damage | Damage = user level |
+070 | Strength | MELEE | ENEMY | Damage | None |
+071 | Absorb | RANGED | ENEMY | Damage + Drain | Heal from damage |
+072 | Mega Drain | RANGED | ENEMY | Damage + Drain | Heal from damage |
+073 | Leech Seed | RANGED | ENEMY | Status DOT | Drain target and heal user | Persistent target effect
+074 | Growth | SELF | SELF | Buff | Special +1 stage | Gen I; 10s; refresh
+075 | Razor Leaf | RANGED | ENEMY | Damage | High crit |
+076 | Solar Beam | RANGED | ENEMY | Damage | Charge move | Wind-up then projectile | Overworld: charge-up then attack
+077 | Poison Powder | RANGED | ENEMY | Status | Poison |
+078 | Stun Spore | RANGED | ENEMY | Status | Paralysis |
+079 | Sleep Powder | RANGED | ENEMY | Status | Sleep |
+080 | Petal Dance | RANGED | ENEMY | Damage | Locks user / later Confusion |
+081 | String Shot | RANGED | ENEMY | Debuff | Speed -1 stage | Gen I stage amount; visible projectile
+082 | Dragon Rage | RANGED | ENEMY | Fixed Damage | 40 HP |
+083 | Fire Spin | RANGED | ENEMY | Damage | Trap: immobilize 10s |
+084 | Thunder Shock | RANGED | ENEMY | Damage | Chance Paralysis |
+085 | Thunderbolt | RANGED | ENEMY | Damage | Chance Paralysis |
+086 | Thunder Wave | RANGED | ENEMY | Status | Paralysis |
+087 | Thunder | RANGED | ENEMY | Damage | Chance Paralysis |
+088 | Rock Throw | RANGED | ENEMY | Damage | None |
+089 | Earthquake | RANGED | AREA | Damage | Area hit | FORWARD AREA; 4-tile strip/cone
+090 | Fissure | RANGED | AREA | OHKO | Ground effect |
+091 | Dig | MELEE | ENEMY | Damage | Two-step / underground | Later special movement behavior | Overworld: charge-up then attack
+092 | Toxic | RANGED | ENEMY | Status DOT | Bad Poison |
+093 | Confusion | RANGED | ENEMY | Damage | Chance Confusion |
+094 | Psychic | RANGED | ENEMY | Damage | Chance Special -1 stage | Gen I Special stat
+095 | Hypnosis | RANGED | ENEMY | Status | Sleep |
+096 | Meditate | SELF | SELF | Buff | Attack +1 stage | 10s; refresh
+097 | Agility | SELF | SELF | Buff | Speed +2 stages | 10s; refresh
+098 | Quick Attack | MELEE | ENEMY | Damage | Fast dash/lunge | Add brief dash later
+099 | Rage | MELEE | ENEMY | Tackle-style damage + buff | +5 per trigger, max 5 stacks | Temporary simplified Rage rule
+100 | Teleport | SELF | SELF | Mobility | Teleport/flee | Later: random valid tile within radius
+101 | Night Shade | RANGED | ENEMY | Fixed Damage | Damage = user level |
+102 | Mimic | RANGED | ENEMY | Copy | Copies target's recent move | Utility
+103 | Screech | RANGED | ENEMY | Debuff | Defense -2 stages |
+104 | Double Team | SELF | SELF | Buff | Evasion +1 stage | 10s; refresh
+105 | Recover | SELF | SELF | Heal | Restore 50% max HP |
+106 | Harden | SELF | SELF | Buff | Defense +1 stage | 10s; refresh
+107 | Minimize | SELF | SELF | Buff | Evasion +1 stage | Gen I +1; 10s; refresh
+108 | Smokescreen | RANGED | ENEMY | Debuff | Accuracy -1 stage |
+109 | Confuse Ray | RANGED | ENEMY | Status | Confusion |
+110 | Withdraw | SELF | SELF | Buff | Defense +1 stage | 10s; refresh
+111 | Defense Curl | SELF | SELF | Buff | Defense +1 stage | 10s; refresh
+112 | Barrier | SELF | SELF | Buff | Defense +2 stages | 10s; refresh
+113 | Light Screen | SELF | SELF | Buff | Reduce special damage | 10s action-mode duration
+114 | Haze | RANGED | AREA | Reset | Clear stat stages | SELF AREA; 3-tile radius AoE utility
+115 | Reflect | SELF | SELF | Buff | Reduce physical damage | 10s action-mode duration
+116 | Focus Energy | SELF | SELF | Buff | Critical-hit boost | 10s; refresh
+117 | Bide | MELEE | ENEMY | Tackle fallback | TODO stored-damage behavior | Prototype = Tackle
+118 | Metronome | SELF | SELF | Random Move | Invoke random move |
+119 | Mirror Move | MELEE | ENEMY | Tackle fallback | TODO copy recent move | Prototype = Tackle
+120 | Self-Destruct | RANGED | AREA | Damage | User faints | SELF AREA; 3-tile radius
+121 | Egg Bomb | RANGED | ENEMY | Damage | None |
+122 | Lick | MELEE | ENEMY | Damage | Chance Paralysis |
+123 | Smog | RANGED | ENEMY | Damage | Chance Poison |
+124 | Sludge | RANGED | ENEMY | Damage | Chance Poison |
+125 | Bone Club | MELEE | ENEMY | Damage | Chance Flinch | | Flinch = immobilize 2s
+126 | Fire Blast | RANGED | ENEMY | Damage | Chance Burn |
+127 | Waterfall | MELEE | ENEMY | Damage | None in Gen I |
+128 | Clamp | MELEE | ENEMY | Damage | Trap: immobilize 10s |
+129 | Swift | RANGED | ENEMY | Damage | Cannot miss |
+130 | Skull Bash | MELEE | ENEMY | Damage + Buff | Charge; Defense +1 before hit | Self buff 10s | Overworld: charge-up then attack
+131 | Spike Cannon | RANGED | ENEMY | Damage | Multi-hit 2-5 | | 1s cooldown; button-mash style
+132 | Constrict | MELEE | ENEMY | Damage | Chance Speed -1 stage |
+133 | Amnesia | SELF | SELF | Buff | Special +2 stages | Gen I Special; 10s; refresh
+134 | Kinesis | RANGED | ENEMY | Debuff | Accuracy -1 stage |
+135 | Soft-Boiled | SELF | SELF | Heal | Restore 50% max HP |
+136 | High Jump Kick | MELEE | ENEMY | Damage | Miss recoil |
+137 | Glare | RANGED | ENEMY | Status | Paralysis |
+138 | Dream Eater | RANGED | ENEMY | Damage + Drain | Only vs sleeping target; heal from damage |
+139 | Poison Gas | RANGED | ENEMY | Status | Poison |
+140 | Barrage | RANGED | ENEMY | Damage | Multi-hit 2-5 | Projectile barrage | 1s cooldown; button-mash style
+141 | Leech Life | MELEE | ENEMY | Damage + Drain | Heal from damage |
+142 | Lovely Kiss | RANGED | ENEMY | Status | Sleep |
+143 | Sky Attack | MELEE | ENEMY | Damage | Charge; high crit; chance Flinch | Later special | Flinch = immobilize 2s | Overworld: charge-up then attack
+144 | Transform | RANGED | ENEMY | Transform | Copy target form/moves | Utility; later
+145 | Bubble | RANGED | ENEMY | Damage | Chance Speed -1 stage |
+146 | Dizzy Punch | MELEE | ENEMY | Damage | Chance Confusion |
+147 | Spore | RANGED | ENEMY | Status | Sleep |
+148 | Flash | RANGED | ENEMY | Damage | 30 Electric damage | Accuracy removed in overworld mode
+149 | Psywave | RANGED | ENEMY | Variable Damage | Based on user level | Reuse backend
+150 | Splash | SELF | SELF | No effect | None |
+151 | Acid Armor | SELF | SELF | Buff | Defense +2 stages | 10s; refresh
+152 | Crabhammer | MELEE | ENEMY | Damage | High crit |
+153 | Explosion | RANGED | AREA | Damage | User faints | SELF AREA; 3-tile radius
+154 | Fury Swipes | MELEE | ENEMY | Damage | Multi-hit 2-5 | | 1s cooldown; button-mash style
+155 | Bonemerang | RANGED | ENEMY | Damage | Hits twice | Out-and-back projectile later | 1s cooldown; button-mash style
+156 | Rest | SELF | SELF | Heal + Status | Full heal; Sleep self | Self-status max 10s in action mode
+157 | Rock Slide | RANGED | AREA | Damage | None in Gen I | Broad rock attack
+158 | Hyper Fang | MELEE | ENEMY | Damage | Chance Flinch | | Flinch = immobilize 2s
+159 | Sharpen | SELF | SELF | Buff | Attack +1 stage | 10s; refresh
+160 | Conversion | SELF | SELF | Type Change | Copy type of user's first move | 10s transformation unless reapplied
+161 | Tri Attack | RANGED | ENEMY | Damage | No status secondary in Gen I |
+162 | Super Fang | MELEE | ENEMY | Fixed Damage | Cuts current HP in half |
+163 | Slash | MELEE | ENEMY | Damage | High crit |
+164 | Substitute | MELEE | ENEMY | Tackle fallback | TODO true Substitute | Prototype = Tackle; no HP cost/decoy
+165 | Struggle | MELEE | ENEMY | Damage | Recoil | Only when no PP

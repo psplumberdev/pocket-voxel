@@ -1,3 +1,5 @@
+import { useRareCandy } from "./rules/rare-candy.ts";
+import { GameMap, isOutside } from "./world/map.ts";
 import { useMedicine } from "./rules/medicine.ts";
 import { physicalExit } from "./world/warp.ts";
 // The Game shell: the state stack (overworld / textbox / stub-battle /
@@ -33,7 +35,7 @@ import {
 import { apply as applyEvolution, checkParty } from "./rules/evolution.ts";
 import { expForLevel, levelForExp } from "./rules/growth.ts";
 import { calc } from "./rules/stats.ts";
-import { movesLearnedAt } from "./rules/experience.ts";
+import { apply as applyExperience, movesLearnedAt } from "./rules/experience.ts";
 import { MAP_ENTRY_AFTER_BATTLE, POST_BATTLE_RETURN, YES_NO_ANSWER } from "./rules/timing.ts";
 import {
   PC_DEX_ROWS,
@@ -54,7 +56,7 @@ import {
   type UiBoxSource,
 } from "./scene.ts";
 import { Overworld, type OverworldShell, type SaveSlice } from "./world/overworld.ts";
-import { isOverworldAttackSpecies, overworldAttacksFor } from "./world/overworld-attack.ts";
+import { FIELD_WALK_TICKS, overworldAttacksFor } from "./world/overworld-attack.ts";
 import { Textbox } from "./world/textbox.ts";
 
 /** The full save: the overworld slice plus the party the battle port added. */
@@ -194,6 +196,62 @@ class StartMenuState implements GameState, SystemOverlaySource {
   }
 }
 
+class PartyMenuState implements GameState, SystemOverlaySource {
+  readonly kind = "party-menu";
+  revision = 0;
+  private cursor = 0;
+  private member = 0;
+  private page: "party" | "actions" | "swap" = "party";
+  constructor(private game: VoxelmonGame) {}
+  private actions(): string[] {
+    const mon = this.game.save.party[this.member];
+    return ["MAKE LEAD", "SWITCH POSITION", "OVERWORLD ATTACK",
+      ...["FLY", "DIG", "TELEPORT"].filter(id => mon.moves.some(m => m.id === id)), "BACK"];
+  }
+  update(): void {
+    const input = this.game.input, party = this.game.save.party;
+    const rows = this.page === "actions" ? this.actions() : [...party.map(m => m.species), "CANCEL"];
+    if (input.wasPressed("start")) { this.game.pop(); return; }
+    if (input.wasPressed("b")) {
+      if (this.page === "party") { this.game.pop(); return; }
+      this.page = "party"; this.cursor = this.member;
+    } else if (input.wasPressed("up")) this.cursor = (this.cursor + rows.length - 1) % rows.length;
+    else if (input.wasPressed("down")) this.cursor = (this.cursor + 1) % rows.length;
+    else if (input.wasPressed("a")) {
+      if (this.cursor === rows.length - 1) {
+        if (this.page === "party") { this.game.pop(); return; }
+        this.page = "party"; this.cursor = this.member;
+      } else if (this.page === "party") {
+        this.member = this.cursor; this.page = "actions"; this.cursor = 0;
+      } else if (this.page === "swap") {
+        [party[this.member], party[this.cursor]] = [party[this.cursor], party[this.member]];
+        this.page = "party";
+      } else {
+        const action = rows[this.cursor];
+        if (action === "MAKE LEAD") {
+          [party[0], party[this.member]] = [party[this.member], party[0]];
+          this.page = "party"; this.cursor = 0;
+        } else if (action === "SWITCH POSITION") { this.page = "swap"; this.cursor = 0; }
+        else if (action === "OVERWORLD ATTACK") {
+          if (this.game.overworld.canUsePokemonPilot(this.member)) {
+            this.game.pop(); this.game.push(new OverworldAttackState(this.game, this.member)); return;
+          }
+          this.game.showText("Choose a healthy\nPOKéMON.");
+        } else { this.game.pop(); this.game.usePartyTravel(this.member, action); return; }
+      }
+    } else return;
+    this.revision++;
+  }
+  emit(host: VoxelHost): void {
+    host.uiRect(8, 8, 464, 256, 0xff181818);
+    host.uiLabel(20, 16, 1, 0xffffffff, this.page === "actions" ? "POKEMON ACTIONS" : this.page === "swap" ? "CHOOSE DESTINATION SLOT" : "POKEMON TEAM");
+    const rows = this.page === "actions" ? this.actions() : [...this.game.save.party.map((m, i) =>
+      `${i + 1} ${m.nickname ?? this.game.data.pokemon[m.species]?.name ?? m.species} L${m.level}  HP ${m.hp}/${m.stats.hp}${m.status ? ` ${m.status}` : ""}`), "CANCEL"];
+    rows.forEach((label, i) => host.uiLabel(20, 44 + i * 27, 1, i === this.cursor ? 0xff80ffff : 0xffffffff, `${i === this.cursor ? ">" : " "} ${label}`));
+    host.uiLabel(20, 246, 1, 0xffc0c0c0, "A SELECT   B BACK   START CLOSE");
+  }
+}
+
 /** Real-time field combat overlay. The world controller owns movement and
  * collision; this state only keeps the HUD and button policy on top. */
 class OverworldAttackState implements GameState, SystemOverlaySource {
@@ -206,7 +264,10 @@ class OverworldAttackState implements GameState, SystemOverlaySource {
     const before = this.game.overworld.pokemonAttackMessage;
     this.game.overworld.updatePokemonPilot();
     if (this.game.overworld.pokemonAttackMessage !== before) this.revision++;
-    if (!this.game.overworld.pokemonPilot) this.game.pop();
+    if (!this.game.overworld.pokemonPilot) {
+      this.game.pop();
+      if (this.game.input.wasPressed("start")) this.game.openStartMenu();
+    }
   }
   emit(host: VoxelHost): void {
     const ow = this.game.overworld;
@@ -215,14 +276,18 @@ class OverworldAttackState implements GameState, SystemOverlaySource {
     const mon = this.game.save.party[pilot.monIndex];
     if (!mon) return;
     const name = mon.nickname ?? this.game.data.pokemon[mon.species]?.name ?? mon.species;
-    const attacks = overworldAttacksFor(mon.species);
+    const attacks = overworldAttacksFor(mon.species, ow.pokemonPilotMoves, this.game.data.moves);
     host.uiRect(4, 182, 224, 84, 0xdd000000);
     host.uiLabel(10, 188, 1, 0xffffffff, `OVERWORLD ATTACK  ${name}`);
     host.uiLabel(10, 202, 1, 0xff70e070, `HP ${mon.hp}/${mon.stats.hp}`);
     host.uiLabel(10, 216, 1, 0xffffff80, `A ${attacks[pilot.attackIndex]?.name ?? "ATTACK"}`);
-    host.uiLabel(10, 230, 1, 0xffb0b0ff, `${attacks[pilot.attackIndex]?.kind.toUpperCase() ?? "MELEE"}  RANGE ${attacks[pilot.attackIndex]?.kind === "ranged" ? 5 : 1}`);
+    const attack = attacks[pilot.attackIndex];
+    const reach = attack?.target === "self" ? "SELF" : attack?.area === "self" ? "AREA  3-TILE RADIUS"
+      : attack?.area === "forward" ? "AREA  4 TILES FORWARD" : attack?.kind === "melee" ? "MELEE  5 FRONT TILES"
+      : `RANGED  RANGE ${attack?.range ?? 5}`;
+    host.uiLabel(10, 230, 1, 0xffb0b0ff, reach);
     host.uiLabel(10, 244, 1, 0xffffffff, ow.pokemonAttackMessage.slice(0, 32));
-    host.uiLabel(10, 258, 1, 0xffc0c0c0, "D-PAD MOVE  RIGHT/SELECT TOGGLE  B EXIT");
+    host.uiLabel(10, 258, 1, 0xffc0c0c0, "D-PAD MOVE  L/R MOVES  B EXIT");
   }
 }
 
@@ -576,6 +641,8 @@ class BattleGameState implements GameState, BattleSceneView {
       party: readonly { species: string; level: number }[];
       onWin: () => void;
     },
+    private wildOnWin?: () => void,
+    private ghostEncounter?: { onEscape: () => void },
   ) {
     this.battle = new WildBattle(
       game.data,
@@ -589,6 +656,11 @@ class BattleGameState implements GameState, BattleSceneView {
     // goes to the arena (docs/VOXEL.md §4)
     const ow = game.overworld;
     this.staging = computeStaging(ow.map, ow.player.cellX, ow.player.cellY, ow.player.surfing);
+    if (ghostEncounter) {
+      this.battle.noCatch = true;
+      this.battle.ghost = !game.save.inventory.SILPH_SCOPE;
+      if (this.battle.ghost) { this.battle.enemy.name = "GHOST"; this.battle.enemyHidden = true; }
+    }
     this.battle.enter();
   }
 
@@ -631,7 +703,8 @@ class BattleGameState implements GameState, BattleSceneView {
               this.trainer.party,
               this.trainer.onWin,
             );
-          }
+          } else if (b.finished === "win" || (this.ghostEncounter && b.pokeDollEscape)) this.wildOnWin?.();
+          else if (b.finished === "run") this.ghostEncounter?.onEscape();
         },
       );
       return;
@@ -742,7 +815,9 @@ export class VoxelmonGame implements OverworldShell, SceneView {
   private applyMovementSpeed(): void {
     if (!this.overworld?.player) return;
     if (this.overworld.map?.def.tileset !== "OVERWORLD" || this.overworld.player.surfing) this.cycling = false;
-    this.overworld.player.stepFrames = (this.musicEnabled ? 24 : 16) / (this.cycling ? 2 : 1);
+    this.overworld.player.stepFrames = this.overworld.pokemonPilot
+      ? FIELD_WALK_TICKS
+      : (this.musicEnabled ? 24 : 16) / (this.cycling ? 2 : 1);
   }
 
   /**
@@ -865,6 +940,14 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     this.save.flags[`EVENT_CHOSE_${species}`] = true;
     const rival = species === "BULBASAUR" ? "CHARMANDER" : species === "CHARMANDER" ? "SQUIRTLE" : "BULBASAUR";
     this.save.flags[`EVENT_RIVAL_CHOSE_${rival}`] = true;
+  }
+
+  receiveGiftPokemon(species: string, level: number, event: string): "granted" | "full" | "already" {
+    if (this.save.flags[event]) return "already";
+    if (this.save.party.length >= 6) return "full";
+    if (!partyAdd(this.save.party, newMon(this.data, species, level))) return "full";
+    this.save.flags[event] = true;
+    return "granted";
   }
 
   buyMagikarp(): "bought" | "money" | "party-full" | "already-bought" {
@@ -1054,7 +1137,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
   openOverworldAttack(): void {
     const eligible = this.save.party
       .map((mon, i) => ({ mon, i }))
-      .filter(({ mon }) => mon.hp > 0 && isOverworldAttackSpecies(mon.species));
+      .filter(({ i }) => this.overworld.canUsePokemonPilot(i));
     if (eligible.length === 0) {
       this.showText("No compatible POKéMON\nfor overworld attacks.");
       return;
@@ -1066,6 +1149,22 @@ export class VoxelmonGame implements OverworldShell, SceneView {
       const chosen = eligible[index];
       if (chosen) this.push(new OverworldAttackState(this, chosen.i));
     });
+  }
+
+  awardFieldExperience(monIndex: number, species: string, level: number, trainer = false): { gained: number; levels: number[] } {
+    const mon = this.save.party[monIndex];
+    const defeated = this.data.pokemon[species];
+    if (!mon || !defeated) return { gained: 0, levels: [] };
+    const [levels, gained] = applyExperience(this.data, mon, defeated, level, trainer, 1, mon.traded);
+    for (const lv of levels) {
+      for (const id of movesLearnedAt(this.data.pokemon[mon.species], lv)) {
+        const def = this.data.moves[id];
+        if (def && mon.moves.length < 4 && !mon.moves.some(move => move.id === id)) {
+          mon.moves.push({ id, pp: def.pp });
+        }
+      }
+    }
+    return { gained, levels };
   }
 
   pushWarpFade(frames: number, midpoint: () => void, onDone?: () => void): void {
@@ -1133,8 +1232,12 @@ export class VoxelmonGame implements OverworldShell, SceneView {
   // OverworldShell keeps the seam's method name (overworld.ts is another
   // task's file); since the battle port it constructs the REAL wild battle
   // (BattleState.newWild in the reference).
-  pushStubBattle(species: string, level: number): void {
-    this.push(new BattleGameState(this, species, level));
+  pushGhostBattle(onWin: () => void, onEscape: () => void): void {
+    this.push(new BattleGameState(this, "MAROWAK", 30, undefined, onWin, { onEscape }));
+  }
+
+  pushStubBattle(species: string, level: number, onWin?: () => void): void {
+    this.push(new BattleGameState(this, species, level, undefined, onWin));
   }
 
   pushTrainerBattle(
@@ -1143,6 +1246,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     party: readonly { species: string; level: number }[],
     onWin: () => void,
   ): void {
+    if (this.overworld.pokemonPilot && this.overworld.startFieldTrainer(name, trainerClass, party, onWin)) return;
     const first = party[0];
     if (!first) { onWin(); return; }
     this.push(new BattleGameState(this, first.species, first.level, { name, trainerClass, party, onWin }));
@@ -1218,30 +1322,61 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     });
   }
 
-  /** Start-menu POKEMON: choose a party member, then its destination slot. */
+  /** Party selection uses the full-screen overlay so all six slots are visible. */
   openParty(): void {
-    if (this.save.party.length === 0) {
-      this.showText("You have no POKéMON!");
-      return;
+    if (!this.save.party.length) { this.showText("You have no POKéMON!"); return; }
+    this.push(new PartyMenuState(this));
+  }
+
+  usePartyTravel(index: number, move: string): void {
+    const mon = this.save.party[index];
+    if (!mon || mon.hp <= 0 || !mon.moves.some(m => m.id === move)) {
+      this.showText("A healthy POKéMON must\nknow this move."); return;
     }
-    const labels = () => this.save.party.map((mon, i) => {
-      const name = mon.nickname ?? this.data.pokemon[mon.species]?.name ?? mon.species;
-      return `${i + 1} ${name} L${mon.level}`;
-    });
-    this.showMenuChoice("Choose a POKéMON.", [...labels(), "CANCEL"], (from) => {
-      if (!this.save.party[from]) return;
-      this.showMenuChoice("Move it to which\nposition?", [...labels(), "CANCEL"], (to) => {
-        if (!this.save.party[to]) return;
-        if (from !== to) {
-          const mon = this.save.party[from];
-          this.save.party[from] = this.save.party[to];
-          this.save.party[to] = mon;
-        }
-        const lead = this.save.party[0];
-        const name = lead.nickname ?? this.data.pokemon[lead.species]?.name ?? lead.species;
-        this.showText(`${name} is now\nfirst in the lineup.`);
+    if (move === "DIG") { this.escapeDungeon(false); return; }
+    if (move === "TELEPORT") {
+      if (!isOutside(this.overworld.map.def)) { this.showText("Use TELEPORT outdoors."); return; }
+      const dest = this.save.lastHeal ?? { map: "REDS_HOUSE_1F", x: 4, y: 6 };
+      this.travelTo(dest.map, dest.x, dest.y); return;
+    }
+    if (move === "FLY") {
+      if (!isOutside(this.overworld.map.def)) { this.showText("Use FLY outdoors."); return; }
+      const destinations = Object.entries(this.save.visitedOutdoor ?? {}).filter(([id]) =>
+        (id.endsWith("_CITY") || id.endsWith("_TOWN") || id === "INDIGO_PLATEAU") && this.overworld.isCooked(id));
+      if (!destinations.length) { this.showText("Visit a town first."); return; }
+      this.showMenuChoice("Fly to which town?", [...destinations.map(([id]) => id.replaceAll("_", " ")), "CANCEL"], i => {
+        const dest = destinations[i];
+        if (dest) this.travelTo(dest[0], dest[1].x, dest[1].y);
       });
-    });
+    }
+  }
+
+  private travelTo(map: string, x: number, y: number): boolean {
+    const def = this.data.maps?.[map];
+    const ts = def && this.data.tilesets?.[def.tileset];
+    if (!def || !ts || !this.overworld.isCooked(map) || !Number.isInteger(x) || !Number.isInteger(y)) return false;
+    const dest = new GameMap(def, ts);
+    if (!dest.inBounds(x, y) || !dest.isWalkableCell(x, y) || dest.isWaterCell(x, y)) {
+      this.showText("Can't travel there yet."); return false;
+    }
+    this.cycling = false;
+    this.overworld.player.surfing = false;
+    const exit = def.warps.find(w => w.destMap === "LAST_MAP");
+    const parent = exit && physicalExit(this.data, map, exit);
+    if (parent) this.overworld.rememberOutdoor(parent.id, parent.x, parent.y);
+    this.overworld.startWarpTo(map, x, y, "down", undefined, false);
+    return true;
+  }
+
+  escapeDungeon(consumeRope: boolean): boolean {
+    const ow = this.overworld, dest = ow.lastOutdoor ?? this.save.lastOutdoor;
+    const dungeon = ["CAVERN", "CEMETERY", "FOREST", "FACILITY"].includes(ow.map.def.tileset);
+    if (!dungeon || !dest || (consumeRope && !(this.save.inventory.ESCAPE_ROPE > 0))) {
+      this.showText("Can't escape from here."); return false;
+    }
+    if (!this.travelTo(dest.id, dest.x, dest.y)) return false;
+    if (consumeRope) Bag.remove(this.save, "ESCAPE_ROPE", 1);
+    return true;
   }
 
   private offerFieldMove(mon: PartyMon, moveId: string, onDone: () => void): void {
@@ -1396,6 +1531,7 @@ export class VoxelmonGame implements OverworldShell, SceneView {
     }), "CANCEL"], (itemIndex) => {
       const id = ids[itemIndex];
       if (!id) return;
+      if (id === "ESCAPE_ROPE") { this.escapeDungeon(true); return; }
       if (id === "BICYCLE") { this.toggleBicycle(); return; }
       const machine = this.data.items?.[id]?.machine;
       const targets = this.save.party.map((mon) => {
@@ -1410,6 +1546,17 @@ export class VoxelmonGame implements OverworldShell, SceneView {
         if (!mon) return;
         if (this.data.items?.[id]?.machine) {
           this.teachMachine(id, partyIndex);
+          return;
+        }
+        if (id === "RARE_CANDY") {
+          if (!(this.save.inventory[id] > 0) || !useRareCandy(this.data, mon)) { this.showText("It won't have any\neffect."); return; }
+          Bag.remove(this.save, id, 1);
+          const learned = movesLearnedAt(this.data.pokemon[mon.species], mon.level);
+          const next = (i: number): void => {
+            if (i < learned.length) this.offerFieldMove(mon, learned[i], () => next(i + 1));
+            else this.runEvolutions(new Set([mon]));
+          };
+          this.showText(`${targets[partyIndex]} grew\nto level ${mon.level}!`, () => next(0));
           return;
         }
         if (!useMedicine(mon, id)) { this.showText("It won't have any\neffect."); return; }
@@ -1446,8 +1593,8 @@ export class VoxelmonGame implements OverworldShell, SceneView {
 
   systemOverlay(): SystemOverlaySource | null {
     const top = this.stack[this.stack.length - 1];
-    return top?.kind === "title" || top?.kind === "start-menu" || top?.kind === "overworld-attack"
-      ? (top as TitleState | StartMenuState | OverworldAttackState)
+    return top?.kind === "title" || top?.kind === "start-menu" || top?.kind === "party-menu" || top?.kind === "overworld-attack"
+      ? (top as TitleState | StartMenuState | PartyMenuState | OverworldAttackState)
       : null;
   }
 

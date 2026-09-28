@@ -48,6 +48,8 @@ pub mod btn {
     pub const B: u32 = 32;
     pub const START: u32 = 64;
     pub const SELECT: u32 = 128;
+    pub const L: u32 = 256;
+    pub const R: u32 = 512;
 }
 
 /// Facing / movement direction. Matches the walk-sheet frame order.
@@ -285,13 +287,15 @@ pub const SHADOW_ALPHA_BATTLE: f32 = 0.68;
 // ---------------------------------------------------------------------------
 
 /// Max simultaneously shown entity billboards (player is slot 0).
-pub const ENTS_MAX: usize = 16;
+pub const ENTS_MAX: usize = 64;
 
 /// Entity billboard flags.
 pub mod ent_flag {
     pub const MIRROR: u32 = 1;
     pub const GHOST: u32 = 2;
     pub const WALKER: u32 = 4;
+    pub const MELEE: u32 = 8;
+    pub const TILED: u32 = 16;
 }
 
 /// Emote bubble kinds.
@@ -473,4 +477,3 @@ pub mod mesh_kind {
 pub const MESH_KINDS: usize = 9;
 /// Bytes per CHNK chunk record: coords + AABB + a range per kind.
 pub const VXPK_CHUNK_RECORD_SIZE: usize = 128;
-

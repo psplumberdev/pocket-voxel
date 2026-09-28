@@ -1,11 +1,14 @@
+import { Scene } from "../voxelmon/game/scene.ts";
+import { MELEE_FLASH_TICKS, isOverworldAttackSpecies, overworldAttacksFor } from "../voxelmon/game/world/overworld-attack.ts";
+import { newMon } from "../voxelmon/game/battle/mon.ts";
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fixtureData } from "./fixtures/voxelmon/fixture-data.ts";
 import { GameMap } from "../voxelmon/game/world/map.ts";
-import { WildPopulation, WILD_LIMIT, WILD_RADIUS, pickWild } from "../voxelmon/game/world/wild.ts";
+import { WildPopulation, WILD_ACTOR_SLOTS, WILD_LIMIT, WILD_RADIUS, pickWild, rollsAggressive } from "../voxelmon/game/world/wild.ts";
 import { fixedRng, seededRng, seqRng } from "../voxelmon/game/rng.ts";
-import { ENTS_MAX, VOX_BTN, VOX_OP } from "../contracts/spec/voxel-spec.ts";
+import { ENT_FLAG, ENTS_MAX, VOX_BTN, VOX_OP } from "../contracts/spec/voxel-spec.ts";
 import { loadRuntimeData, type MapDef, type TilesetDef } from "../voxelmon/game/data.ts";
 import { VoxelmonGame } from "../voxelmon/game/game.ts";
 import { RecorderHost } from "../voxelmon/game/host.ts";
@@ -96,10 +99,10 @@ describe("visible wild population (ROM-free)", () => {
       expect(pop.slots.some(w => w.active)).toBe(false);
     }
   });
-  test("one remaining renderer slot allows only one wild Pokémon", () => {
+  test("one remaining actor slot allows only one wild Pokémon", () => {
     const { data, map, player } = fixture();
     const pop = new WildPopulation(seededRng(2));
-    for (let tick = 0; tick < 600; tick++) pop.update(data, map, player, Array(ENTS_MAX - 1).fill(player));
+    for (let tick = 0; tick < 600; tick++) pop.update(data, map, player, Array(WILD_ACTOR_SLOTS - 1).fill(player));
     expect(pop.slots.filter(w => w.active).length).toBe(1);
   });
   test("consuming a creature keeps its identity and gives a respawn grace period", () => {
@@ -193,17 +196,45 @@ function gameWithIcons() {
 }
 
 describe.skipIf(!hasGen)("visible wild integration", () => {
-  test("contact opens the exact visible species and level once, without a step roll", () => {
+  test("walking into a visible Pokémon starts one classic battle with that encounter", () => {
     const { game } = gameWithIcons();
     const w = seedSlot(game.overworld.wild, 11, 7);
     Object.assign(w, { species: "PIDGEY", level: 4 });
-    game.tick(VOX_BTN.down);
+    for (let i = 0; i < 30; i++) game.tick(VOX_BTN.down);
+    expect(game.overworld.player.cellY).toBe(6);
     expect(game.overworld.encounterCount).toBe(1);
     expect(game.battleView()?.battle.enemy.mon.species).toBe("PIDGEY");
     expect(game.battleView()?.battle.enemy.mon.level).toBe(4);
     expect(w.active).toBe(false);
+  });
+  test("contact stays in field combat until attack mode is exited", () => {
+    const { game } = gameWithIcons();
+    const ow = game.overworld;
+    ow.startPokemonPilot();
+    const w = seedSlot(ow.wild, 11, 7);
+    Object.assign(w, { species: "PIDGEY", level: 4, mon: newMon(game.data, "PIDGEY", 4) });
+    for (let i = 0; i < 30; i++) {
+      game.input.setButtons(VOX_BTN.down); game.input.step(); ow.updatePokemonPilot();
+    }
+    expect(ow.encounterCount).toBe(0);
+    expect(game.battleView()).toBeNull();
+    expect(w.active).toBe(true);
+    ow.stopPokemonPilot();
     for (let i = 0; i < 30; i++) game.tick(VOX_BTN.down);
-    expect(game.overworld.encounterCount).toBe(1);
+    expect(ow.encounterCount).toBe(1);
+    expect(game.battleView()?.battle.enemy.mon.species).toBe("PIDGEY");
+    expect(w.active).toBe(false);
+  });
+  test("wild contact cannot start a battle through impassable terrain", () => {
+    const { game } = gameWithIcons();
+    const ow = game.overworld;
+    const w = seedSlot(ow.wild, 11, 7);
+    Object.assign(w, { species: "PIDGEY", level: 4 });
+    ow.map.isWalkableCell = () => false;
+    for (let i = 0; i < 30; i++) game.tick(VOX_BTN.down);
+    expect(ow.encounterCount).toBe(0);
+    expect(game.battleView()).toBeNull();
+    expect(w.active).toBe(true);
   });
   test("A can engage a visible creature, and absent creatures do not roll invisible battles", () => {
     const { game } = gameWithIcons();
@@ -259,5 +290,339 @@ describe.skipIf(!hasGen)("visible wild integration", () => {
     expect(w.animation).toBe(animation);
     game.overworld.setMap("DIGLETTS_CAVE", 6, 5, "down");
     expect(game.overworld.wild.slots.every(w => !w.active)).toBe(true);
+  });
+});
+
+test("hostile wild movement takes the same number of ticks as player walking", () => {
+  const { data, map, player } = fixture();
+  const pop = new WildPopulation(seededRng(8));
+  const wild = seedSlot(pop, player.cellX - 3, player.cellY);
+  wild.aggro = true;
+  pop.update(data, map, player, [player]);
+  expect(wild.moving).toBe(true);
+  const startX = wild.cellX;
+  for (let tick = 1; tick <= 15; tick++) {
+    pop.update(data, map, player, [player]);
+    expect(wild.cellX).toBe(startX);
+    expect(wild.px).toBe(startX * 16 + tick);
+  }
+  pop.update(data, map, player, [player]);
+  expect(wild.cellX).toBe(startX + 1);
+  expect(wild.moving).toBe(false);
+});
+
+describe.skipIf(!hasGen)("overworld move projectiles", () => {
+  test("player and enemy shots render all four elemental frames and the matching impact on one page", () => {
+    const { game, host } = gameWithIcons();
+    game.data.projectilePage = 7777;
+    const ow = game.overworld;
+    const enemy = ow.wild.slots[0]!;
+    const entities: number[][] = [];
+    host.ent = (...args: number[]) => { entities.push(args); };
+    for (const source of [undefined, enemy]) for (let frame = 0; frame < 4; frame++) {
+      ow.pokemonProjectiles = [{ x: 11, y: 7, dx: -1, dy: 0, remaining: 5, name: "FLASH",
+        monIndex: 0, frame: frame * 8, ticks: 0, stepTicks: 12, move: { id: "FLASH", pp: 1 }, source }];
+      ow.pokemonImpacts = [{ x: 11, y: 8, moveId: "FLASH", ticks: 12 }];
+      entities.length = 0;
+      new Scene(host).emit(game);
+      const visuals = entities.filter(args => args[1] === 7777);
+      expect(visuals.map(args => args[2])).toEqual([20 + frame, 24]);
+      expect(visuals[0]![6]! & ENT_FLAG.tiled).toBe(ENT_FLAG.tiled);
+      expect(visuals[0]![6]! & ENT_FLAG.mirror).toBe(ENT_FLAG.mirror);
+    }
+    ow.setMap("ROUTE_1", 11, 6, "down");
+    expect(ow.pokemonImpacts).toHaveLength(0);
+  });
+
+  test("player projectiles take half a walking step per tile and spend PP even when blocked", () => {
+    const { game } = gameWithIcons();
+    const mon = newMon(game.data, "PIKACHU", 10);
+    mon.moves = [{ id: "THUNDERSHOCK", pp: 10 }];
+    game.save.party = [mon];
+    const ow = game.overworld;
+    ow.wild.clear();
+    ow.wild.update = () => {};
+    expect(ow.startPokemonPilot()).toBe(true);
+    (ow as unknown as { firePokemonAttack(): void }).firePokemonAttack();
+    expect(mon.moves[0]!.pp).toBe(9);
+    const shot = ow.pokemonProjectile!;
+    expect(shot).toBeDefined();
+    for (let i = 1; i < ow.player.stepFrames / 2; i++) ow.updatePokemonPilot();
+    expect(shot.y).toBe(ow.player.cellY);
+    ow.updatePokemonPilot();
+    expect(shot.y).toBe(ow.player.cellY + 1);
+    ow.map.isWalkableCell = () => false;
+    for (let i = 0; i < ow.player.stepFrames / 2; i++) ow.updatePokemonPilot();
+    expect(ow.pokemonProjectile).toBeUndefined();
+    expect(mon.moves[0]!.pp).toBe(9);
+    expect(ow.pokemonImpacts).toHaveLength(1);
+    expect(ow.pokemonImpacts[0]!.moveId).toBe("THUNDERSHOCK");
+    for (let i = 0; i < 12; i++) ow.updatePokemonPilot();
+    expect(ow.pokemonImpacts).toHaveLength(0);
+  });
+
+  test("pursuing enemies stop to emit visible melee and ranged attacks", () => {
+    for (const [move, distance] of [["TACKLE", 1], ["ROCK_THROW", 3]] as const) {
+      const { game, host } = gameWithIcons();
+      const ow = game.overworld;
+      game.save.party = [newMon(game.data, "PIKACHU", 30)];
+      ow.wild.clear();
+      ow.startPokemonPilot();
+      game.data.partyIcons!.BALL ??= game.data.partyIcons!.MON!;
+      const wild = seedSlot(ow.wild, ow.player.cellX, ow.player.cellY + distance);
+      Object.assign(wild, { species: "ONIX", level: 20, aggressive: true, aggro: true,
+        habitat: "grass", facing: "down", attackCooldown: 0 });
+      wild.mon = newMon(game.data, "ONIX", 20);
+      wild.mon.moves = [{ id: move, pp: 20 }];
+      // Keep actual movement/AI active, with a walkable habitat for pursuit.
+      (ow.wild as any).habitatAt = () => "grass";
+      ow.updatePokemonPilot();
+      expect(wild.facing).toBe("up");
+      expect(wild.moving).toBe(false);
+      const scene = new Scene(host);
+      scene.emit(game); host.frameDone(0, 0);
+      const entities = host.text().split("\n").filter(line => line.startsWith(`o ${VOX_OP.ent} `));
+      if (distance === 1) {
+        expect(ow.pokemonMeleeFlashes).toContainEqual(expect.objectContaining({ x: ow.player.cellX, y: ow.player.cellY }));
+        expect(entities.some(line => line.endsWith(` ${ENT_FLAG.melee}`))).toBe(true);
+      } else {
+        expect(ow.pokemonProjectile?.source).toBe(wild);
+        expect(ow.pokemonProjectile?.dy).toBe(-1);
+        expect(entities.some(line => line.split(" ").map(Number)[7] === 6)).toBe(true);
+      }
+    }
+  });
+
+  test("wild Pokémon launch their learned ranged moves without immediate contact damage", () => {
+    const { game } = gameWithIcons();
+    game.save.party = [newMon(game.data, "PIKACHU", 10)];
+    const ow = game.overworld;
+    ow.wild.clear();
+    ow.wild.update = () => {};
+    expect(ow.startPokemonPilot()).toBe(true);
+    const wild = seedSlot(ow.wild, ow.player.cellX, ow.player.cellY + 3);
+    Object.assign(wild, { species: "ONIX", level: 20, aggressive: true, aggro: true });
+    wild.mon = newMon(game.data, "ONIX", 20);
+    wild.mon.moves = [{ id: "ROCK_THROW", pp: 15 }];
+    const hp = game.save.party[0]!.hp;
+    ow.updatePokemonPilot();
+    expect(ow.pokemonProjectile?.source).toBe(wild);
+    expect(ow.pokemonProjectile?.move.id).toBe("ROCK_THROW");
+    expect(game.save.party[0]!.hp).toBe(hp);
+    expect(wild.attackCooldown).toBe(180);
+  });
+});
+
+test("spawn loading precedes fully initialized stats, HP, learned moves and battler", () => {
+  const { data, map, player } = fixture();
+  const pop = new WildPopulation(seededRng(8));
+  for (let i = 0; i < 300 && !pop.loading; i++) pop.update(data, map, player, [player]);
+  expect(pop.loading).toBe(true);
+  expect(pop.slots.some(w => w.active)).toBe(false);
+  pop.update(data, map, player, [player]);
+  expect(pop.loading).toBe(false);
+  const wild = pop.slots.find(w => w.active)!;
+  expect(wild.mon).toBeDefined();
+  expect(wild.mon!.moves.length).toBeGreaterThan(0);
+  expect(wild.hp).toBe(wild.mon!.stats.hp);
+  expect(wild.battler!.mon).toBe(wild.mon!);
+  expect(wild.mon!.stats.speed).toBeGreaterThan(0);
+});
+
+test("aggression is exactly one of five equally likely spawn outcomes", () => {
+  expect([0, 1, 2, 3, 4].map(roll => rollsAggressive({ int: () => roll, byte: () => 0 })))
+    .toEqual([true, false, false, false, false]);
+});
+
+describe.skipIf(!hasGen)("field encounter rules", () => {
+  function field() {
+    const { game, host } = gameWithIcons();
+    const ow = game.overworld;
+    ow.wild.clear();
+    ow.wild.update = () => {};
+    const mon = newMon(game.data, "IVYSAUR", 30);
+    mon.moves = [{ id: "TACKLE", pp: 35 }];
+    game.save.party = [mon];
+    ow.startPokemonPilot();
+    const wild = seedSlot(ow.wild, ow.player.cellX, ow.player.cellY + 1);
+    Object.assign(wild, { species: "RATTATA", level: 3 });
+    wild.mon = newMon(game.data, "RATTATA", 3);
+    const fire = () => (ow as unknown as { firePokemonAttack(): void }).firePokemonAttack();
+    return { game, host, ow, mon, wild, fire };
+  }
+
+  test("passive neighbors stay passive until attacked; misses still provoke", () => {
+    const { ow, wild, game, fire } = field();
+    for (let i = 0; i < 30; i++) ow.updatePokemonPilot();
+    expect(wild.aggro).toBe(false);
+    game.data.moves.TACKLE!.accuracy = 0;
+    fire();
+    expect(wild.provoked).toBe(true);
+    expect(wild.hp).toBe(wild.mon!.stats.hp);
+    ow.updatePokemonPilot();
+    expect(wild.aggro).toBe(true);
+  });
+
+  test("melee marks the facing cell on misses and enemy attacks", () => {
+    const { ow, wild, mon, fire, game, host } = field();
+    ow.player.facing = "up";
+    fire();
+    expect(ow.pokemonMeleeFlashes).toContainEqual(expect.objectContaining({ x: ow.player.cellX, y: ow.player.cellY - 1 }));
+    expect(wild.provoked).toBe(false);
+    wild.aggressive = true; wild.aggro = true; wild.facing = "up";
+    wild.mon!.moves = [{ id: "TACKLE", pp: 35 }];
+    ow.updatePokemonPilot();
+    expect(ow.pokemonMeleeFlashes.some(f => f.x === ow.player.cellX && f.y === ow.player.cellY)).toBe(true);
+    const scene = new Scene(host);
+    scene.emit(game);
+    host.frameDone(0, 0);
+    expect(host.text().split("\n").some(line => line.startsWith(`o ${VOX_OP.ent} `) && line.endsWith(` ${ENT_FLAG.melee}`))).toBe(true);
+    for (let i = 0; i < MELEE_FLASH_TICKS; i++) ow.updatePokemonPilot();
+    expect(ow.pokemonMeleeFlashes).toHaveLength(0);
+    expect(mon.hp).toBeGreaterThan(0);
+  });
+
+  test("melee includes the facing tile in all four directions", () => {
+    for (const [dir, dx, dy] of [["up", 0, -1], ["down", 0, 1], ["left", -1, 0], ["right", 1, 0]] as const) {
+      const { ow, wild, fire } = field();
+      ow.player.facing = dir;
+      Object.assign(wild, { cellX: ow.player.cellX + dx, cellY: ow.player.cellY + dy,
+        px: (ow.player.cellX + dx) * 16, py: (ow.player.cellY + dy) * 16 });
+      fire();
+      expect(ow.pokemonMeleeFlashes).toHaveLength(5);
+      expect(ow.pokemonMeleeFlashes).toContainEqual(expect.objectContaining({ x: wild.cellX, y: wild.cellY }));
+      expect(wild.provoked).toBe(true);
+    }
+  });
+
+  test("enemy melee cannot hit behind its facing or while stepping", () => {
+    const { ow, wild, mon } = field();
+    wild.aggressive = wild.aggro = true;
+    wild.mon!.moves = [{ id: "TACKLE", pp: 35 }];
+    wild.facing = "down";
+    const hp = mon.hp;
+    ow.updatePokemonPilot();
+    expect(ow.pokemonMeleeFlashes).toHaveLength(0);
+    expect(mon.hp).toBe(hp);
+    wild.facing = "up"; wild.moving = true;
+    ow.updatePokemonPilot();
+    expect(ow.pokemonMeleeFlashes).toHaveLength(0);
+    wild.moving = false;
+    ow.updatePokemonPilot();
+    expect(ow.pokemonMeleeFlashes).toHaveLength(5);
+    expect(ow.pokemonMeleeFlashes).toContainEqual(expect.objectContaining({ x: ow.player.cellX, y: ow.player.cellY }));
+  });
+
+  test("changing input mid-step keeps facing and melee aligned with travel", () => {
+    const { ow, game, fire } = field();
+    const x = ow.player.cellX, y = ow.player.cellY;
+    Object.assign(ow.player, { facing: "right", moving: true, targetX: x + 1, targetY: y,
+      progress: 16, stepFramesCur: 24 });
+    game.input.isDown = dir => dir === "up";
+    ow.updatePokemonPilot();
+    expect(ow.player.facing).toBe("right");
+    expect(ow.player.py).toBe(y * 16);
+    fire();
+    expect(ow.pokemonMeleeFlashes).toContainEqual(expect.objectContaining({ x: x + 2, y }));
+  });
+
+  test("sleep freezes player movement and prevents player and enemy attacks", () => {
+    const { ow, mon, wild, fire, game } = field();
+    mon.status = "SLP";
+    wild.mon!.status = "SLP";
+    wild.aggressive = wild.aggro = true;
+    wild.facing = "up";
+    Object.assign(ow.player, { moving: true, targetX: ow.player.cellX + 1,
+      targetY: ow.player.cellY, facing: "right", progress: 5, stepFramesCur: 24 });
+    game.input.isDown = dir => dir === "right";
+    const x = ow.player.px, pp = mon.moves[0]!.pp;
+    for (let i = 0; i < 299; i++) { fire(); ow.updatePokemonPilot(); }
+    expect(ow.player.px).toBe(x);
+    expect(ow.player.progress).toBe(5);
+    expect(mon.moves[0]!.pp).toBe(pp);
+    expect(ow.pokemonMeleeFlashes).toHaveLength(0);
+    expect(ow.pokemonProjectiles).toHaveLength(0);
+    ow.updatePokemonPilot();
+    expect(mon.status).toBeNull();
+    expect(ow.player.progress).toBe(6);
+  });
+
+  test("kill XP is applied once to the controlled Pokémon", () => {
+    const { ow, wild, mon, fire, game } = field();
+    game.data.moves.TACKLE!.accuracy = 100;
+    wild.mon!.hp = wild.hp = 1;
+    const before = mon.exp;
+    for (let i = 0; i < 10 && wild.active; i++) { ow.pokemonAttackCooldown = 0; fire(); }
+    expect(wild.active).toBe(false);
+    expect(wild.rewarded).toBe(true);
+    expect(mon.exp).toBeGreaterThan(before);
+    const after = mon.exp;
+    ow.pokemonAttackCooldown = 0; fire();
+    expect(mon.exp).toBe(after);
+  });
+
+  test("every Pokémon through #050 has stats, graphics and valid original moves", () => {
+    const { game } = gameWithIcons();
+    const species = Object.values(game.data.pokemon).filter(p => p.dex <= 50);
+    expect(species).toHaveLength(50);
+    for (const def of species) {
+      expect(isOverworldAttackSpecies(def.id)).toBe(true);
+      expect(game.data.partyIcons?.[def.partyIcon!]).toBeDefined();
+      for (const stat of Object.values(def.baseStats)) expect(stat).toBeGreaterThan(0);
+      for (const id of [...def.level1Moves, ...def.learnset.map(m => m.move)]) {
+        const move = game.data.moves[id];
+        expect(move).toBeDefined();
+        expect(move!.pp).toBeGreaterThan(0);
+        expect(overworldAttacksFor(def.id, [{ id }], game.data.moves)[0]!.power).toBe(move!.power);
+      }
+    }
+  });
+});
+
+describe.skipIf(!hasGen)("field pacing at the host's fastest 60 Hz logic rate", () => {
+  test("an adjacent ranged target takes 12 ticks, with visible positions across 6 presented frames", () => {
+    const { game, host } = gameWithIcons();
+    const ow = game.overworld;
+    const mon = newMon(game.data, "PIKACHU", 10);
+    mon.moves = [{ id: "THUNDERSHOCK", pp: 10 }];
+    game.save.party = [mon];
+    game.data.partyIcons!.BALL ??= game.data.partyIcons!.MON!;
+    ow.wild.clear(); ow.wild.update = () => {};
+    ow.startPokemonPilot();
+    const wild = seedSlot(ow.wild, ow.player.cellX, ow.player.cellY + 1);
+    Object.assign(wild, { species: "RATTATA", level: 3 });
+    wild.mon = newMon(game.data, wild.species, wild.level);
+    const hp = wild.mon.hp;
+    (ow as unknown as { firePokemonAttack(): void }).firePokemonAttack();
+    const shot = ow.pokemonProjectile!;
+    expect(shot.stepTicks).toBe(12);
+    const scene = new Scene(host);
+    let presented = 0;
+    for (let tick = 0; tick < 12; tick++) {
+      if (tick % 2 === 0) { scene.emit(game); host.frameDone(tick, 0); presented++; }
+      expect(ow.pokemonProjectile).toBe(shot);
+      expect(wild.mon.hp).toBe(hp);
+      ow.updatePokemonPilot();
+    }
+    expect(presented).toBe(6);
+    expect(ow.pokemonProjectile).toBeUndefined();
+    const points = host.text().split("\n").filter(line => line.startsWith(`o ${VOX_OP.ent} `))
+      .map(line => line.split(" ").map(Number)).filter(args => args[7] === 6);
+    expect(new Set(points.map(args => args[6])).size).toBeGreaterThanOrEqual(6);
+  });
+
+  test("cycling and music cannot speed up the field pilot", () => {
+    const { game } = gameWithIcons();
+    game.save.party = [newMon(game.data, "PIKACHU", 10)];
+    game.overworld.startPokemonPilot();
+    for (const cycling of [false, true]) for (const music of [false, true]) {
+      game.cycling = cycling;
+      game.setMusicEnabled(music);
+      expect(game.overworld.player.stepFrames).toBe(24);
+    }
+    game.overworld.stopPokemonPilot();
+    game.cycling = false;
+    game.setMusicEnabled(false);
+    expect(game.overworld.player.stepFrames).toBe(16);
   });
 });

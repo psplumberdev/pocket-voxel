@@ -32,6 +32,8 @@ use alloc::boxed::Box;
 
 mod remote;
 mod debug;
+mod boot;
+mod loading;
 mod model;
 mod voxel;
 
@@ -69,9 +71,10 @@ macro_rules! device_log { ($($arg:tt)*) => {}; }
 /// compiled and serialized by build.rs with the same pinned QuickJS revision.
 static APP_BYTECODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/game.qjbc"));
 
-/// Pak search order: PSPLINK/PPSSPP (host0: is the EBOOT's own directory),
-/// then a Memory Stick install.
-const PAK_PATHS: [&[u8]; 2] = [
+/// rust-psp sets the working directory to the launched EBOOT's directory.
+/// Prefer its sibling pack, including renamed folders and ef0: installs.
+const PAK_PATHS: [&[u8]; 3] = [
+    b"voxelmon.vxpak\0",
     b"host0:/voxelmon.vxpak\0",
     b"ms0:/PSP/GAME/VOXELMON/voxelmon.vxpak\0",
 ];
@@ -176,6 +179,7 @@ static mut LAST_GC_BUMP: usize = 0;
 
 fn psp_main() {
     unsafe {
+        boot::begin();
         host::reset_fpu_status();
         host::run_on_worker(worker_main, run);
     }
@@ -188,10 +192,11 @@ unsafe extern "C" fn worker_main(_argc: usize, _argv: *mut c_void) -> i32 {
 }
 
 unsafe fn log_exception(ctx: *mut JSContext) {
-    #[cfg(feature = "capture")]
-    host::log_exception_with(ctx, |msg| capture::log_line(msg));
-    #[cfg(not(feature = "capture"))]
-    host::log_exception_with(ctx, |_| {});
+    host::log_exception_with(ctx, |msg| {
+        boot::line(msg);
+        #[cfg(feature = "capture")]
+        capture::log_line(msg);
+    });
 }
 
 unsafe fn log_quickjs_memory(stage: &str) {
@@ -217,6 +222,7 @@ fn bytecode_fingerprint() -> u32 {
 }
 
 unsafe fn run() {
+    boot::checkpoint("worker entered, opening pak");
     // Partition size BEFORE anything allocates: PSPLINK's ldstart path does
     // not apply the PBP's MEMSIZE, so a dev session can get the 24 MB user
     // partition where an XMB launch gets ~56 MB. Knowing which is which is
@@ -228,21 +234,34 @@ unsafe fn run() {
     // Index first, then retain only non-geometry sections. CHNK/STMP bulk
     // never enters the resident image; map geometry comes from the reusable
     // file-backed cache below.
-    let (mut pak_file, pak_index) = PAK_PATHS
-        .iter()
-        .find_map(|path| pak_file::PakFileReader::open_index(path).ok())
-        .unwrap_or_else(|| host::halt("voxelmon.vxpak not found or invalid"));
+    let mut pak_errors = alloc::string::String::from("pak launch check 3\n");
+    let mut opened = None;
+    for path in PAK_PATHS {
+        match pak_file::PakFileReader::open_index(path) {
+            Ok(pack) => { opened = Some(pack); break; }
+            Err(error) => {
+                use core::fmt::Write;
+                let name = core::str::from_utf8(&path[..path.len() - 1]).unwrap_or("?");
+                let _ = writeln!(pak_errors, "{}\n{}", name, error);
+            }
+        }
+    }
+    let (mut pak_file, pak_index) = opened.unwrap_or_else(|| boot::halt(&pak_errors));
+    drop(pak_errors);
+    boot::checkpoint("pak index ready, reading GAME");
     let startup_game = pak_file
         .load_startup(&pak_index)
-        .unwrap_or_else(|e| host::halt(e));
+        .unwrap_or_else(|e| boot::halt(e));
     let startup_game_raw: *mut [u8] = Box::into_raw(startup_game.into_boxed_slice());
     let startup_game: &'static [u8] = &*startup_game_raw;
+    boot::checkpoint("GAME buffer ready");
 
     psp::enable_home_button();
     // Full clocks. PSPLINK launches modules at its own 222 MHz default, and
     // a QuickJS guest feels every missing cycle (the perf-wall lesson).
     sys::scePowerSetClockFrequency(333, 333, 166);
     host::init_graphics(host::GfxConfig { depth: true });
+    boot::checkpoint("graphics initialized");
 
     sys::sceCtrlSetSamplingCycle(0);
     sys::sceCtrlSetSamplingMode(CtrlMode::Analog);
@@ -259,9 +278,10 @@ unsafe fn run() {
         sys::sceKernelMaxFreeMemSize() / 1024,
     );
 
-    // The GAME section borrows from the leaked (never-freed) blob, so the
-    // 'static it carries is honest.
+    // The native GAME borrow stays valid through guest evaluation. Release
+    // the borrow before freeing its backing box below.
     voxel::init(startup_game);
+    boot::checkpoint("scene initialized, creating QuickJS");
     // The chip synth's banks (pak AUDI section) reach the guest through the
     // `audiodata` op: the manifest half tells the guest which bank and address
     // a song lives at, and the program half stays in the pak, where the core
@@ -278,13 +298,14 @@ unsafe fn run() {
     // ---- QuickJS ----
     let rt = pocketjs_psp::qjs_alloc::new_runtime();
     if rt.is_null() {
-        host::halt("JS_NewRuntime returned null");
+        boot::halt("JS_NewRuntime returned null");
     }
     let ctx = JS_NewContext(rt);
     if ctx.is_null() {
-        host::halt("JS_NewContext returned null");
+        boot::halt("JS_NewContext returned null");
     }
     let global = JS_GetGlobalObject(ctx);
+    boot::checkpoint("QuickJS context ready");
     voxel::register(ctx, global);
     // globalThis.audio — the PocketJS audio module (credit-based PCM). This
     // surface is mounted on its own, not through ffi::register (that mounts
@@ -297,6 +318,7 @@ unsafe fn run() {
         bytecode_fingerprint(),
     );
     log_quickjs_memory("before read");
+    boot::checkpoint("bytecode read begin");
     let compiled = JS_ReadObject(
         ctx,
         APP_BYTECODE.as_ptr(),
@@ -304,49 +326,55 @@ unsafe fn run() {
         JS_READ_OBJ_BYTECODE,
     );
     log_quickjs_memory("after read");
+    boot::checkpoint("bytecode read end");
     if JS_ValueGetTag(compiled) == JS_TAG_EXCEPTION {
         log_exception(ctx);
-        host::halt("JS_ReadObject threw");
+        boot::halt("JS_ReadObject threw");
     }
     // JS_EvalFunction takes ownership of the deserialized function object.
+    boot::checkpoint("bytecode eval begin");
     let res = JS_EvalFunction(ctx, compiled);
     log_quickjs_memory("after eval");
+    boot::checkpoint("bytecode eval end");
     if JS_ValueGetTag(res) == JS_TAG_EXCEPTION {
         log_exception(ctx);
-        host::halt("JS_EvalFunction threw");
+        boot::halt("JS_EvalFunction threw");
     }
     JS_FreeValue(ctx, res);
 
-    // native.gamedata() is boot-only. The parsed game owns independent
+    // native.parseGameData() is boot-only. The parsed game owns independent
     // QuickJS objects now, so return the 1+ MB transport buffer to the arena
     // before any streamed map or audio state is allocated.
     voxel::release_game();
     drop(Box::from_raw(startup_game_raw));
     JS_RunGC(rt);
     log_quickjs_memory("after GAME release");
+    boot::checkpoint("GAME buffer released, loading resident assets");
 
     // The guest's cold GAME read and initial scene ops are complete.
     // Only now retain the complete non-geometry pak used by rendering/audio.
     let resident_blob: &'static pak_file::ResidentBlob = Box::leak(Box::new(
-        pak_file.load_resident(&pak_index).unwrap_or_else(|e| host::halt(e)),
+        pak_file.load_resident(&pak_index).unwrap_or_else(|e| boot::halt(e)),
     ));
     let pak = match pak::read_streaming_resident(resident_blob.bytes(), &pak_index) {
         Ok(p) => p,
-        Err(e) => host::halt(e),
+        Err(e) => boot::halt(e),
     };
     voxel::init_data(&[], pak.audio);
+    boot::checkpoint("resident assets ready, enabling audio");
     let enable_audio = JS_GetPropertyStr(ctx, global, b"enableAudio\0".as_ptr() as *const _);
     if JS_IsUndefined(enable_audio) {
-        host::halt("globalThis.enableAudio is undefined");
+        boot::halt("globalThis.enableAudio is undefined");
     }
     let audio_res = JS_Call(ctx, enable_audio, global, 0, core::ptr::null_mut());
     JS_FreeValue(ctx, enable_audio);
     if JS_ValueGetTag(audio_res) == JS_TAG_EXCEPTION {
         log_exception(ctx);
-        host::halt("enableAudio threw");
+        boot::halt("enableAudio threw");
     }
     JS_FreeValue(ctx, audio_res);
     log_quickjs_memory("after audio enable");
+    boot::checkpoint("audio ready, creating renderer");
     device_log!(
         "[voxelmon] resident pak after eval: {} KB (geometry/atlas omitted, audio enabled)",
         resident_blob.allocated_bytes().div_ceil(1024),
@@ -354,29 +382,20 @@ unsafe fn run() {
 
     let frame_fn = JS_GetPropertyStr(ctx, global, b"frame\0".as_ptr() as *const _);
     if JS_IsUndefined(frame_fn) {
-        host::halt("globalThis.frame is undefined");
+        boot::halt("globalThis.frame is undefined");
     }
 
     let mut renderer = gu::Renderer::new();
+    loading::present(&mut renderer, "LOADING MAP");
+    boot::checkpoint("loading screen presented, streaming map");
     let mut map_geometry = pak_file::MapGeometry::new();
     let mut atlas_cache = pak_file::AtlasCache::new();
 
-    // Pay the first working-set IO cost while startup is still finishing.
-    // This intentionally makes the load longer so the first playable frame
-    // starts with its geometry and texture pages warm instead of hitching.
-    let startup_working_set = deep_working_set(voxel::scene(), &pak);
-    map_geometry
-        .sync(&mut pak_file, &pak_index, &startup_working_set)
-        .unwrap_or_else(|e| host::halt(e));
-    atlas_cache
-        .sync(&mut pak_file, &pak_index, &startup_working_set)
-        .unwrap_or_else(|e| host::halt(e));
-    sys::sceKernelDcacheWritebackAll();
-    device_log!(
-        "[voxelmon] startup working set preloaded: geometry {} KB, atlases {} KB",
-        map_geometry.resident_bytes().div_ceil(1024),
-        atlas_cache.allocated_bytes().div_ceil(1024),
-    );
+    // Defer the first working-set IO to the frame loop.  Reading every
+    // visible mesh and atlas frame here can leave the LOADING MAP screen up
+    // for minutes on a Memory Stick; the frame loop already synchronizes the
+    // exact visible set before its first playable frame.
+    boot::checkpoint("startup map streaming deferred");
     let mut debug_panel = debug::DebugPanel::new();
     let mut primary_map = voxel::scene().maps[0].map_id;
     let mut pad = SceCtrlData::default();
@@ -449,6 +468,13 @@ unsafe fn run() {
         let reload_reason = match reload_request & 3 {
             1 => "START", 3 => "START + MAP", _ => "MAP ENTRY",
         };
+        if reload_request & 2 != 0 || primary_map != next_primary_map {
+            loading::present(&mut renderer, "LOADING MAP");
+        } else if reload_request & 4 != 0 {
+            // Pending spawn was announced this turn; stats are constructed
+            // on the next guest turn, after this screen has reached the LCD.
+            loading::present(&mut renderer, "LOADING POKEMON");
+        }
         deep_load |= reload_scene;
         let cleanup_before = if reload_scene {
             // Keep music supplied across the synchronous unload/GC/reload.
@@ -527,10 +553,10 @@ unsafe fn run() {
             if capture::is_mark(frame) {
                 capture::log_line("mark: build");
                 let (list, working_set) = draw::build_with_working_set(scene, &pak);
-                if map_geometry.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| host::halt(e)) {
+                if map_geometry.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| boot::halt(e)) {
                     device_log!("[voxelmon] streamed geometry high-water: {} KB used, {} KB allocated; kernel free {} KB, arena tail {} KB", map_geometry.resident_bytes().div_ceil(1024), map_geometry.allocated_bytes().div_ceil(1024), sys::sceKernelMaxFreeMemSize() / 1024, arena::stats().tail_free_bytes / 1024);
                 }
-                if atlas_cache.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| host::halt(e)) {
+                if atlas_cache.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| boot::halt(e)) {
                     device_log!("[voxelmon] streamed atlases: {} KB allocated, {} KB peak", atlas_cache.allocated_bytes().div_ceil(1024), atlas_cache.peak_bytes().div_ceil(1024));
                 }
                 renderer.reset_pool(); // GE idle: fully synced below, every mark
@@ -574,10 +600,10 @@ unsafe fn run() {
             if map_geometry.needs_sync(&working_set) || atlas_cache.needs_sync(&working_set) {
                 sys::sceGuSync(GuSyncMode::Finish, GuSyncBehavior::Wait);
             }
-            if map_geometry.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| host::halt(e)) {
+            if map_geometry.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| boot::halt(e)) {
                 device_log!("[voxelmon] streamed geometry high-water: {} KB used, {} KB allocated; kernel free {} KB, arena tail {} KB", map_geometry.resident_bytes().div_ceil(1024), map_geometry.allocated_bytes().div_ceil(1024), sys::sceKernelMaxFreeMemSize() / 1024, arena::stats().tail_free_bytes / 1024);
             }
-            if atlas_cache.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| host::halt(e)) {
+            if atlas_cache.sync(&mut pak_file, &pak_index, &working_set).unwrap_or_else(|e| boot::halt(e)) {
                 device_log!("[voxelmon] streamed atlases: {} KB allocated, {} KB peak", atlas_cache.allocated_bytes().div_ceil(1024), atlas_cache.peak_bytes().div_ceil(1024));
             }
             debug_panel.update(frame, ctx, global, scene, &pak, &map_geometry, &atlas_cache);
@@ -1004,6 +1030,12 @@ fn map_buttons(pad: &SceCtrlData) -> u32 {
     }
     if b.contains(CtrlButtons::SELECT) {
         mask |= spec::btn::SELECT;
+    }
+    if b.contains(CtrlButtons::LTRIGGER) {
+        mask |= spec::btn::L;
+    }
+    if b.contains(CtrlButtons::RTRIGGER) {
+        mask |= spec::btn::R;
     }
     let dx = pad.lx as i32 - 128;
     let dy = pad.ly as i32 - 128;

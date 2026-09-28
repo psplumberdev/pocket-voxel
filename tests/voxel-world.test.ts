@@ -911,6 +911,7 @@ describe("title and save", () => {
     tap(game, VOX_BTN.down);
     tap(game, VOX_BTN.down);
     tap(game, VOX_BTN.down);
+    tap(game, VOX_BTN.down);
     tap(game, VOX_BTN.a);
     expect(host.savedJson).not.toBeNull();
     expect(JSON.parse(host.savedJson!).save.party[0].species).toBe("BULBASAUR");
@@ -924,6 +925,7 @@ describe("title and save", () => {
     expect(game.overworld.player.stepFrames).toBe(16);
 
     tap(game, VOX_BTN.start);
+    tap(game, VOX_BTN.down);
     tap(game, VOX_BTN.down);
     tap(game, VOX_BTN.down);
     tap(game, VOX_BTN.a);
@@ -1192,6 +1194,25 @@ describe("Route 22 through Cerulean chapter", () => {
     expect(game.save.party.at(-1)?.level).toBe(5);
     expect(game.save.flags.EVENT_BOUGHT_MAGIKARP).toBe(true);
     expect(game.buyMagikarp()).toBe("already-bought");
+  });
+});
+
+describe("Lavender south exit and Route 12", () => {
+  test.skipIf(!hasGen)("cooks Lavender's complete town facilities and Route 12 support maps", () => {
+    for (const id of [
+      "LAVENDER_TOWN", "LAVENDER_POKECENTER", "LAVENDER_MART",
+      "LAVENDER_CUBONE_HOUSE", "MR_FUJIS_HOUSE", "NAME_RATERS_HOUSE",
+      "POKEMON_TOWER_1F", "ROUTE_12", "ROUTE_12_GATE_1F",
+      "ROUTE_12_GATE_2F", "ROUTE_12_SUPER_ROD_HOUSE",
+    ]) expect(DEFAULT_MAPS).toContain(id);
+    const town = romData!.maps!.LAVENDER_TOWN!;
+    const route = romData!.maps!.ROUTE_12!;
+    expect(town.connections.south?.map).toBe("ROUTE_12");
+    expect(route.connections.north?.map).toBe("LAVENDER_TOWN");
+    expect(route.warps.some(warp => warp.destMap === "ROUTE_12_GATE_1F")).toBe(true);
+    expect(route.warps.some(warp => warp.destMap === "ROUTE_12_SUPER_ROD_HOUSE")).toBe(true);
+    expect(route.objects.some(object => object.name === "ROUTE12_SNORLAX")).toBe(true);
+    expect(route.objects.filter(object => object.trainerClass).length).toBeGreaterThanOrEqual(5);
   });
 });
 
@@ -1551,4 +1572,157 @@ describe("story tape", () => {
     },
     60_000,
   );
+});
+
+
+describe("Lavender and Saffron chapter audit", () => {
+  test.skipIf(!hasGen)("all requested dungeon and gym floors are in the cooked map catalog", () => {
+    const maps = ["CELADON_GYM", "SAFFRON_GYM", "FIGHTING_DOJO", "SAFFRON_CITY", "ROCKET_HIDEOUT_ELEVATOR", "SILPH_CO_ELEVATOR",
+      ...Array.from({length: 7}, (_, i) => `POKEMON_TOWER_${i + 1}F`),
+      ...Array.from({length: 4}, (_, i) => `ROCKET_HIDEOUT_B${i + 1}F`),
+      ...Array.from({length: 11}, (_, i) => `SILPH_CO_${i + 1}F`)];
+    for (const id of maps) {
+      expect(DEFAULT_MAPS).toContain(id);
+      expect(romData!.maps![id]).toBeDefined();
+      for (const warp of romData!.maps![id].warps) {
+        // Silph's elevator exit is resolved dynamically by takeWarp.
+        if (id === "SILPH_CO_ELEVATOR" && warp.destMap === "UNUSED_MAP_ED") continue;
+        if (warp.destMap !== "LAST_MAP") expect(DEFAULT_MAPS).toContain(warp.destMap);
+      }
+    }
+  });
+
+  function immediate(game: VoxelmonGame) {
+    game.showText = (_text, done) => done?.();
+    game.showChoice = (_text, choice) => choice(true);
+  }
+  function talk(game: VoxelmonGame, name: string) {
+    const npc = game.overworld.npcs.find(n => n.def.name === name);
+    expect(npc).toBeDefined();
+    game.overworld.talkTo(npc!);
+  }
+
+  test.skipIf(!hasGen)("Silph Gary uses the starter-dependent party and only a win unlocks Lapras", () => {
+    const game = makeGame(); immediate(game);
+    game.overworld.setMap("SILPH_CO_7F", 3, 2, "down");
+    let win: (() => void) | undefined;
+    game.pushTrainerBattle = (_name, klass, party, done) => {
+      expect(klass).toBe("OPP_RIVAL2");
+      expect(party.at(-1)).toEqual({ species: "VENUSAUR", level: 40 });
+      win = done;
+    };
+    talk(game, "SILPHCO7F_SILPH_WORKER_M1");
+    expect(game.save.party.length).toBe(1);
+    game.overworld.onStepComplete();
+    expect(win).toBeDefined();
+    expect(game.save.flags.EVENT_BEAT_SILPH_CO_RIVAL).toBeFalsy();
+    win!();
+    talk(game, "SILPHCO7F_SILPH_WORKER_M1");
+    expect(game.save.party.at(-1)?.species).toBe("LAPRAS");
+    expect(game.save.party.at(-1)?.level).toBe(15);
+    talk(game, "SILPHCO7F_SILPH_WORKER_M1");
+    expect(game.save.party.length).toBe(2);
+    game.overworld.setMap("SILPH_CO_7F", 3, 2, "down");
+    expect(game.overworld.npcs.some(n => n.def.name === "SILPHCO7F_RIVAL")).toBe(false);
+  });
+
+  test.skipIf(!hasGen)("Lapras remains available after a full party or declining", () => {
+    const game = makeGame(); immediate(game);
+    game.save.flags.EVENT_BEAT_SILPH_CO_RIVAL = true;
+    game.overworld.setMap("SILPH_CO_7F", 1, 4, "down");
+    game.showChoice = (_text, choice) => choice(false);
+    talk(game, "SILPHCO7F_SILPH_WORKER_M1");
+    expect(game.save.flags.EVENT_GOT_LAPRAS).toBeFalsy();
+    immediate(game);
+    while (game.save.party.length < 6) game.save.party.push(newMon(game.data, "PIDGEY", 5));
+    talk(game, "SILPHCO7F_SILPH_WORKER_M1");
+    expect(game.save.flags.EVENT_GOT_LAPRAS).toBeFalsy();
+    game.save.party.pop();
+    talk(game, "SILPHCO7F_SILPH_WORKER_M1");
+    expect(game.save.party.at(-1)?.species).toBe("LAPRAS");
+  });
+
+  test.skipIf(!hasGen)("Tower Gary triggers at his ambush and uses his Tower party", () => {
+    const game = makeGame(); immediate(game);
+    game.overworld.setMap("POKEMON_TOWER_2F", 14, 6, "right");
+    let win: (() => void) | undefined;
+    game.pushTrainerBattle = (_name, klass, party, done) => {
+      expect(klass).toBe("OPP_RIVAL2");
+      expect(party.at(-1)).toEqual({ species: "IVYSAUR", level: 25 });
+      win = done;
+    };
+    game.overworld.onStepComplete();
+    expect(win).toBeDefined();
+    expect(game.save.flags.EVENT_BEAT_POKEMON_TOWER_RIVAL).toBeFalsy();
+    win!();
+    expect(game.save.flags.EVENT_BEAT_POKEMON_TOWER_RIVAL).toBe(true);
+  });
+
+  test.skipIf(!hasGen)("Silph Giovanni frees Saffron and the President gives one Master Ball", () => {
+    const game = makeGame(); immediate(game);
+    game.overworld.setMap("SILPH_CO_11F", 6, 10, "up");
+    talk(game, "SILPHCO11F_SILPH_PRESIDENT");
+    expect(game.save.inventory.MASTER_BALL).toBeFalsy();
+    game.pushTrainerBattle = (_name, _klass, _party, win) => win();
+    talk(game, "SILPHCO11F_GIOVANNI");
+    expect(game.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI).toBe(true);
+    talk(game, "SILPHCO11F_SILPH_PRESIDENT");
+    talk(game, "SILPHCO11F_SILPH_PRESIDENT");
+    expect(game.save.inventory.MASTER_BALL).toBe(1);
+    game.overworld.setMap("SAFFRON_CITY", 18, 22, "down");
+    expect(game.overworld.npcs.some(n => n.def.name?.startsWith("SAFFRONCITY_ROCKET"))).toBe(false);
+  });
+
+  test.skipIf(!hasGen)("Silph elevator placeholder exits to the entrance floor", () => {
+    const game = makeGame(); immediate(game);
+    game.pushWarpFade = (_frames, midpoint, done) => { midpoint(); done?.(); };
+    game.overworld.setMap("SILPH_CO_5F", 0, 0, "up");
+    const entrance = romData!.maps!.SILPH_CO_5F.warps.find(w => w.destMap === "SILPH_CO_ELEVATOR")!;
+    game.overworld.takeWarp(entrance);
+    expect(game.overworld.map.id).toBe("SILPH_CO_ELEVATOR");
+    game.overworld.takeWarp(romData!.maps!.SILPH_CO_ELEVATOR.warps[0]);
+    expect(game.overworld.map.id).toBe("SILPH_CO_5F");
+  });
+
+  for (const species of ["HITMONLEE", "HITMONCHAN"]) {
+    test.skipIf(!hasGen)(`Dojo ${species} requires a win, survives a full party, and excludes the other prize`, () => {
+      const game = makeGame(); immediate(game);
+      game.overworld.setMap("FIGHTING_DOJO", 4, 2, "up");
+      talk(game, `FIGHTINGDOJO_${species}_POKE_BALL`);
+      expect(game.save.party.length).toBe(1);
+      game.pushTrainerBattle = (_name, _klass, _party, win) => win();
+      talk(game, "FIGHTINGDOJO_KARATE_MASTER");
+      while (game.save.party.length < 6) game.save.party.push(newMon(game.data, "PIDGEY", 5));
+      talk(game, `FIGHTINGDOJO_${species}_POKE_BALL`);
+      expect(game.save.flags.EVENT_GOT_DOJO_POKEMON).toBeFalsy();
+      game.save.party.pop();
+      talk(game, `FIGHTINGDOJO_${species}_POKE_BALL`);
+      expect(game.save.party.at(-1)?.species).toBe(species);
+      expect(game.save.party.at(-1)?.level).toBe(30);
+      game.overworld.setMap("FIGHTING_DOJO", 4, 2, "up");
+      const other = species === "HITMONLEE" ? "HITMONCHAN" : "HITMONLEE";
+      game.save.party.pop();
+      talk(game, `FIGHTINGDOJO_${other}_POKE_BALL`);
+      expect(game.save.party.length).toBe(5);
+    });
+  }
+
+  for (const [map, npc, badge, tm] of [
+    ["CELADON_GYM", "CELADONGYM_ERIKA", "RAINBOWBADGE", "TM_MEGA_DRAIN"],
+    ["SAFFRON_GYM", "SAFFRONGYM_SABRINA", "MARSHBADGE", "TM_PSYWAVE"],
+  ]) {
+    test.skipIf(!hasGen)(`${npc} awards badge and TM once after victory`, () => {
+      const game = makeGame(); immediate(game);
+      game.overworld.setMap(map, 9, 9, "up");
+      let win: (() => void) | undefined;
+      game.pushTrainerBattle = (_name, _klass, party, done) => { expect(party.length).toBeGreaterThan(0); win = done; };
+      talk(game, npc);
+      expect(game.save.inventory[badge]).toBeFalsy();
+      win!();
+      expect(game.save.inventory[badge]).toBe(1);
+      expect(game.save.inventory[tm]).toBe(1);
+      talk(game, npc);
+      expect(game.save.inventory[tm]).toBe(1);
+    });
+  }
 });

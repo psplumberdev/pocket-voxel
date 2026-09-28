@@ -3,9 +3,10 @@ import { VOX_BTN } from "../../contracts/spec/voxel-spec.ts";
 // Return bits consumed by the PSP host after the guest turn, before drawing.
 export const PSP_RELOAD_START = 1;
 export const PSP_RELOAD_MAP = 2;
+export const PSP_LOADING_SPAWN = 4;
 
 interface FrameGame {
-  overworld: { map: object };
+  overworld: { map: object; wild?: { loading: boolean } };
   tick(buttons: number): void;
 }
 
@@ -19,8 +20,10 @@ export function createPspFrame(game: FrameGame): (buttons: number) => number {
       (previousButtons & VOX_BTN.start) === 0;
     previousButtons = buttons;
     const previousMap = game.overworld.map;
+    const wasSpawning = game.overworld.wild?.loading ?? false;
     game.tick(buttons);
     return (startPressed ? PSP_RELOAD_START : 0) |
-      (previousMap !== game.overworld.map ? PSP_RELOAD_MAP : 0);
+      (previousMap !== game.overworld.map ? PSP_RELOAD_MAP : 0) |
+      (!wasSpawning && game.overworld.wild?.loading ? PSP_LOADING_SPAWN : 0);
   };
 }

@@ -77,6 +77,8 @@ export const VOX_BTN = {
   b: 1 << 5,
   start: 1 << 6,
   select: 1 << 7,
+  l: 1 << 8,
+  r: 1 << 9,
 } as const;
 
 /** Facing / movement direction. Matches the walk-sheet frame order. */
@@ -422,7 +424,8 @@ export const SHADOW_ALPHA_BATTLE = 0.68;
 // ---------------------------------------------------------------------------
 
 /** Max simultaneously shown entity billboards (player is slot 0). */
-export const ENTS_MAX = 16;
+// Includes transient field area tiles/projectiles alongside actors.
+export const ENTS_MAX = 64;
 
 export const ENT_FLAG = {
   /** Mirror the card on X (right-facing / alternating walk step). */
@@ -431,6 +434,10 @@ export const ENT_FLAG = {
   ghost: 1 << 1,
   /** Card is a 16x16 grass-occluded walker (draw before grass mesh). */
   walker: 1 << 2,
+  /** Texture-free dark square on the attacked ground cell; no sprite card. */
+  melee: 1 << 3,
+  /** Sprite frames occupy a row-major 16x16 grid instead of a vertical strip. */
+  tiled: 1 << 4,
 } as const;
 
 /** Emote bubble kinds (upstream field.emotionBubbles order for Red). */

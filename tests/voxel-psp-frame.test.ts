@@ -60,3 +60,14 @@ test("Start and a transition in the same turn request one combined reload", () =
   game.onTick = () => {};
   expect(frame(VOX_BTN.start)).toBe(0);
 });
+
+test("spawn loading is presented before stats are committed on the next tick", () => {
+  const game = {
+    overworld: { map: {}, wild: { loading: false } },
+    tick() { this.overworld.wild.loading = !this.overworld.wild.loading; },
+  };
+  const frame = createPspFrame(game);
+  expect(frame(0)).toBe(4);
+  expect(frame(0)).toBe(0);
+  expect(frame(0)).toBe(4);
+});

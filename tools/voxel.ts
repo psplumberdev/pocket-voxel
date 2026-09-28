@@ -19,6 +19,7 @@ import {
   rmSync,
 } from "node:fs";
 
+import { installPspPackage } from "./psp-package.ts";
 import { packageVitaVpk } from "../vendor/pocketjs/tools/vita-package.ts";
 import { missingInputReason, resolveEnv } from "../voxelmon/import/env.ts";
 import { runImport } from "../voxelmon/import/index.ts";
@@ -44,6 +45,8 @@ commands:
   wav       render the chip synth to dist/voxelmon/audio/*.wav (local)
   psp       gen+cook+trace + bundle game.js + cargo psp -> EBOOT.PBP
             (extra args pass to cargo psp, e.g. --release, --features capture)
+            --reuse-pak rebuilds gameplay against an existing validated asset pack
+  psp-install --destination DIR [--debug] validate and install both PSP launch files; preserve saves
   run       psp, then launch the EBOOT in PPSSPP
   vita      gen+cook+trace + bundle game.js + cargo vita -> a VPK carrying
             the pak (extra args pass to cargo vita, e.g. --release);
@@ -109,7 +112,7 @@ async function preparePakAndTrace(): Promise<number> {
   }
   // Every verdict re-cooks: a stale pak is the one failure that looks like
   // an engine bug (the tools/mon.ts lesson).
-  const cook = await run(["bun", "voxelmon/cook/cli.ts"]);
+  const cook = await run(["bun", "--smol", "voxelmon/cook/cli.ts"]);
   if (cook !== 0) return cook;
   for (const tape of TAPES) {
     const rc = await run([
@@ -332,6 +335,11 @@ async function buildEboot(cargoArgs: string[]): Promise<number> {
   );
   if (packRc !== 0) return packRc;
 
+  // Use the PSP's actual streaming reader, not just the permissive full
+  // reader: an invalid catalog must never reach the install directory.
+  const validPak = await run(["cargo", "run", "--quiet", "-p", "pocketvoxel-core",
+    "--example", "validate-pak", "--", `${ROOT}${PAK}`]);
+  if (validPak !== 0) return validPak;
   // The pak rides next to the EBOOT (never include_bytes! — 21 MB).
   await Bun.write(`${outDir}/voxelmon.vxpak`, Bun.file(`${ROOT}${PAK}`));
   console.log(`voxel psp: ${outDir}/EBOOT.PBP`);
@@ -666,9 +674,25 @@ async function main(): Promise<number> {
     console.log(USAGE);
     return command ? 0 : 1;
   }
+  if (command === "psp-install") {
+    const destination = arg("destination");
+    if (!destination) { console.error("psp-install requires --destination DIR"); return 2; }
+    const profile = process.argv.includes("--debug") ? "debug" : "release";
+    const source = `${ROOT}${EBOOT_DIR}/target/mipsel-sony-psp/${profile}`;
+    const valid = await run(["cargo", "run", "--quiet", "-p", "pocketvoxel-core",
+      "--example", "validate-pak", "--", `${source}/voxelmon.vxpak`]);
+    if (valid !== 0) return valid;
+    const hashes = await installPspPackage(source, destination);
+    for (const [file, hash] of Object.entries(hashes)) console.log(`${hash}  ${destination}/${file}`);
+    return 0;
+  }
   if (command === "psp" || command === "run") {
-    const cargoArgs = process.argv.slice(3);
-    const prep = await preparePakAndTrace();
+    const reusePak = process.argv.includes("--reuse-pak");
+    const cargoArgs = process.argv.slice(3).filter(a => a !== "--reuse-pak");
+    const prep = reusePak
+      ? await run(["cargo", "run", "--quiet", "-p", "pocketvoxel-core",
+        "--example", "validate-pak", "--", `${ROOT}${PAK}`])
+      : await preparePakAndTrace();
     if (prep !== 0) return prep;
     const bundle = await bundleGuest();
     if (bundle !== 0) return bundle;
